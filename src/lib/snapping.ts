@@ -86,6 +86,28 @@ function overlaps(a: paper.Path, b: paper.Path): boolean {
 	return a.intersects(b) || a.contains(b.interiorPoint) || b.contains(a.interiorPoint);
 }
 
+/** Overlap area (px²) below which two outlines count as merely touching rather
+ *  than overlapping. Real rock overlaps are hundreds of px²; this only absorbs
+ *  tangency slivers and boolean-op noise. */
+const OVERLAP_AREA_EPS = 4;
+
+/**
+ * Authoritative overlap test used as a final guard: two rocks overlap only when
+ * their filled regions share more than a negligible area. This catches partial
+ * overlaps (crossing outlines) and full containment alike, and — unlike the
+ * fast `overlaps` primitive — won't false-positive on rocks that merely touch.
+ */
+export function rocksOverlap(a: paper.Path, b: paper.Path): boolean {
+	if (!a.bounds.intersects(b.bounds)) return false;
+	if (!(a.intersects(b) || a.contains(b.interiorPoint) || b.contains(a.interiorPoint))) {
+		return false;
+	}
+	const inter = a.intersect(b, { insert: false }) as paper.Path;
+	const area = Math.abs(inter.area);
+	inter.remove();
+	return area > OVERLAP_AREA_EPS;
+}
+
 interface Pair {
 	dist: number;
 	onCandidate: paper.Point;
@@ -257,9 +279,10 @@ function centerOfMass(paths: paper.Path[]): paper.Point {
  * Cluster mode: rocks must touch another rock (the very first rock is free),
  * may run off the canvas, and borders are not snap targets.
  *
- * Stack mode: rocks stay inside the artboard, rest on the ground (bottom
- * border) or on top of other rocks, and must sit close to the vertical line
- * through the supporting stack's center of mass.
+ * Stack mode: rocks rest on the ground (bottom border) or on top of other
+ * rocks and must sit close to the vertical line through the supporting
+ * stack's center of mass. They may overflow the left, right, and top edges,
+ * but never sink below the ground.
  */
 export function resolveSnap(
 	candidatePath: paper.Path,
@@ -269,10 +292,14 @@ export function resolveSnap(
 ): SnapResult {
 	const { mode } = opts;
 	const cand = new Candidate(candidatePath);
-	// In cluster mode rocks may overflow the artboard freely.
-	const travelBounds = mode === 'stack' ? bounds : bounds.expand(1e9);
+	// Cluster rocks may overflow the artboard freely. Stack rocks are only
+	// constrained by the ground: they may overflow the left, right, and top.
+	const travelBounds =
+		mode === 'stack'
+			? new paper.Rectangle(new paper.Point(-1e9, -1e9), new paper.Point(1e9, bounds.bottom))
+			: bounds.expand(1e9);
 
-	if (mode === 'stack') clampToBounds(cand, bounds);
+	if (mode === 'stack') clampToBounds(cand, travelBounds);
 
 	// Everything expensive only ever looks at rocks near the cursor.
 	const nearby = placed.filter((p) => p.bounds.expand(SNAP_RADIUS * 2).intersects(candidatePath.bounds));
@@ -282,7 +309,7 @@ export function resolveSnap(
 		const obstacle = nearby.find((p) => overlaps(candidatePath, p));
 		if (!obstacle) break;
 		pushOut(cand, obstacle);
-		if (mode === 'stack') clampToBounds(cand, bounds);
+		if (mode === 'stack') clampToBounds(cand, travelBounds);
 	}
 	if (nearby.some((p) => overlaps(candidatePath, p))) {
 		return { valid: false, position: candidatePath.position, contacts: [], balance: null };
@@ -339,7 +366,7 @@ export function resolveSnap(
 			cand.translate(delta.multiply(t));
 		}
 
-		if (mode === 'stack') clampToBounds(cand, bounds);
+		if (mode === 'stack') clampToBounds(cand, travelBounds);
 	} else if (groundInRange) {
 		cand.translate(new paper.Point(0, groundDist));
 		if (nearby.some((p) => overlaps(candidatePath, p))) {
@@ -373,6 +400,14 @@ export function resolveSnap(
 		if (!ok || !restingOnTop) {
 			return { valid: false, position: candidatePath.position, contacts: [], balance };
 		}
+	}
+
+	// Final authoritative guard: `nearby` is captured from the candidate's
+	// starting bounds, so travel during separation/relaxation could leave it
+	// overlapping a rock that fell outside that set. Reject any real overlap
+	// against the full placed set so a resolved position never overlaps.
+	if (placed.some((p) => rocksOverlap(candidatePath, p))) {
+		return { valid: false, position: candidatePath.position, contacts: [], balance };
 	}
 
 	return {

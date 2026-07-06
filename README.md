@@ -4,14 +4,16 @@ A generator tool for building clusters and stacked rock shapes ("cairns") from a
 
 ## Current features
 
-- Two placement modes, toggled from the toolbar:
-  - **Cluster** — rocks snap to touch other rocks (the first rock can go anywhere) and may run off the canvas edges. Borders are not snap targets.
-  - **Stack** — rocks stay inside the artboard and rest on the ground (bottom border) or on top of other rocks. Each stack has a center-of-mass line (dashed while hovering); new rocks must sit close to it, keeping stacks looking balanced. Off-balance spots show a red line and can't be placed.
-- Click the canvas to place the active rock shape. A translucent preview appears only when the cursor is at a genuinely placeable spot — snapped to touch the nearest edge(s), still under the cursor — with a dot marking each contact point. Anywhere else the canvas stays quiet and clicks do nothing.
-- A semi-transparent ghost preview follows the cursor, tinted with the upcoming fill color.
-- Fill colors cycle automatically through the Project Everyone palette as you place rocks.
-- Cycle through the 8 rock shapes with the scroll wheel (over the canvas), Left/Right arrow keys, or by clicking a thumbnail in the sidebar.
-- Choose the artboard aspect ratio (1:1, 4:5, 5:4, 16:9, 9:16) from the sidebar.
+- **Place mode** (default): manually place rocks with snap-to-contact rules, rotation, and size controls.
+- **Shuffle mode**: auto-generate compositions using the same snap rules. Choose aspect ratio, cluster vs stack generation, and toggle colors, shapes, and sizes on or off. Hit **Shuffle** to regenerate.
+  - **Cluster shuffle**: grows a single cohesive cluster outward from the canvas center, keeping every rock as close to the middle as the snap rules allow.
+  - **Stack shuffle**: creates multiple balanced stacks packed toward the horizontal center.
+- Toggle between place and shuffle via the leftmost toolbar button (crosshair ↔ shuffle arrows).
+
+In **place mode**:
+- **Cluster** — rocks snap to touch other rocks; may run off canvas edges.
+- **Stack** — rocks rest on the ground or on top of each other, balanced near the stack's center-of-mass line.
+- Ghost preview only appears at genuinely placeable spots; gray hint follows the cursor elsewhere.
 
 ## Development
 
@@ -32,5 +34,6 @@ Other scripts:
 - `svgs/` – original source rock SVGs
 - `src/assets/rocks/` – rock SVGs bundled into the app (imported as raw strings for Paper.js)
 - `src/lib/state.svelte.ts` – shared runes state (aspect ratio, active rock, palette cycle)
-- `src/lib/Sidebar.svelte` – aspect ratio selector, palette strip, rock picker
-- `src/lib/Canvas.svelte` – Paper.js stage: SVG import, ghost preview, click-to-place
+- `src/lib/Toolbar.svelte` – floating toolbar (place + shuffle controls)
+- `src/lib/shuffle.ts` – auto-generation using snap rules
+- `src/lib/Canvas.svelte` – Paper.js stage

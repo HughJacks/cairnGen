@@ -4,21 +4,27 @@
 </script>
 
 <div class="app">
+	<Toolbar />
 	<main class="stage">
 		<Canvas />
 	</main>
-	<Toolbar />
 </div>
 
 <style>
 	.app {
-		position: relative;
+		display: flex;
 		height: 100%;
 		overflow: hidden;
+		background:
+			radial-gradient(circle at top left, rgba(255, 247, 136, 0.26), transparent 38%),
+			var(--stage-bg);
 	}
 
 	.stage {
+		flex: 1;
+		min-width: 0;
 		height: 100%;
-		background: var(--stage-bg);
+		padding: 18px;
+		box-sizing: border-box;
 	}
 </style>

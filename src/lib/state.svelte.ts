@@ -37,7 +37,9 @@ export const ROCK_COLORS: Swatch[] = PALETTE.filter(
 	(c) => c.name !== 'Ink' && c.name !== 'Paper'
 );
 
-export const ROCK_COUNT = 8;
+import { ROCK_COUNT } from './rocks';
+
+export { ROCK_COUNT };
 
 export interface RockSize {
 	label: string;
@@ -53,8 +55,15 @@ export const ROCK_SIZES: RockSize[] = [
 ];
 
 export type Mode = 'cluster' | 'stack';
+export type DesignMode = 'place' | 'shuffle';
+
+export interface UploadedImage {
+	id: string;
+	src: string;
+}
 
 class AppState {
+	designMode: DesignMode = $state('place');
 	mode: Mode = $state('cluster');
 	aspect: AspectId = $state('4:5');
 	rockIndex = $state(0);
@@ -62,6 +71,73 @@ class AppState {
 	placedCount = $state(0);
 	sizeIndex = $state(1);
 	rotation = $state(0);
+	clearVersion = $state(0);
+	exportVersion = $state(0);
+
+	/** Per-item shuffle selections — only used in shuffle design mode.
+	 *  Every color, shape, and size is on by default; toggling an entry
+	 *  removes it from the pool the shuffle draws from. */
+	colorEnabled = $state(ROCK_COLORS.map(() => true));
+	shapeEnabled = $state(Array.from({ length: ROCK_COUNT }, () => true));
+	sizeEnabled = $state(ROCK_SIZES.map(() => true));
+	shuffleSeed = $state(0);
+
+	/** Uploaded images available to attach to shapes. */
+	images = $state<UploadedImage[]>([]);
+	/** Image selected in the tray, waiting to be attached to a clicked shape. */
+	activeImageId: string | null = $state(null);
+	/** The single image that sits behind (fills) every shape, or null. Only one
+	 *  image may fill all shapes at a time. */
+	backgroundImageId: string | null = $state(null);
+	private imageSeq = 0;
+
+	imageById(id: string | null): UploadedImage | undefined {
+		return id ? this.images.find((im) => im.id === id) : undefined;
+	}
+
+	addImages(srcs: string[]) {
+		const added = srcs.map((src) => ({ id: `img-${++this.imageSeq}`, src }));
+		this.images = [...this.images, ...added];
+		if (!this.activeImageId && added.length) this.activeImageId = added[0].id;
+	}
+
+	removeImage(id: string) {
+		this.images = this.images.filter((im) => im.id !== id);
+		if (this.backgroundImageId === id) this.backgroundImageId = null;
+		if (this.activeImageId === id) this.activeImageId = this.images.at(-1)?.id ?? null;
+	}
+
+	/** Select (or deselect) an image to attach to the next clicked shape. */
+	selectImage(id: string) {
+		this.activeImageId = this.activeImageId === id ? null : id;
+	}
+
+	/** Make an image fill every shape, or turn that off. Exclusive: enabling one
+	 *  clears any previous background image. */
+	toggleBackground(id: string) {
+		this.backgroundImageId = this.backgroundImageId === id ? null : id;
+	}
+
+	/** Hex fills currently allowed in the shuffle. */
+	get enabledColors(): string[] {
+		return ROCK_COLORS.filter((_, i) => this.colorEnabled[i]).map((c) => c.hex);
+	}
+
+	/** Rock indices currently allowed in the shuffle. */
+	get enabledShapes(): number[] {
+		return this.shapeEnabled.reduce<number[]>((acc, on, i) => {
+			if (on) acc.push(i);
+			return acc;
+		}, []);
+	}
+
+	/** Size indices currently allowed in the shuffle. */
+	get enabledSizes(): number[] {
+		return this.sizeEnabled.reduce<number[]>((acc, on, i) => {
+			if (on) acc.push(i);
+			return acc;
+		}, []);
+	}
 
 	get nextColor(): Swatch {
 		return ROCK_COLORS[this.colorIndex];
@@ -92,9 +168,55 @@ class AppState {
 		this.mode = this.mode === 'cluster' ? 'stack' : 'cluster';
 	}
 
+	toggleDesignMode() {
+		this.designMode = this.designMode === 'place' ? 'shuffle' : 'place';
+		if (this.designMode === 'shuffle') this.shuffleSeed++;
+		else this.clear();
+	}
+
+	/** Flip one entry on/off, but never leave a category completely empty. */
+	private toggleAt(flags: boolean[], i: number): boolean[] {
+		const next = flags.slice();
+		if (next[i] && next.filter(Boolean).length === 1) return flags;
+		next[i] = !next[i];
+		return next;
+	}
+
+	toggleColor(i: number) {
+		this.colorEnabled = this.toggleAt(this.colorEnabled, i);
+	}
+
+	toggleShape(i: number) {
+		this.shapeEnabled = this.toggleAt(this.shapeEnabled, i);
+	}
+
+	toggleSize(i: number) {
+		this.sizeEnabled = this.toggleAt(this.sizeEnabled, i);
+	}
+
+	shuffle() {
+		this.shuffleSeed++;
+	}
+
 	advanceColor(direction: 1 | -1 = 1) {
 		this.colorIndex =
 			(this.colorIndex + direction + ROCK_COLORS.length) % ROCK_COLORS.length;
+	}
+
+	selectColor(i: number) {
+		this.colorIndex = i;
+	}
+
+	selectSize(i: number) {
+		this.sizeIndex = i;
+	}
+
+	clear() {
+		this.clearVersion++;
+	}
+
+	exportPng() {
+		this.exportVersion++;
 	}
 }
 
