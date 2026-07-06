@@ -458,94 +458,63 @@
 	function exportPng() {
 		if (!canvasEl) return;
 
-		const currentWidth = Math.max(Math.round(artboard.w), 1);
-		const currentHeight = Math.max(Math.round(artboard.h), 1);
+		const w = Math.max(Math.round(artboard.w), 1);
+		const h = Math.max(Math.round(artboard.h), 1);
 		const MAX_EXPORT_EDGE = 4096;
-		const scale = Math.max(1, Math.floor(MAX_EXPORT_EDGE / Math.max(currentWidth, currentHeight)));
-		const exportWidth = currentWidth * scale;
-		const exportHeight = currentHeight * scale;
+		const scale = Math.max(1, Math.floor(MAX_EXPORT_EDGE / Math.max(w, h)));
 
-		const exportCanvas = document.createElement('canvas');
-		exportCanvas.width = exportWidth;
-		exportCanvas.height = exportHeight;
+		const output = document.createElement('canvas');
+		output.width = w * scale;
+		output.height = h * scale;
+		const ctx = output.getContext('2d');
+		if (!ctx) return;
 
-		const exportScope = new paper.PaperScope();
-		exportScope.setup(exportCanvas);
-		exportScope.view.viewSize = new exportScope.Size(exportWidth, exportHeight);
-		const cleanupExportScope = () => {
-			exportScope.project.clear();
-			exportScope.view.remove();
-		};
+		ctx.fillStyle = '#FFFFFF';
+		ctx.fillRect(0, 0, output.width, output.height);
+		// Work in view coordinates; the scale gives a crisp high-res render.
+		ctx.scale(scale, scale);
 
-		const renderImageGroup = (clipJSON: string, el: HTMLImageElement, r: paper.Raster) => {
-			const clip = exportScope.project.importJSON(clipJSON);
-			if (!clip) return;
-			const raster = new exportScope.Raster(el);
-			raster.scaling = new exportScope.Size(r.scaling.width, r.scaling.height);
-			raster.position = new exportScope.Point(r.position.x, r.position.y);
-			const group = new exportScope.Group([clip, raster]);
-			group.clipped = true;
-			exportScope.project.activeLayer.addChild(group);
-			group.scale(scale, new exportScope.Point(0, 0));
+		// A paper Raster draws its image centered at `position`, sized by its
+		// scaling times the natural pixels — replicate that with drawImage.
+		const drawRaster = (el: HTMLImageElement, r: paper.Raster) => {
+			const dw = el.naturalWidth * r.scaling.x;
+			const dh = el.naturalHeight * r.scaling.y;
+			ctx.drawImage(el, r.position.x - dw / 2, r.position.y - dh / 2, dw, dh);
 		};
 
 		for (const path of placed) {
 			const fill = fills.get(path);
 			const el = fill ? imageEls.get(fill.imageId) : undefined;
 			if (fill && el) {
-				renderImageGroup(fill.clip.exportJSON(), el, fill.raster);
+				ctx.save();
+				ctx.clip(new Path2D(fill.clip.pathData));
+				drawRaster(el, fill.raster);
+				ctx.restore();
 				continue;
 			}
 			// Un-pinned rocks are drawn by the unified background group below.
 			if (bgFill) continue;
-			const imported = exportScope.project.importJSON(path.exportJSON());
-			if (!imported) continue;
-			// importJSON returns the item without inserting it into the scene
-			// graph, so it must be added explicitly or nothing renders.
-			exportScope.project.activeLayer.addChild(imported);
-			imported.scale(scale, new exportScope.Point(0, 0));
+			const color = path.fillColor as paper.Color | null;
+			if (!color) continue;
+			ctx.save();
+			ctx.fillStyle = color.toCSS(true);
+			ctx.fill(new Path2D(path.pathData));
+			ctx.restore();
 		}
 
 		// The single unified background image, masked by the merged silhouette.
 		const bgEl = app.backgroundImageId ? imageEls.get(app.backgroundImageId) : undefined;
 		if (bgFill && bgEl) {
-			renderImageGroup(bgFill.clip.exportJSON(), bgEl, bgFill.raster);
+			ctx.save();
+			ctx.clip(new Path2D(bgFill.clip.pathData));
+			drawRaster(bgEl, bgFill.raster);
+			ctx.restore();
 		}
-
-		exportScope.view.update();
-
-		const output = document.createElement('canvas');
-		output.width = exportWidth;
-		output.height = exportHeight;
-		const context = output.getContext('2d');
-		if (!context) {
-			cleanupExportScope();
-			return;
-		}
-
-		context.fillStyle = '#FFFFFF';
-		context.fillRect(0, 0, exportWidth, exportHeight);
-		// Paper scales the backing store by devicePixelRatio (e.g. 2x on retina),
-		// so draw the full source rect scaled to the output to avoid cropping to
-		// the top-left on high-DPI displays.
-		context.drawImage(
-			exportCanvas,
-			0,
-			0,
-			exportCanvas.width,
-			exportCanvas.height,
-			0,
-			0,
-			exportWidth,
-			exportHeight
-		);
 
 		const link = document.createElement('a');
 		link.href = output.toDataURL('image/png');
 		link.download = `cairn-${app.aspect.replace(':', 'x')}.png`;
 		link.click();
-
-		cleanupExportScope();
 	}
 
 	function runShuffle() {
