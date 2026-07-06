@@ -26,6 +26,16 @@
 		const srcs = await Promise.all(files.map(readAsDataURL));
 		app.addImages(srcs);
 	}
+
+	// First click selects an image; clicking the already-selected one toggles
+	// whether it fills every shape ("behind all").
+	function onThumbClick(id: string) {
+		if (app.activeImageId === id) {
+			app.toggleBackground(id);
+		} else {
+			app.selectImage(id);
+		}
+	}
 </script>
 
 <aside class="toolbar">
@@ -204,17 +214,31 @@
 		/>
 		<div class="thumbs">
 			{#each app.images as img (img.id)}
-				<button
-					class={['thumb', { active: app.activeImageId === img.id, bg: app.backgroundImageId === img.id }]}
-					onclick={() => app.selectImage(img.id)}
-					title="Select image"
-					aria-pressed={app.activeImageId === img.id}
-				>
-					<img src={img.src} alt="" />
-					{#if app.backgroundImageId === img.id}
-						<span class="thumb-badge">All</span>
+				<div class="thumb-wrap">
+					<button
+						class={['thumb', { active: app.activeImageId === img.id, bg: app.backgroundImageId === img.id }]}
+						onclick={() => onThumbClick(img.id)}
+						title={app.activeImageId === img.id ? 'Click again to fill every shape' : 'Select image'}
+						aria-pressed={app.activeImageId === img.id}
+					>
+						<img src={img.src} alt="" />
+						{#if app.backgroundImageId === img.id}
+							<span class="thumb-badge">All</span>
+						{/if}
+					</button>
+					{#if app.activeImageId === img.id}
+						<button
+							class="thumb-remove"
+							onclick={() => app.removeImage(img.id)}
+							title="Remove image"
+							aria-label="Remove image"
+						>
+							<svg viewBox="0 0 16 16" aria-hidden="true">
+								<path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" />
+							</svg>
+						</button>
 					{/if}
-				</button>
+				</div>
 			{/each}
 			<button class="thumb add" onclick={() => fileInput?.click()} title="Upload images" aria-label="Upload images">
 				<svg viewBox="0 0 16 16" aria-hidden="true">
@@ -223,26 +247,10 @@
 			</button>
 		</div>
 		{#if app.activeImageId}
-			<div class="row">
-				<button
-					class={['chip mini', { active: app.backgroundImageId === app.activeImageId }]}
-					onclick={() => app.activeImageId && app.toggleBackground(app.activeImageId)}
-					title="Fill every shape with this image"
-				>
-					Behind all
-				</button>
-				<button
-					class="chip mini remove-chip"
-					onclick={() => app.activeImageId && app.removeImage(app.activeImageId)}
-					title="Remove image"
-				>
-					Remove
-				</button>
-			</div>
 			<span class="mask-caption">
 				{app.backgroundImageId === app.activeImageId
 					? 'Fills every shape'
-					: 'Click a shape to attach'}
+					: 'Click a shape to attach, or click again for behind all'}
 			</span>
 		{/if}
 	</div>
@@ -495,14 +503,47 @@
 		height: auto;
 	}
 
-	.image-tray {
-		margin-top: auto;
-	}
-
 	.thumbs {
 		display: flex;
 		flex-wrap: wrap;
 		gap: 8px;
+	}
+
+	.thumb-wrap {
+		position: relative;
+		/* Room for the remove badge to overhang the corner. */
+		padding-top: 6px;
+		padding-right: 6px;
+		margin-top: -6px;
+		margin-right: -6px;
+	}
+
+	.thumb-remove {
+		position: absolute;
+		top: 0;
+		right: 0;
+		width: 18px;
+		height: 18px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 0;
+		border-radius: 50%;
+		border: 1px solid var(--paper);
+		background: var(--ink);
+		color: var(--paper);
+		cursor: pointer;
+		transition: transform 120ms ease;
+	}
+
+	.thumb-remove svg {
+		width: 10px;
+		height: 10px;
+	}
+
+	.thumb-remove:hover {
+		transform: scale(1.1);
+		background: #ed4e3d;
 	}
 
 	.thumb {
@@ -570,13 +611,6 @@
 		border-color: var(--ink);
 	}
 
-	.chip.mini {
-		flex: 1;
-		height: 32px;
-		font-size: 12px;
-		padding: 0 10px;
-	}
-
 	.mask-caption {
 		font-size: 11px;
 		font-weight: 600;
@@ -585,16 +619,8 @@
 		opacity: 0.6;
 	}
 
-	.remove-chip {
-		color: #ed4e3d;
-		border-color: color-mix(in srgb, #ed4e3d 40%, transparent);
-	}
-
-	.remove-chip:hover {
-		border-color: #ed4e3d;
-	}
-
 	.actions {
+		margin-top: auto;
 		display: flex;
 		gap: 8px;
 	}
