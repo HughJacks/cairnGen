@@ -104,22 +104,18 @@
 
 	{#if app.designMode === 'place'}
 		<div class="group">
-			<div class="rock-picker">
-				<button class="arrow" onclick={() => app.cycleRock(-1)} title="Previous rock" aria-label="Previous rock">
-					<svg viewBox="0 0 16 16" aria-hidden="true">
-						<path d="M10 3L5 8l5 5" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round" />
-					</svg>
-				</button>
-				<button class="rock-shape" onclick={() => app.cycleRock(1)} title="Cycle rock shape" aria-label="Cycle rock shape">
-					<span style:transform="rotate({app.rotation}deg)">
-						<img src={ROCK_IMAGE_URLS[app.rockIndex]} alt="" />
-					</span>
-				</button>
-				<button class="arrow" onclick={() => app.cycleRock(1)} title="Next rock" aria-label="Next rock">
-					<svg viewBox="0 0 16 16" aria-hidden="true">
-						<path d="M6 3l5 5-5 5" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round" />
-					</svg>
-				</button>
+			<div class="row wrap">
+				{#each ROCK_SVGS as _svg, i (i)}
+					<button
+						class={['shape', { on: app.rockIndex === i }]}
+						onclick={() => app.selectRock(i)}
+						title="Shape {i + 1}"
+						aria-label="Shape {i + 1}"
+						aria-pressed={app.rockIndex === i}
+					>
+						<img src={ROCK_IMAGE_URLS[i]} alt="" />
+					</button>
+				{/each}
 			</div>
 		</div>
 
@@ -375,72 +371,6 @@
 	.size-chip {
 		flex: 1;
 		padding: 0;
-	}
-
-	.rock-picker {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 8px;
-	}
-
-	.arrow {
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		width: 36px;
-		height: 36px;
-		padding: 0;
-		background: none;
-		border: none;
-		color: var(--ink);
-		cursor: pointer;
-		opacity: 0.7;
-		flex: 0 0 auto;
-		transition: opacity 120ms ease, transform 120ms ease;
-	}
-
-	.arrow svg {
-		width: 18px;
-		height: 18px;
-	}
-
-	.arrow:hover {
-		opacity: 1;
-		transform: translateY(-1px);
-	}
-
-	.rock-shape {
-		flex: 1;
-		min-width: 0;
-		height: 48px;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		padding: 4px;
-		background: none;
-		border: none;
-		cursor: pointer;
-		transition: transform 120ms ease;
-	}
-
-	.rock-shape span {
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		max-width: 100%;
-		max-height: 100%;
-	}
-
-	.rock-shape img {
-		max-width: 100%;
-		max-height: 40px;
-		width: auto;
-		height: auto;
-	}
-
-	.rock-shape:hover {
-		transform: translateY(-1px);
 	}
 
 	.chip:hover {

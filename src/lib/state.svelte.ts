@@ -151,6 +151,10 @@ class AppState {
 		this.rockIndex = (this.rockIndex + direction + ROCK_COUNT) % ROCK_COUNT;
 	}
 
+	selectRock(i: number) {
+		this.rockIndex = i;
+	}
+
 	cycleAspect() {
 		const i = ASPECTS.findIndex((a) => a.id === this.aspect);
 		this.aspect = ASPECTS[(i + 1) % ASPECTS.length].id;

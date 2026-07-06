@@ -17,6 +17,18 @@
 	let seenClearVersion = app.clearVersion;
 	let seenExportVersion = app.exportVersion;
 
+	// Download dialog: pick a solid white or transparent background before saving.
+	let showExportDialog = $state(false);
+	let exportTransparent = $state(false);
+	let dialogEl = $state<HTMLDialogElement | null>(null);
+
+	function exportDialog(node: HTMLDialogElement) {
+		dialogEl = node;
+		return () => {
+			dialogEl = null;
+		};
+	}
+
 	let sourcePaths: paper.Path[] = [];
 	let placed: paper.Path[] = [];
 	let ghost: paper.Path | null = null;
@@ -76,17 +88,21 @@
 	}
 
 	/** Grow/shift a raster until it fully covers a rectangle, so a rock's edges
-	 *  and the image's corners are never exposed. */
+	 *  and the image's corners are never exposed. Only the portion of the mask
+	 *  inside the canvas frame must stay covered — anything off-frame is never
+	 *  visible, so image edges are allowed to fall there. */
 	function coverClamp(raster: paper.Raster, cb: paper.Rectangle) {
-		const grow = Math.max(cb.width / raster.bounds.width, cb.height / raster.bounds.height, 1);
+		const eff = cb.intersect(viewBounds());
+		if (eff.width <= 0 || eff.height <= 0) return;
+		const grow = Math.max(eff.width / raster.bounds.width, eff.height / raster.bounds.height, 1);
 		if (grow > 1) raster.scale(grow);
 		const b = raster.bounds;
 		let dx = 0;
 		let dy = 0;
-		if (b.left > cb.left) dx = cb.left - b.left;
-		else if (b.right < cb.right) dx = cb.right - b.right;
-		if (b.top > cb.top) dy = cb.top - b.top;
-		else if (b.bottom < cb.bottom) dy = cb.bottom - b.bottom;
+		if (b.left > eff.left) dx = eff.left - b.left;
+		else if (b.right < eff.right) dx = eff.right - b.right;
+		if (b.top > eff.top) dy = eff.top - b.top;
+		else if (b.bottom < eff.bottom) dy = eff.bottom - b.bottom;
 		if (dx !== 0 || dy !== 0) raster.position = raster.position.add(new paper.Point(dx, dy));
 	}
 
@@ -123,15 +139,19 @@
 		const bg = app.backgroundImageId;
 		const el = bg ? imageEls.get(bg) : undefined;
 		if (!el) return;
-		const rect = bgFill.clip.bounds;
-		const minScale = Math.max(rect.width / el.naturalWidth, rect.height / el.naturalHeight);
-		if (bgScale < minScale) bgScale = minScale;
-		const halfW = (el.naturalWidth * bgScale) / 2;
-		const halfH = (el.naturalHeight * bgScale) / 2;
-		bgCenter = new paper.Point(
-			clamp(bgCenter.x, rect.right - halfW, rect.left + halfW),
-			clamp(bgCenter.y, rect.bottom - halfH, rect.top + halfH)
-		);
+		// Only keep the on-canvas part of the silhouette covered; the mask may
+		// extend past the frame, and image edges hidden there are fine.
+		const rect = bgFill.clip.bounds.intersect(viewBounds());
+		if (rect.width > 0 && rect.height > 0) {
+			const minScale = Math.max(rect.width / el.naturalWidth, rect.height / el.naturalHeight);
+			if (bgScale < minScale) bgScale = minScale;
+			const halfW = (el.naturalWidth * bgScale) / 2;
+			const halfH = (el.naturalHeight * bgScale) / 2;
+			bgCenter = new paper.Point(
+				clamp(bgCenter.x, rect.right - halfW, rect.left + halfW),
+				clamp(bgCenter.y, rect.bottom - halfH, rect.top + halfH)
+			);
+		}
 		bgFill.raster.scaling = new paper.Size(bgScale, bgScale);
 		bgFill.raster.position = bgCenter;
 	}
@@ -455,7 +475,7 @@
 		updateGhost();
 	}
 
-	function exportPng() {
+	function exportPng(transparent = false) {
 		if (!canvasEl) return;
 
 		const w = Math.max(Math.round(artboard.w), 1);
@@ -469,8 +489,11 @@
 		const ctx = output.getContext('2d');
 		if (!ctx) return;
 
-		ctx.fillStyle = '#FFFFFF';
-		ctx.fillRect(0, 0, output.width, output.height);
+		// Leave the canvas empty for a transparent PNG; otherwise paint white.
+		if (!transparent) {
+			ctx.fillStyle = '#FFFFFF';
+			ctx.fillRect(0, 0, output.width, output.height);
+		}
 		// Work in view coordinates; the scale gives a crisp high-res render.
 		ctx.scale(scale, scale);
 
@@ -795,8 +818,25 @@
 		const version = app.exportVersion;
 		if (version === seenExportVersion) return;
 		seenExportVersion = version;
-		untrack(() => exportPng());
+		showExportDialog = true;
 	});
+
+	// Drive the native <dialog> from the open flag so it gets focus trapping,
+	// Escape-to-close, and a backdrop for free.
+	$effect(() => {
+		if (!dialogEl) return;
+		if (showExportDialog && !dialogEl.open) dialogEl.showModal();
+		else if (!showExportDialog && dialogEl.open) dialogEl.close();
+	});
+
+	function confirmExport() {
+		showExportDialog = false;
+		exportPng(exportTransparent);
+	}
+
+	function cancelExport() {
+		showExportDialog = false;
+	}
 
 	function onWheel(event: WheelEvent) {
 		const point = new paper.Point(event.offsetX, event.offsetY);
@@ -821,6 +861,15 @@
 	}
 
 	function onKeydown(event: KeyboardEvent) {
+		// The native <dialog> traps focus and handles Escape itself; just add
+		// Enter as a shortcut to confirm the download.
+		if (showExportDialog) {
+			if (event.key === 'Enter') {
+				event.preventDefault();
+				confirmExport();
+			}
+			return;
+		}
 		if (app.designMode !== 'place') return;
 		if (event.key === 'ArrowRight') {
 			event.preventDefault();
@@ -849,6 +898,32 @@
 	></canvas>
 </div>
 
+<dialog
+	class="modal"
+	aria-labelledby="export-title"
+	{@attach exportDialog}
+	onclose={cancelExport}
+	onclick={(e) => {
+		if (e.target === e.currentTarget) cancelExport();
+	}}
+>
+	<div class="modal-body">
+		<h2 id="export-title" class="modal-title">Download PNG</h2>
+		<label class="toggle-row">
+			<input type="checkbox" bind:checked={exportTransparent} />
+			<span class="toggle-text">
+				<span class="toggle-label">Transparent background</span>
+				<span class="toggle-hint">Save without the white backdrop</span>
+			</span>
+		</label>
+		<div class="preview" class:transparent={exportTransparent} aria-hidden="true"></div>
+		<div class="modal-actions">
+			<button class="modal-btn ghost" onclick={cancelExport}>Cancel</button>
+			<button class="modal-btn primary" onclick={confirmExport}>Download</button>
+		</div>
+	</div>
+</dialog>
+
 <style>
 	.wrap {
 		width: 100%;
@@ -867,5 +942,128 @@
 
 	.wrap.shuffle canvas {
 		cursor: default;
+	}
+
+	.modal {
+		width: 100%;
+		max-width: 340px;
+		box-sizing: border-box;
+		padding: 0;
+		border: none;
+		border-radius: 16px;
+		background: var(--paper);
+		color: var(--ink);
+		box-shadow: 0 12px 48px rgba(16, 26, 49, 0.28);
+	}
+
+	.modal::backdrop {
+		background: rgba(16, 26, 49, 0.42);
+		backdrop-filter: blur(2px);
+	}
+
+	.modal-body {
+		display: flex;
+		flex-direction: column;
+		gap: 18px;
+		padding: 22px;
+	}
+
+	.modal-title {
+		margin: 0;
+		font-size: 16px;
+		font-weight: 700;
+		color: var(--ink);
+	}
+
+	.toggle-row {
+		display: flex;
+		align-items: flex-start;
+		gap: 10px;
+		cursor: pointer;
+	}
+
+	.toggle-row input {
+		margin: 0;
+		margin-top: 2px;
+		width: 16px;
+		height: 16px;
+		accent-color: var(--ink);
+		cursor: pointer;
+		flex: 0 0 auto;
+	}
+
+	.toggle-text {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+
+	.toggle-label {
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--ink);
+	}
+
+	.toggle-hint {
+		font-size: 11px;
+		color: var(--ink);
+		opacity: 0.55;
+	}
+
+	.preview {
+		height: 72px;
+		border-radius: 10px;
+		border: 1px solid var(--border);
+		background: #ffffff;
+	}
+
+	.preview.transparent {
+		/* Checkerboard signalling transparency. */
+		background-color: #ffffff;
+		background-image:
+			linear-gradient(45deg, #d7dbe3 25%, transparent 25%),
+			linear-gradient(-45deg, #d7dbe3 25%, transparent 25%),
+			linear-gradient(45deg, transparent 75%, #d7dbe3 75%),
+			linear-gradient(-45deg, transparent 75%, #d7dbe3 75%);
+		background-size: 16px 16px;
+		background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+	}
+
+	.modal-actions {
+		display: flex;
+		justify-content: flex-end;
+		gap: 8px;
+	}
+
+	.modal-btn {
+		font: inherit;
+		height: 40px;
+		padding: 0 16px;
+		font-size: 13px;
+		font-weight: 600;
+		border-radius: 10px;
+		cursor: pointer;
+		transition: transform 120ms ease, opacity 120ms ease, background-color 120ms ease;
+	}
+
+	.modal-btn.ghost {
+		color: var(--ink);
+		background: none;
+		border: 1px solid var(--border);
+	}
+
+	.modal-btn.ghost:hover {
+		border-color: var(--ink);
+	}
+
+	.modal-btn.primary {
+		color: var(--paper);
+		background: var(--ink);
+		border: 1px solid var(--ink);
+	}
+
+	.modal-btn.primary:hover {
+		transform: translateY(-1px);
+		opacity: 0.92;
 	}
 </style>
