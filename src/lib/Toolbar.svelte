@@ -27,14 +27,14 @@
 		app.addImages(srcs);
 	}
 
-	// First click selects an image; clicking the already-selected one toggles
-	// whether it fills every shape ("behind all").
+	// Click to select/deselect an image for shape attachment.
 	function onThumbClick(id: string) {
-		if (app.activeImageId === id) {
-			app.toggleBackground(id);
-		} else {
-			app.selectImage(id);
-		}
+		app.selectImage(id);
+	}
+
+	function onBackgroundToggle(id: string, event: MouseEvent) {
+		event.stopPropagation();
+		app.toggleBackground(id);
 	}
 </script>
 
@@ -43,24 +43,23 @@
 
 	<div class="group">
 		<span class="label">Mode</span>
-		<div class="row">
+		<div class="row segmented">
 			<button
 				class={['chip icon-chip', { active: app.designMode === 'place' }]}
 				onclick={() => app.designMode !== 'place' && app.toggleDesignMode()}
 				aria-pressed={app.designMode === 'place'}
-				title="Switch to place mode"
+				title="Place mode"
 			>
 				<svg viewBox="0 0 16 16" aria-hidden="true">
 					<circle cx="8" cy="8" r="2.2" />
 					<path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2" stroke="currentColor" stroke-width="1.2" fill="none" />
 				</svg>
-				<span>Place</span>
 			</button>
 			<button
 				class={['chip icon-chip', { active: app.designMode === 'shuffle' }]}
 				onclick={() => app.designMode !== 'shuffle' && app.toggleDesignMode()}
 				aria-pressed={app.designMode === 'shuffle'}
-				title="Switch to shuffle mode"
+				title="Shuffle mode"
 			>
 				<svg viewBox="0 0 16 16" aria-hidden="true">
 					<path
@@ -72,18 +71,17 @@
 						stroke-linejoin="round"
 					/>
 				</svg>
-				<span>Shuffle</span>
 			</button>
 		</div>
 	</div>
 
 	<div class="group">
 		<span class="label">Layout</span>
-		<div class="row">
+		<div class="row segmented">
 			<button class="chip" onclick={() => app.cycleAspect()} title="Cycle aspect ratio">
-				Aspect {app.aspect}
+				{app.aspect}
 			</button>
-			<button class="chip icon-chip" onclick={() => app.toggleMode()} title="Toggle cluster or stack">
+			<button class="chip icon-chip" onclick={() => app.toggleMode()} title={app.mode === 'cluster' ? 'Cluster' : 'Stack'}>
 				{#if app.mode === 'cluster'}
 					<svg viewBox="0 0 16 16" aria-hidden="true">
 						<circle cx="5" cy="6" r="2.4" />
@@ -97,7 +95,6 @@
 						<circle cx="8" cy="13.2" r="2.4" />
 					</svg>
 				{/if}
-				<span>{app.mode === 'cluster' ? 'Cluster' : 'Stack'}</span>
 			</button>
 		</div>
 	</div>
@@ -135,7 +132,7 @@
 		</div>
 
 		<div class="group">
-			<div class="row">
+			<div class="row segmented">
 				{#each ROCK_SIZES as size, i (size.label)}
 					<button
 						class={['chip size-chip', { active: app.sizeIndex === i }]}
@@ -183,7 +180,7 @@
 
 		<div class="group">
 			<span class="label">Sizes</span>
-			<div class="row wrap">
+			<div class="row segmented">
 				{#each ROCK_SIZES as size, i (size.label)}
 					<button
 						class={['chip size-chip', { active: app.sizeEnabled[i] }]}
@@ -214,13 +211,19 @@
 					<button
 						class={['thumb', { active: app.activeImageId === img.id, bg: app.backgroundImageId === img.id }]}
 						onclick={() => onThumbClick(img.id)}
-						title={app.activeImageId === img.id ? 'Click again to fill every shape' : 'Select image'}
+						title={app.activeImageId === img.id ? 'Click to deselect' : 'Select image'}
 						aria-pressed={app.activeImageId === img.id}
 					>
 						<img src={img.src} alt="" />
-						{#if app.backgroundImageId === img.id}
-							<span class="thumb-badge">All</span>
-						{/if}
+					</button>
+					<button
+						class={['thumb-bg', { on: app.backgroundImageId === img.id }]}
+						onclick={(e) => onBackgroundToggle(img.id, e)}
+						title={app.backgroundImageId === img.id ? 'Remove fill-all' : 'Fill every shape'}
+						aria-label={app.backgroundImageId === img.id ? 'Remove fill-all' : 'Fill every shape'}
+						aria-pressed={app.backgroundImageId === img.id}
+					>
+						All
 					</button>
 					{#if app.activeImageId === img.id}
 						<button
@@ -245,10 +248,49 @@
 		{#if app.activeImageId}
 			<span class="mask-caption">
 				{app.backgroundImageId === app.activeImageId
-					? 'Fills every shape'
-					: 'Click a shape to attach, or click again for behind all'}
+					? 'Fills every shape — click thumbnail to deselect'
+					: 'Click a shape to attach'}
 			</span>
 		{/if}
+	</div>
+
+	<div class="history-actions">
+		<button
+			class="history-btn"
+			onclick={() => app.undo()}
+			disabled={app.designMode !== 'place' || !app.canUndo}
+			title="Undo (⌘Z)"
+			aria-label="Undo"
+		>
+			<svg viewBox="0 0 16 16" aria-hidden="true">
+				<path
+					d="M4 8h7.5M4 8l2.5-2.5M4 8l2.5 2.5"
+					stroke="currentColor"
+					stroke-width="1.3"
+					fill="none"
+					stroke-linecap="round"
+					stroke-linejoin="round"
+				/>
+			</svg>
+		</button>
+		<button
+			class="history-btn"
+			onclick={() => app.redo()}
+			disabled={app.designMode !== 'place' || !app.canRedo}
+			title="Redo (⌘⇧Z)"
+			aria-label="Redo"
+		>
+			<svg viewBox="0 0 16 16" aria-hidden="true">
+				<path
+					d="M12 8H4.5M12 8L9.5 5.5M12 8L9.5 10.5"
+					stroke="currentColor"
+					stroke-width="1.3"
+					fill="none"
+					stroke-linecap="round"
+					stroke-linejoin="round"
+				/>
+			</svg>
+		</button>
 	</div>
 
 	<div class="actions">
@@ -286,22 +328,21 @@
 <style>
 	.toolbar {
 		flex: 0 0 auto;
-		width: 260px;
+		width: 200px;
 		height: 100%;
 		box-sizing: border-box;
 		display: flex;
 		flex-direction: column;
 		align-items: stretch;
-		gap: 18px;
-		padding: 20px 18px;
+		gap: 10px;
+		padding: 12px;
 		background: var(--paper);
 		border-right: 1px solid var(--border);
-		box-shadow: 2px 0 24px rgba(16, 26, 49, 0.08);
 		overflow-y: auto;
 	}
 
 	.brand {
-		font-size: 15px;
+		font-size: 13px;
 		font-weight: 700;
 		letter-spacing: 0.01em;
 		color: var(--ink);
@@ -310,54 +351,83 @@
 	.group {
 		display: flex;
 		flex-direction: column;
-		gap: 8px;
+		gap: 4px;
 	}
 
 	.label {
-		font-size: 10px;
+		font-size: 9px;
 		font-weight: 600;
 		letter-spacing: 0.06em;
 		text-transform: uppercase;
 		color: var(--ink);
-		opacity: 0.54;
+		opacity: 0.5;
 	}
 
 	.row {
 		display: flex;
 		align-items: center;
-		gap: 8px;
+		gap: 6px;
 	}
 
 	.row.wrap {
 		flex-wrap: wrap;
+		gap: 4px;
+	}
+
+	.row.segmented {
+		gap: 0;
+		border: 1px solid var(--border);
+		border-radius: 4px;
+		overflow: hidden;
 	}
 
 	.chip {
 		font: inherit;
-		height: 40px;
+		height: 28px;
 		display: flex;
 		align-items: center;
 		justify-content: center;
-		gap: 8px;
-		padding: 0 14px;
-		border-radius: 999px;
-		font-size: 13px;
+		gap: 4px;
+		padding: 0 8px;
+		border-radius: 4px;
+		font-size: 11px;
 		font-weight: 600;
 		color: var(--ink);
 		background: var(--paper);
 		border: 1px solid var(--border);
 		cursor: pointer;
 		transition:
-			border-color 120ms ease,
-			background-color 120ms ease,
-			color 120ms ease,
-			opacity 120ms ease,
-			transform 120ms ease;
+			border-color 100ms ease,
+			background-color 100ms ease,
+			color 100ms ease,
+			opacity 100ms ease;
+	}
+
+	.row.segmented .chip {
+		flex: 1;
+		min-width: 0;
+		height: 26px;
+		padding: 0 4px;
+		border-radius: 0;
+		border: none;
+		border-right: 1px solid var(--border);
+	}
+
+	.row.segmented .chip.icon-chip {
+		padding: 0;
+	}
+
+	.row.segmented .chip:last-child {
+		border-right: none;
+	}
+
+	.row.segmented .chip:hover {
+		background: color-mix(in srgb, var(--ink) 4%, transparent);
 	}
 
 	.icon-chip svg {
-		width: 16px;
-		height: 16px;
+		width: 13px;
+		height: 13px;
 		fill: currentColor;
 		flex: 0 0 auto;
 	}
@@ -368,62 +438,57 @@
 		border-color: var(--ink);
 	}
 
+	.row.segmented .chip.active {
+		border-color: transparent;
+	}
+
 	.size-chip {
 		flex: 1;
 		padding: 0;
 	}
 
 	.chip:hover {
-		transform: translateY(-1px);
 		border-color: var(--ink);
 	}
 
 	.dot {
-		width: 20px;
-		height: 20px;
+		width: 16px;
+		height: 16px;
 		border-radius: 50%;
 		flex: 0 0 auto;
 	}
 
 	.dot-button {
-		width: 26px;
-		height: 26px;
+		width: 20px;
+		height: 20px;
 		padding: 0;
 		border: none;
 		cursor: pointer;
-		opacity: 0.4;
-		transition: opacity 120ms ease, transform 120ms ease, box-shadow 120ms ease;
+		opacity: 0.35;
+		transition: opacity 100ms ease, box-shadow 100ms ease;
 	}
 
 	.dot-button.on {
 		opacity: 1;
-		box-shadow: 0 0 0 2px var(--paper), 0 0 0 3px var(--ink);
-	}
-
-	.dot-button:hover {
-		transform: translateY(-1px);
+		box-shadow: 0 0 0 1px var(--paper), 0 0 0 2px var(--ink);
 	}
 
 	.shape {
-		width: 40px;
-		height: 40px;
+		width: 32px;
+		height: 32px;
 		display: flex;
 		align-items: center;
 		justify-content: center;
-		padding: 6px;
+		padding: 3px;
 		background: none;
 		border: none;
 		cursor: pointer;
 		opacity: 0.25;
-		transition: opacity 120ms ease, transform 120ms ease;
+		transition: opacity 100ms ease;
 	}
 
 	.shape.on {
 		opacity: 1;
-	}
-
-	.shape:hover {
-		transform: translateY(-1px);
 	}
 
 	.shape img {
@@ -436,57 +501,58 @@
 	.thumbs {
 		display: flex;
 		flex-wrap: wrap;
-		gap: 8px;
+		gap: 6px;
 	}
 
 	.thumb-wrap {
 		position: relative;
-		/* Room for the remove badge to overhang the corner. */
-		padding-top: 6px;
-		padding-right: 6px;
-		margin-top: -6px;
-		margin-right: -6px;
+		padding-top: 4px;
+		padding-right: 4px;
+		padding-bottom: 4px;
+		padding-left: 4px;
+		margin-top: -4px;
+		margin-right: -4px;
+		margin-bottom: -4px;
+		margin-left: -4px;
 	}
 
 	.thumb-remove {
 		position: absolute;
 		top: 0;
 		right: 0;
-		width: 18px;
-		height: 18px;
+		width: 14px;
+		height: 14px;
 		display: flex;
 		align-items: center;
 		justify-content: center;
 		padding: 0;
-		border-radius: 50%;
+		border-radius: 2px;
 		border: 1px solid var(--paper);
 		background: var(--ink);
 		color: var(--paper);
 		cursor: pointer;
-		transition: transform 120ms ease;
 	}
 
 	.thumb-remove svg {
-		width: 10px;
-		height: 10px;
+		width: 8px;
+		height: 8px;
 	}
 
 	.thumb-remove:hover {
-		transform: scale(1.1);
 		background: #ed4e3d;
 	}
 
 	.thumb {
 		position: relative;
-		width: 44px;
-		height: 44px;
+		width: 36px;
+		height: 36px;
 		padding: 0;
-		border-radius: 10px;
+		border-radius: 3px;
 		border: 1px solid var(--border);
 		background: var(--paper);
 		overflow: hidden;
 		cursor: pointer;
-		transition: transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
+		transition: box-shadow 100ms ease, border-color 100ms ease;
 	}
 
 	.thumb img {
@@ -496,30 +562,13 @@
 		display: block;
 	}
 
-	.thumb:hover {
-		transform: translateY(-1px);
-	}
-
 	.thumb.active {
-		box-shadow: 0 0 0 2px var(--paper), 0 0 0 3px var(--ink);
+		box-shadow: 0 0 0 1px var(--paper), 0 0 0 2px var(--ink);
 		border-color: var(--ink);
 	}
 
 	.thumb.bg {
 		border-color: var(--ink);
-	}
-
-	.thumb-badge {
-		position: absolute;
-		bottom: 2px;
-		right: 2px;
-		font-size: 8px;
-		font-weight: 700;
-		line-height: 1;
-		padding: 2px 3px;
-		border-radius: 4px;
-		color: var(--paper);
-		background: var(--ink);
 	}
 
 	.thumb.add {
@@ -528,12 +577,12 @@
 		justify-content: center;
 		color: var(--ink);
 		border-style: dashed;
-		opacity: 0.7;
+		opacity: 0.6;
 	}
 
 	.thumb.add svg {
-		width: 16px;
-		height: 16px;
+		width: 14px;
+		height: 14px;
 	}
 
 	.thumb.add:hover {
@@ -542,65 +591,123 @@
 	}
 
 	.mask-caption {
-		font-size: 11px;
-		font-weight: 600;
-		text-align: center;
+		font-size: 10px;
+		font-weight: 500;
+		line-height: 1.3;
 		color: var(--ink);
-		opacity: 0.6;
+		opacity: 0.55;
+	}
+
+	.history-actions {
+		display: flex;
+		gap: 4px;
+	}
+
+	.history-btn {
+		flex: 1;
+		height: 28px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 0;
+		background: var(--paper);
+		color: var(--ink);
+		border: 1px solid var(--border);
+		border-radius: 4px;
+		cursor: pointer;
+		transition: border-color 100ms ease, opacity 100ms ease;
+	}
+
+	.history-btn svg {
+		width: 15px;
+		height: 15px;
+	}
+
+	.history-btn:hover:not(:disabled) {
+		border-color: var(--ink);
+	}
+
+	.history-btn:disabled {
+		opacity: 0.3;
+		cursor: default;
+	}
+
+	.thumb-bg {
+		position: absolute;
+		bottom: 0;
+		left: 0;
+		font: inherit;
+		font-size: 7px;
+		font-weight: 700;
+		line-height: 1;
+		padding: 1px 3px;
+		border-radius: 2px;
+		border: 1px solid var(--paper);
+		background: var(--ink);
+		color: var(--paper);
+		cursor: pointer;
+		opacity: 0.75;
+	}
+
+	.thumb-bg.on {
+		opacity: 1;
+	}
+
+	.thumb-bg:hover {
+		opacity: 1;
 	}
 
 	.actions {
 		margin-top: auto;
 		display: flex;
-		gap: 8px;
+		gap: 4px;
 	}
 
 	.action-icon {
 		flex: 1;
-		height: 44px;
+		height: 32px;
 		display: flex;
 		align-items: center;
 		justify-content: center;
 		background: var(--ink);
 		color: var(--paper);
 		border: 1px solid var(--ink);
-		border-radius: 12px;
+		border-radius: 4px;
 		cursor: pointer;
-		transition: transform 120ms ease, opacity 120ms ease;
+		transition: opacity 100ms ease;
 	}
 
 	.action-icon svg {
-		width: 20px;
-		height: 20px;
+		width: 16px;
+		height: 16px;
 	}
 
 	.action-icon:hover {
-		transform: translateY(-1px);
-		opacity: 0.92;
+		opacity: 0.88;
 	}
 
 	.clear {
 		font: inherit;
-		height: 40px;
-		font-size: 13px;
+		height: 28px;
+		font-size: 11px;
 		font-weight: 600;
-		color: #ED4E3D;
+		color: #ed4e3d;
 		background: none;
-		border: 1px solid color-mix(in srgb, #ED4E3D 40%, transparent);
-		border-radius: 12px;
+		border: 1px solid color-mix(in srgb, #ed4e3d 35%, transparent);
+		border-radius: 4px;
 		cursor: pointer;
-		transition: background-color 120ms ease, border-color 120ms ease;
+		transition: background-color 100ms ease, border-color 100ms ease;
 	}
 
 	.clear:hover {
-		background: color-mix(in srgb, #ED4E3D 10%, transparent);
-		border-color: #ED4E3D;
+		background: color-mix(in srgb, #ed4e3d 8%, transparent);
+		border-color: #ed4e3d;
 	}
 
 	@media (max-width: 760px) {
 		.toolbar {
-			width: 220px;
-			padding: 16px 14px;
+			width: 180px;
+			padding: 10px;
 		}
 	}
 </style>

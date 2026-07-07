@@ -24,7 +24,7 @@
 		flex: 1;
 		min-width: 0;
 		height: 100%;
-		padding: 18px;
+		padding: 12px;
 		box-sizing: border-box;
 	}
 </style>

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { untrack } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import paper from 'paper';
 	import { app, ASPECTS } from './state.svelte';
 	import { ROCK_SVGS } from './rocks';
@@ -9,6 +9,8 @@
 	/** Height (in canvas px) of the tallest rock; all rocks share the same scale factor. */
 	const ROCK_HEIGHT = 140;
 	const STAGE_PADDING = 72;
+	/** Max image zoom as a multiple of the cover scale that fills a mask. */
+	const MAX_ZOOM = 4;
 
 	let stageW = $state(0);
 	let stageH = $state(0);
@@ -16,6 +18,9 @@
 	let canvasEl: HTMLCanvasElement | null = null;
 	let seenClearVersion = app.clearVersion;
 	let seenExportVersion = app.exportVersion;
+	let seenUndoVersion = app.undoVersion;
+	let seenRedoVersion = app.redoVersion;
+	let lastDesignMode = app.designMode;
 
 	// Download dialog: pick a solid white or transparent background before saving.
 	let showExportDialog = $state(false);
@@ -54,10 +59,13 @@
 		raster: paper.Raster;
 		imageId: string;
 	}
-	interface BgFill {
+	interface BgFillGroup {
 		group: paper.Group;
-		clip: paper.PathItem;
+		clip: paper.Path;
 		raster: paper.Raster;
+	}
+	interface BgFill {
+		groups: BgFillGroup[];
 	}
 	type Hit = { kind: 'pin'; fill: PinFill } | { kind: 'bg'; fill: BgFill };
 
@@ -77,6 +85,155 @@
 	let imageLoadTick = $state(0);
 	let imageDrag: { kind: 'pin' | 'bg'; fill: PinFill | BgFill; last: paper.Point } | null = null;
 	let didDragImage = false;
+	let ghostRaf = 0;
+
+	// --- Undo / redo ---------------------------------------------------------
+	interface PinTransform {
+		imageId: string;
+		scaleX: number;
+		scaleY: number;
+		x: number;
+		y: number;
+	}
+
+	interface CanvasSnapshot {
+		rocks: { pathData: string; fillColor: string }[];
+		attach: [number, string][];
+		pins: [number, PinTransform][];
+		backgroundImageId: string | null;
+		bgScale: number;
+		bgCenter: { x: number; y: number } | null;
+		placedArtboard: { w: number; h: number };
+	}
+
+	let historyRecording = true;
+	let historyStack: CanvasSnapshot[] = [];
+	let historyIndex = -1;
+
+	function captureSnapshot(): CanvasSnapshot {
+		return {
+			rocks: placed.map((p) => ({
+				pathData: p.pathData,
+				fillColor: (p.fillColor as paper.Color | null)?.toCSS(true) ?? app.nextColor.hex
+			})),
+			attach: placed.flatMap((p, i) => {
+				const id = attach.get(p);
+				return id ? ([[i, id]] as [number, string][]) : [];
+			}),
+			pins: placed.flatMap((p, i) => {
+				const fill = fills.get(p);
+				if (!fill) return [];
+				return [
+					[
+						i,
+						{
+							imageId: fill.imageId,
+							scaleX: fill.raster.scaling.x,
+							scaleY: fill.raster.scaling.y,
+							x: fill.raster.position.x,
+							y: fill.raster.position.y
+						}
+					] as [number, PinTransform]
+				];
+			}),
+			backgroundImageId: app.backgroundImageId,
+			bgScale,
+			bgCenter: bgCenter ? { x: bgCenter.x, y: bgCenter.y } : null,
+			placedArtboard: { ...placedArtboard }
+		};
+	}
+
+	function recomputeGroups() {
+		groupParent = placed.map((_, i) => i);
+		for (let i = 0; i < placed.length; i++) {
+			for (let j = 0; j < i; j++) {
+				if (!placed[j].bounds.expand(GROUP_EPS * 4).intersects(placed[i].bounds)) continue;
+				if (outlineDistance(placed[i], placed[j]) <= GROUP_EPS) {
+					groupParent[findGroup(j)] = findGroup(i);
+				}
+			}
+		}
+	}
+
+	function restoreSnapshot(snap: CanvasSnapshot) {
+		clearFills();
+		for (const p of placed) p.remove();
+		placed = [];
+		groupParent = [];
+		attach.clear();
+
+		for (const rock of snap.rocks) {
+			const path = new paper.Path({ insert: false });
+			path.pathData = rock.pathData;
+			path.fillColor = new paper.Color(rock.fillColor);
+			paper.project.activeLayer.addChild(path);
+			placed.push(path);
+		}
+
+		recomputeGroups();
+		placedArtboard = { ...snap.placedArtboard };
+
+		for (const [i, imageId] of snap.attach) {
+			const path = placed[i];
+			if (path) attach.set(path, imageId);
+		}
+
+		app.backgroundImageId = snap.backgroundImageId;
+		bgScale = snap.bgScale;
+		bgCenter = snap.bgCenter ? new paper.Point(snap.bgCenter.x, snap.bgCenter.y) : null;
+		bgId = snap.backgroundImageId;
+
+		syncFills();
+
+		for (const [i, pin] of snap.pins) {
+			const path = placed[i];
+			const fill = path ? fills.get(path) : undefined;
+			if (!fill || fill.imageId !== pin.imageId) continue;
+			fill.raster.scaling = new paper.Point(pin.scaleX, pin.scaleY);
+			fill.raster.position = new paper.Point(pin.x, pin.y);
+		}
+
+		if (bgFill) reapplyBg();
+		app.placedCount = placed.length;
+		updateGhost();
+	}
+
+	function syncHistoryFlags() {
+		app.setUndoRedo(historyIndex > 0, historyIndex < historyStack.length - 1);
+	}
+
+	function initHistory() {
+		historyStack = [captureSnapshot()];
+		historyIndex = 0;
+		syncHistoryFlags();
+	}
+
+	function commitHistory() {
+		if (!historyRecording || !ready) return;
+		const snap = captureSnapshot();
+		historyStack = historyStack.slice(0, historyIndex + 1);
+		historyStack.push(snap);
+		historyIndex++;
+		syncHistoryFlags();
+	}
+
+	function undoHistory() {
+		if (historyIndex <= 0) return;
+		historyIndex--;
+		historyRecording = false;
+		restoreSnapshot(historyStack[historyIndex]);
+		historyRecording = true;
+		syncHistoryFlags();
+	}
+
+	function redoHistory() {
+		if (historyIndex >= historyStack.length - 1) return;
+		historyIndex++;
+		historyRecording = false;
+		restoreSnapshot(historyStack[historyIndex]);
+		historyRecording = true;
+		syncHistoryFlags();
+	}
 
 	function loadImage(id: string, src: string) {
 		const img = new Image();
@@ -111,6 +268,30 @@
 		return Math.min(Math.max(v, lo), hi);
 	}
 
+	function coverScale(el: HTMLImageElement, w: number, h: number): number {
+		return Math.max(w / el.naturalWidth, h / el.naturalHeight);
+	}
+
+	function clampBgScale(scale: number, el: HTMLImageElement, rect: paper.Rectangle): number {
+		if (rect.width <= 0 || rect.height <= 0) return scale;
+		const min = coverScale(el, rect.width, rect.height);
+		return clamp(scale, min, min * MAX_ZOOM);
+	}
+
+	function clampPinRaster(raster: paper.Raster, clip: paper.Path, el: HTMLImageElement) {
+		const min = coverScale(el, clip.bounds.width, clip.bounds.height);
+		const max = min * MAX_ZOOM;
+		const sx = raster.scaling.x;
+		const sy = raster.scaling.y;
+		raster.scaling = new paper.Point(clamp(sx, min, max), clamp(sy, min, max));
+	}
+
+	/** Paper.js clipped groups often fail to paint until the raster has loaded. */
+	function whenRasterReady(raster: paper.Raster, fn: () => void) {
+		if (raster.loaded) fn();
+		else raster.onLoad = fn;
+	}
+
 	/** Establish the background baseline (cover the whole view, centered) when
 	 *  it isn't set yet or the background image changed. */
 	function ensureBgInit() {
@@ -132,19 +313,34 @@
 		}
 	}
 
+	/** Bounds of every rock in the unified background mask. */
+	function bgClipBounds(): paper.Rectangle | null {
+		if (!bgFill?.groups.length) return null;
+		let bounds = bgFill.groups[0].clip.bounds;
+		for (let i = 1; i < bgFill.groups.length; i++) {
+			bounds = bounds.unite(bgFill.groups[i].clip.bounds);
+		}
+		return bounds;
+	}
+
+	function bgFillReady(): boolean {
+		return !!bgFill && bgFill.groups.length > 0 && bgFill.groups.every((g) => g.raster.loaded);
+	}
+
 	/** Clamp the background transform so it still covers the unified silhouette,
-	 *  then push it to the single background raster (the unified move/pan). */
+	 *  then push it to every background raster (they share one pan/zoom). */
 	function reapplyBg() {
 		if (!bgFill || !bgCenter) return;
 		const bg = app.backgroundImageId;
 		const el = bg ? imageEls.get(bg) : undefined;
 		if (!el) return;
+		const clipBounds = bgClipBounds();
+		if (!clipBounds) return;
 		// Only keep the on-canvas part of the silhouette covered; the mask may
 		// extend past the frame, and image edges hidden there are fine.
-		const rect = bgFill.clip.bounds.intersect(viewBounds());
+		const rect = clipBounds.intersect(viewBounds());
 		if (rect.width > 0 && rect.height > 0) {
-			const minScale = Math.max(rect.width / el.naturalWidth, rect.height / el.naturalHeight);
-			if (bgScale < minScale) bgScale = minScale;
+			bgScale = clampBgScale(bgScale, el, rect);
 			const halfW = (el.naturalWidth * bgScale) / 2;
 			const halfH = (el.naturalHeight * bgScale) / 2;
 			bgCenter = new paper.Point(
@@ -152,31 +348,32 @@
 				clamp(bgCenter.y, rect.bottom - halfH, rect.top + halfH)
 			);
 		}
-		bgFill.raster.scaling = new paper.Size(bgScale, bgScale);
-		bgFill.raster.position = bgCenter;
+		for (const { raster, clip } of bgFill.groups) {
+			raster.scaling = new paper.Point(bgScale, bgScale);
+			raster.position = bgCenter;
+			coverClamp(raster, clip.bounds);
+		}
 	}
 
 	function addPinFill(path: paper.Path, imageId: string) {
 		const el = imageEls.get(imageId);
 		if (!el) return;
-		const clip = path.clone({ insert: false }) as paper.Path;
-		clip.data = {};
-		// A rock hidden behind the background clones to visible=false; keep the
-		// clip visible so it actually masks the image.
-		clip.visible = true;
+		const clip = cloneRockGeometry(path);
 		const raster = new paper.Raster(el);
-		const cover = Math.max(
-			path.bounds.width / el.naturalWidth,
-			path.bounds.height / el.naturalHeight
-		);
-		raster.scaling = new paper.Size(cover, cover);
+		const cover = coverScale(el, path.bounds.width, path.bounds.height);
+		raster.scaling = new paper.Point(cover, cover);
 		raster.position = path.bounds.center;
 		const group = new paper.Group([clip, raster]);
 		group.clipped = true;
-		coverClamp(raster, clip.bounds);
 		paper.project.activeLayer.addChild(group);
-		path.visible = false;
-		fills.set(path, { group, clip, raster, imageId });
+		const fill: PinFill = { group, clip, raster, imageId };
+		fills.set(path, fill);
+		whenRasterReady(raster, () => {
+			coverClamp(raster, clip.bounds);
+			clampPinRaster(raster, clip, el);
+			path.visible = false;
+			paper.view.update();
+		});
 	}
 
 	function removeFill(path: paper.Path) {
@@ -188,7 +385,8 @@
 	}
 
 	function removeBgFill() {
-		bgFill?.group.remove();
+		if (!bgFill) return;
+		for (const { group } of bgFill.groups) group.remove();
 		bgFill = null;
 	}
 
@@ -197,8 +395,21 @@
 		removeBgFill();
 	}
 
-	/** Merge every un-pinned rock into one silhouette and clip the single
-	 *  background image to it — the shapes become one unified mask. */
+	/** Clone a placed rock's geometry for masking. Hidden paths can produce
+	 *  broken clones in Paper.js, so rebuild from pathData + matrix instead. */
+	function cloneRockGeometry(p: paper.Path): paper.Path {
+		const c = new paper.Path({ insert: false });
+		c.pathData = p.pathData;
+		c.matrix = p.matrix.clone();
+		c.fillColor = null;
+		c.strokeColor = null;
+		c.visible = true;
+		return c;
+	}
+
+	/** Clip the same background image to each un-pinned rock. CompoundPath and
+	 *  boolean-unite masks fail to paint in Paper.js clipped groups, but one
+	 *  group per rock (sharing the same pan/zoom) works reliably. */
 	function buildBgFill() {
 		removeBgFill();
 		const bg = app.backgroundImageId;
@@ -207,31 +418,26 @@
 		const bgPaths = placed.filter((p) => !attach.has(p));
 		if (bgPaths.length === 0) return;
 
-		// Boolean ops ignore operands with visible=false (the rocks are hidden
-		// behind the background), so unite visible clones instead — otherwise
-		// previously placed shapes silently drop out of the merged mask.
-		const clones = bgPaths.map((p) => {
-			const c = p.clone({ insert: false }) as paper.PathItem;
-			c.visible = true;
-			return c;
-		});
-		let union = clones[0];
-		for (let i = 1; i < clones.length; i++) {
-			const next = union.unite(clones[i], { insert: false });
-			union.remove();
-			clones[i].remove();
-			union = next;
+		const groups: BgFillGroup[] = [];
+		for (const path of bgPaths) {
+			const clip = cloneRockGeometry(path);
+			const raster = new paper.Raster(el);
+			raster.scaling = new paper.Point(bgScale, bgScale);
+			raster.position = bgCenter ?? paper.view.center;
+			const group = new paper.Group([clip, raster]);
+			group.clipped = true;
+			paper.project.activeLayer.addChild(group);
+			groups.push({ group, clip, raster });
+			whenRasterReady(raster, () => {
+				coverClamp(raster, clip.bounds);
+				reapplyBg();
+				for (const rock of placed) {
+					if (!fills.has(rock)) rock.visible = false;
+				}
+				paper.view.update();
+			});
 		}
-		union.data = {};
-		union.visible = true;
-
-		const raster = new paper.Raster(el);
-		raster.scaling = new paper.Size(bgScale, bgScale);
-		raster.position = bgCenter ?? paper.view.center;
-		const group = new paper.Group([union, raster]);
-		group.clipped = true;
-		paper.project.activeLayer.addChild(group);
-		bgFill = { group, clip: union, raster };
+		bgFill = { groups };
 	}
 
 	/** Bring every rock's fill in line with the current pins/background,
@@ -269,14 +475,15 @@
 		buildBgFill();
 		reapplyBg();
 
-		// Un-pinned rocks are hidden behind the background union, or show their
-		// solid colour when there is no background.
+		// Un-pinned rocks hide behind the background union once its raster has
+		// painted; pinned rocks hide once their own raster is ready.
 		for (const path of placed) {
-			if (fills.has(path)) {
-				path.visible = false;
+			const pin = fills.get(path);
+			if (pin) {
+				path.visible = !pin.raster.loaded;
 				continue;
 			}
-			path.visible = !bgFill;
+			path.visible = !bgFill || !bgFillReady();
 		}
 	}
 
@@ -338,8 +545,19 @@
 				if (iid === id) attach.delete(p);
 			}
 			attach.set(path, id);
+			// Return to placing rocks after a single attach.
+			app.activeImageId = null;
 		}
 		syncFills();
+	}
+
+	/** Apply the active palette color to an already-placed rock. */
+	function recolorShape(path: paper.Path): boolean {
+		const hex = app.nextColor.hex;
+		const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
+		if (cur === hex) return false;
+		path.fillColor = new paper.Color(hex);
+		return true;
 	}
 
 	function findGroup(i: number): number {
@@ -387,6 +605,17 @@
 	 *  as the position the user meant. */
 	const CURSOR_ATTACH_DIST = 24;
 
+	/** A CSS cursor showing a filled circle of the given color — used when
+	 *  hovering a rock in place mode to signal the color that will be dropped. */
+	function colorDropCursor(hex: string): string {
+		const svg =
+			`<svg xmlns='http://www.w3.org/2000/svg' width='26' height='26'>` +
+			`<circle cx='13' cy='13' r='9' fill='${hex}' stroke='#101A31' stroke-width='1.5'/>` +
+			`</svg>`;
+		const encoded = svg.replace(/#/g, '%23').replace(/</g, '%3C').replace(/>/g, '%3E');
+		return `url("data:image/svg+xml,${encoded}") 13 13, pointer`;
+	}
+
 	/** Scaled clone of the active rock, positioned at the cursor and snapped.
 	 *  `placeable` is true only when the snap is valid AND the resolved shape
 	 *  is still under (or right next to) the cursor. */
@@ -413,6 +642,10 @@
 		// With an image selected, hovering a shape will attach the image rather
 		// than place a new rock, so don't show the placement ghost there.
 		if (app.activeImageId && shapeAt(pointer)) return;
+
+		// Hovering an existing rock recolors it on click. Skip the placement
+		// ghost there — the colored circle cursor communicates the drop instead.
+		if (shapeAt(pointer)) return;
 
 		const { cand, snap, placeable } = makeSnappedCandidate(pointer);
 
@@ -473,6 +706,7 @@
 		clearPlaced();
 		resetOverlay();
 		updateGhost();
+		if (app.designMode === 'place') commitHistory();
 	}
 
 	function exportPng(transparent = false) {
@@ -525,13 +759,15 @@
 			ctx.restore();
 		}
 
-		// The single unified background image, masked by the merged silhouette.
+		// The unified background image, masked by each un-pinned rock silhouette.
 		const bgEl = app.backgroundImageId ? imageEls.get(app.backgroundImageId) : undefined;
 		if (bgFill && bgEl) {
-			ctx.save();
-			ctx.clip(new Path2D(bgFill.clip.pathData));
-			drawRaster(bgEl, bgFill.raster);
-			ctx.restore();
+			for (const { clip, raster } of bgFill.groups) {
+				ctx.save();
+				ctx.clip(new Path2D(clip.pathData));
+				drawRaster(bgEl, raster);
+				ctx.restore();
+			}
 		}
 
 		const link = document.createElement('a');
@@ -607,11 +843,23 @@
 		if (app.backgroundImageId) syncFills();
 
 		app.placedCount++;
+		commitHistory();
 	}
 
-	function setup(canvas: HTMLCanvasElement) {
-		canvasEl = canvas;
-		paper.setup(canvas);
+	function setupPaper() {
+		if (!canvasEl) return;
+		paper.setup(canvasEl);
+		(window as unknown as { __paper: typeof paper; __bg: () => unknown }).__paper = paper;
+		(window as unknown as { __bg: () => unknown }).__bg = () =>
+			bgFill
+				? {
+						groupCount: bgFill.groups.length,
+						autoUpdate: (paper.view as unknown as { autoUpdate: boolean }).autoUpdate,
+						rasterLoaded: bgFill.groups.map((g) => g.raster.loaded),
+						bgScale,
+						bgCenter
+					}
+				: 'no bgFill';
 
 		sourcePaths = ROCK_SVGS.map((svg) => {
 			const group = paper.project.importSVG(svg, { insert: false });
@@ -628,11 +876,10 @@
 
 		// Snap resolution is too heavy to run for every mousemove event, so
 		// coalesce moves and recompute the ghost at most once per frame.
-		let raf = 0;
 		const scheduleGhostUpdate = () => {
-			if (raf) return;
-			raf = requestAnimationFrame(() => {
-				raf = 0;
+			if (ghostRaf) return;
+			ghostRaf = requestAnimationFrame(() => {
+				ghostRaf = 0;
 				updateGhost();
 			});
 		};
@@ -658,12 +905,18 @@
 				return;
 			}
 			if (canvasEl) {
-				// Grab over a picture; copy where the active image could attach.
+				const shape = shapeAt(event.point);
+				// Grab over a picture; copy where the active image could attach;
+				// a colored circle where dropping the active color recolors a rock.
 				canvasEl.style.cursor = hitAt(event.point)
 					? 'grab'
-					: app.activeImageId && shapeAt(event.point)
+					: app.activeImageId && shape
 						? 'copy'
-						: '';
+						: shape
+							? app.designMode === 'place'
+								? colorDropCursor(app.nextColor.hex)
+								: 'pointer'
+							: '';
 			}
 			if (app.designMode !== 'place') return;
 			pointer = event.point;
@@ -681,33 +934,42 @@
 			if (hit) imageDrag = { kind: hit.kind, fill: hit.fill, last: event.point };
 		};
 		paper.view.onMouseUp = () => {
+			if (imageDrag && didDragImage) commitHistory();
 			imageDrag = null;
 			if (canvasEl) canvasEl.style.cursor = '';
 		};
 		paper.view.onClick = (event: paper.MouseEvent) => {
-			// A drag that repositioned an image must not also place/attach.
+			// A drag that repositioned an image must not also place/attach/recolor.
 			if (didDragImage) {
 				didDragImage = false;
 				return;
 			}
+			const shape = shapeAt(event.point);
 			// With an image selected, clicking a rock pins the image to it.
-			if (app.activeImageId) {
-				const hit = shapeAt(event.point);
-				if (hit) {
-					attachActiveImage(hit);
-					return;
-				}
+			if (app.activeImageId && shape) {
+				attachActiveImage(shape);
+				commitHistory();
+				return;
 			}
 			if (app.designMode !== 'place') return;
+			// Clicking an existing rock applies the active color.
+			if (shape) {
+				if (recolorShape(shape)) commitHistory();
+				return;
+			}
 			placeRock(event.point);
 		};
 
 		ready = true;
+		initHistory();
+	}
 
+	onMount(() => {
+		setupPaper();
 		return () => {
 			ready = false;
 			canvasEl = null;
-			if (raf) cancelAnimationFrame(raf);
+			if (ghostRaf) cancelAnimationFrame(ghostRaf);
 			placed = [];
 			groupParent = [];
 			fills = new Map();
@@ -717,7 +979,7 @@
 			bgId = null;
 			paper.project.clear();
 		};
-	}
+	});
 
 	function unitedBounds(): paper.Rectangle {
 		let bounds = placed[0].bounds;
@@ -821,6 +1083,32 @@
 		showExportDialog = true;
 	});
 
+	$effect(() => {
+		if (!ready || app.designMode !== 'place') return;
+		const version = app.undoVersion;
+		if (version === seenUndoVersion) return;
+		seenUndoVersion = version;
+		untrack(() => undoHistory());
+	});
+
+	$effect(() => {
+		if (!ready || app.designMode !== 'place') return;
+		const version = app.redoVersion;
+		if (version === seenRedoVersion) return;
+		seenRedoVersion = version;
+		untrack(() => redoHistory());
+	});
+
+	// Fresh undo stack when returning to place mode from shuffle.
+	$effect(() => {
+		if (!ready) return;
+		const mode = app.designMode;
+		if (mode === 'place' && lastDesignMode !== 'place') {
+			untrack(() => initHistory());
+		}
+		lastDesignMode = mode;
+	});
+
 	// Drive the native <dialog> from the open flag so it gets focus trapping,
 	// Escape-to-close, and a backdrop for free.
 	$effect(() => {
@@ -850,9 +1138,12 @@
 				bgCenter = point.add(bgCenter.subtract(point).multiply(factor));
 				reapplyBg();
 			} else if (hit.kind === 'pin') {
+				const el = imageEls.get(hit.fill.imageId);
 				hit.fill.raster.scale(factor, point);
 				coverClamp(hit.fill.raster, hit.fill.clip.bounds);
+				if (el) clampPinRaster(hit.fill.raster, hit.fill.clip, el);
 			}
+			commitHistory();
 			return;
 		}
 		if (app.designMode !== 'place') return;
@@ -868,6 +1159,13 @@
 				event.preventDefault();
 				confirmExport();
 			}
+			return;
+		}
+		const mod = event.metaKey || event.ctrlKey;
+		if (mod && event.key === 'z' && app.designMode === 'place') {
+			event.preventDefault();
+			if (event.shiftKey) app.redo();
+			else app.undo();
 			return;
 		}
 		if (app.designMode !== 'place') return;
@@ -891,10 +1189,10 @@
 
 <div class="wrap" class:shuffle={app.designMode === 'shuffle'} bind:clientWidth={stageW} bind:clientHeight={stageH}>
 	<canvas
+		bind:this={canvasEl}
 		style:width="{artboard.w}px"
 		style:height="{artboard.h}px"
 		onwheel={onWheel}
-		{@attach setup}
 	></canvas>
 </div>
 
@@ -946,11 +1244,11 @@
 
 	.modal {
 		width: 100%;
-		max-width: 340px;
+		max-width: 300px;
 		box-sizing: border-box;
 		padding: 0;
 		border: none;
-		border-radius: 16px;
+		border-radius: 6px;
 		background: var(--paper);
 		color: var(--ink);
 		box-shadow: 0 12px 48px rgba(16, 26, 49, 0.28);
@@ -964,13 +1262,13 @@
 	.modal-body {
 		display: flex;
 		flex-direction: column;
-		gap: 18px;
-		padding: 22px;
+		gap: 12px;
+		padding: 16px;
 	}
 
 	.modal-title {
 		margin: 0;
-		font-size: 16px;
+		font-size: 14px;
 		font-weight: 700;
 		color: var(--ink);
 	}
@@ -1011,8 +1309,8 @@
 	}
 
 	.preview {
-		height: 72px;
-		border-radius: 10px;
+		height: 56px;
+		border-radius: 4px;
 		border: 1px solid var(--border);
 		background: #ffffff;
 	}
@@ -1037,11 +1335,11 @@
 
 	.modal-btn {
 		font: inherit;
-		height: 40px;
-		padding: 0 16px;
-		font-size: 13px;
+		height: 32px;
+		padding: 0 12px;
+		font-size: 12px;
 		font-weight: 600;
-		border-radius: 10px;
+		border-radius: 4px;
 		cursor: pointer;
 		transition: transform 120ms ease, opacity 120ms ease, background-color 120ms ease;
 	}

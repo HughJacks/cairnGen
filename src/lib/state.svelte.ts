@@ -73,6 +73,10 @@ class AppState {
 	rotation = $state(0);
 	clearVersion = $state(0);
 	exportVersion = $state(0);
+	undoVersion = $state(0);
+	redoVersion = $state(0);
+	canUndo = $state(false);
+	canRedo = $state(false);
 
 	/** Per-item shuffle selections — only used in shuffle design mode.
 	 *  Every color, shape, and size is on by default; toggling an entry
@@ -113,9 +117,15 @@ class AppState {
 	}
 
 	/** Make an image fill every shape, or turn that off. Exclusive: enabling one
-	 *  clears any previous background image. */
+	 *  clears any previous background image. Deselects the tray image so canvas
+	 *  clicks keep placing rocks instead of attaching to shapes. */
 	toggleBackground(id: string) {
-		this.backgroundImageId = this.backgroundImageId === id ? null : id;
+		if (this.backgroundImageId === id) {
+			this.backgroundImageId = null;
+			return;
+		}
+		this.backgroundImageId = id;
+		this.activeImageId = null;
 	}
 
 	/** Hex fills currently allowed in the shuffle. */
@@ -217,6 +227,19 @@ class AppState {
 
 	clear() {
 		this.clearVersion++;
+	}
+
+	undo() {
+		if (this.canUndo) this.undoVersion++;
+	}
+
+	redo() {
+		if (this.canRedo) this.redoVersion++;
+	}
+
+	setUndoRedo(canUndo: boolean, canRedo: boolean) {
+		this.canUndo = canUndo;
+		this.canRedo = canRedo;
 	}
 
 	exportPng() {
