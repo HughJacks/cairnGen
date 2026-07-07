@@ -245,14 +245,20 @@ function findContact(cand: Candidate, nearby: paper.Path[], bounds: paper.Rectan
 }
 
 /** Every point where the candidate currently touches a rock or the ground. */
-function allContacts(cand: Candidate, nearby: paper.Path[], bounds: paper.Rectangle, mode: Mode): paper.Point[] {
+function allContacts(
+	cand: Candidate,
+	nearby: paper.Path[],
+	bounds: paper.Rectangle,
+	mode: Mode,
+	touchEps = TOUCH_EPS
+): paper.Point[] {
 	const pts: paper.Point[] = [];
 	for (const p of nearby) {
-		if (!p.bounds.expand(TOUCH_EPS * 8).intersects(cand.path.bounds)) continue;
+		if (!p.bounds.expand(touchEps * 8).intersects(cand.path.bounds)) continue;
 		const pair = nearestPairFrom(cand.samples, cand.path, p);
-		if (pair.dist <= TOUCH_EPS) pts.push(pair.onTarget);
+		if (pair.dist <= touchEps) pts.push(pair.onTarget);
 	}
-	if (mode === 'stack' && groundDistance(cand.path, bounds) <= TOUCH_EPS) {
+	if (mode === 'stack' && groundDistance(cand.path, bounds) <= touchEps) {
 		pts.push(groundContactPoint(cand));
 	}
 	return pts;
@@ -279,9 +285,9 @@ export function getShapeContacts(
 	mode: Mode
 ): paper.Point[] {
 	const others = placed.filter((p) => p !== path);
-	const nearby = others.filter((p) => p.bounds.expand(SNAP_RADIUS * 2).intersects(path.bounds));
 	const cand = new Candidate(path);
-	return allContacts(cand, nearby, bounds, mode);
+	// Use GROUP_EPS so selection dots match the same touch threshold as grouping.
+	return allContacts(cand, others, bounds, mode, GROUP_EPS);
 }
 
 // ---------------------------------------------------------------------------

@@ -498,6 +498,7 @@
 			}
 			path.visible = !bgFill || !bgFillReady();
 		}
+		if (selectedPath && placed.includes(selectedPath)) raiseSelectionVisuals();
 	}
 
 	/** Drop loaded elements + pins for images that no longer exist, then sync. */
@@ -642,6 +643,12 @@
 			paper.project.activeLayer.addChild(m);
 			contactMarkers.push(m);
 		}
+		raiseSelectionVisuals();
+	}
+
+	function raiseSelectionVisuals() {
+		selectionOutline?.bringToFront();
+		for (const m of contactMarkers) m.bringToFront();
 	}
 
 	function updateSelectionOutline() {
@@ -659,6 +666,7 @@
 		outline.opacity = 0.55;
 		paper.project.activeLayer.addChild(outline);
 		selectionOutline = outline;
+		raiseSelectionVisuals();
 	}
 
 	function updateSelectionVisuals() {

@@ -89,101 +89,57 @@
 		</div>
 	</div>
 
-	{#if app.designMode === 'place'}
-		<div class="group">
-			<div class="row wrap">
-				{#each ROCK_SVGS as _svg, i (i)}
-					<button
-						class={['shape', { on: app.rockIndex === i }]}
-						onclick={() => app.selectRock(i)}
-						title="Shape {i + 1}"
-						aria-label="Shape {i + 1}"
-						aria-pressed={app.rockIndex === i}
-					>
-						<img src={ROCK_IMAGE_URLS[i]} alt="" />
-					</button>
-				{/each}
-			</div>
+	<div class="group">
+		<div class="row wrap">
+			{#each ROCK_SVGS as _svg, i (i)}
+				{@const shapeOn =
+					app.designMode === 'place' ? app.rockIndex === i : app.shapeEnabled[i]}
+				<button
+					class={['shape', { on: shapeOn }]}
+					onclick={() =>
+						app.designMode === 'place' ? app.selectRock(i) : app.toggleShape(i)}
+					title="Shape {i + 1}"
+					aria-label="Shape {i + 1}"
+					aria-pressed={shapeOn}
+				>
+					<img src={ROCK_IMAGE_URLS[i]} alt="" />
+				</button>
+			{/each}
 		</div>
+	</div>
 
-		<div class="group">
-			<div class="color-grid">
-				{#each ROCK_COLORS as color, i (color.hex)}
-					<button
-						class={['dot dot-button', { on: app.colorIndex === i }]}
-						style:background={color.hex}
-						onclick={() => app.selectColor(i)}
-						title={color.name}
-						aria-label={color.name}
-						aria-pressed={app.colorIndex === i}
-					></button>
-				{/each}
-			</div>
+	<div class="group">
+		<div class="color-grid">
+			{#each ROCK_COLORS as color, i (color.hex)}
+				{@const colorOn =
+					app.designMode === 'place' ? app.colorIndex === i : app.colorEnabled[i]}
+				<button
+					class={['dot dot-button', { on: colorOn }]}
+					style:background={color.hex}
+					onclick={() =>
+						app.designMode === 'place' ? app.selectColor(i) : app.toggleColor(i)}
+					title={color.name}
+					aria-label={color.name}
+					aria-pressed={colorOn}
+				></button>
+			{/each}
 		</div>
+	</div>
 
-		<div class="group">
-			<div class="row segmented">
-				{#each ROCK_SIZES as size, i (size.label)}
-					<button
-						class={['chip size-chip', { active: app.sizeIndex === i }]}
-						onclick={() => app.selectSize(i)}
-						title="Size {size.label}"
-						aria-pressed={app.sizeIndex === i}
-					>
-						{size.label}
-					</button>
-				{/each}
-			</div>
+	<div class="group">
+		<div class="row segmented">
+			{#each ROCK_SIZES as size, i (size.label)}
+				<button
+					class={['chip size-chip', { active: app.sizeIndex === i }]}
+					onclick={() => app.selectSize(i)}
+					title="Size {size.label}"
+					aria-pressed={app.sizeIndex === i}
+				>
+					{size.label}
+				</button>
+			{/each}
 		</div>
-	{:else}
-		<div class="group">
-			<span class="label">Colors</span>
-			<div class="color-grid">
-				{#each ROCK_COLORS as color, i (color.hex)}
-					<button
-						class={['dot dot-button', { on: app.colorEnabled[i] }]}
-						style:background={color.hex}
-						onclick={() => app.toggleColor(i)}
-						title="{color.name} {app.colorEnabled[i] ? 'on' : 'off'}"
-						aria-pressed={app.colorEnabled[i]}
-						aria-label={color.name}
-					></button>
-				{/each}
-			</div>
-		</div>
-
-		<div class="group">
-			<span class="label">Shapes</span>
-			<div class="row wrap">
-				{#each ROCK_SVGS as _svg, i (i)}
-					<button
-						class={['shape', { on: app.shapeEnabled[i] }]}
-						onclick={() => app.toggleShape(i)}
-						title="Shape {i + 1} {app.shapeEnabled[i] ? 'on' : 'off'}"
-						aria-pressed={app.shapeEnabled[i]}
-					>
-						<img src={ROCK_IMAGE_URLS[i]} alt="" />
-					</button>
-				{/each}
-			</div>
-		</div>
-
-		<div class="group">
-			<span class="label">Size</span>
-			<div class="row segmented">
-				{#each ROCK_SIZES as size, i (size.label)}
-					<button
-						class={['chip size-chip', { active: app.sizeIndex === i }]}
-						onclick={() => app.selectSize(i)}
-						title="Size {size.label}"
-						aria-pressed={app.sizeIndex === i}
-					>
-						{size.label}
-					</button>
-				{/each}
-			</div>
-		</div>
-	{/if}
+	</div>
 
 	<div class="group image-tray">
 		<span class="label">Images</span>
@@ -352,7 +308,7 @@
 	.color-grid {
 		display: grid;
 		grid-template-columns: repeat(5, 24px);
-		gap: 4px;
+		gap: 8px;
 		justify-content: start;
 	}
 
