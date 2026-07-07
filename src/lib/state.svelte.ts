@@ -33,9 +33,7 @@ export const PALETTE: Swatch[] = [
 ];
 
 /** Colors that cycle as fills for placed rocks. */
-export const ROCK_COLORS: Swatch[] = PALETTE.filter(
-	(c) => c.name !== 'Ink' && c.name !== 'Paper'
-);
+export const ROCK_COLORS: Swatch[] = PALETTE.filter((c) => c.name !== 'Paper');
 
 import { ROCK_COUNT } from './rocks';
 
@@ -79,17 +77,16 @@ class AppState {
 	canRedo = $state(false);
 
 	/** Per-item shuffle selections — only used in shuffle design mode.
-	 *  Every color, shape, and size is on by default; toggling an entry
-	 *  removes it from the pool the shuffle draws from. */
+	 *  Every color and shape is on by default; toggling an entry removes it
+	 *  from the pool the shuffle draws from. Size uses `sizeIndex` (shared). */
 	colorEnabled = $state(ROCK_COLORS.map(() => true));
 	shapeEnabled = $state(Array.from({ length: ROCK_COUNT }, () => true));
-	sizeEnabled = $state(ROCK_SIZES.map(() => true));
 	shuffleSeed = $state(0);
 
 	/** Uploaded images available to attach to shapes. */
 	images = $state<UploadedImage[]>([]);
-	/** Image selected in the tray, waiting to be attached to a clicked shape. */
-	activeImageId: string | null = $state(null);
+	/** Image currently being masked/panned/zoomed in the canvas edit overlay. */
+	imageEditId: string | null = $state(null);
 	/** The single image that sits behind (fills) every shape, or null. Only one
 	 *  image may fill all shapes at a time. */
 	backgroundImageId: string | null = $state(null);
@@ -102,30 +99,28 @@ class AppState {
 	addImages(srcs: string[]) {
 		const added = srcs.map((src) => ({ id: `img-${++this.imageSeq}`, src }));
 		this.images = [...this.images, ...added];
-		if (!this.activeImageId && added.length) this.activeImageId = added[0].id;
 	}
 
 	removeImage(id: string) {
 		this.images = this.images.filter((im) => im.id !== id);
 		if (this.backgroundImageId === id) this.backgroundImageId = null;
-		if (this.activeImageId === id) this.activeImageId = this.images.at(-1)?.id ?? null;
+		if (this.imageEditId === id) this.cancelImageEdit();
 	}
 
-	/** Select (or deselect) an image to attach to the next clicked shape. */
-	selectImage(id: string) {
-		this.activeImageId = this.activeImageId === id ? null : id;
+	startImageEdit(id: string) {
+		this.imageEditId = id;
 	}
 
-	/** Make an image fill every shape, or turn that off. Exclusive: enabling one
-	 *  clears any previous background image. Deselects the tray image so canvas
-	 *  clicks keep placing rocks instead of attaching to shapes. */
-	toggleBackground(id: string) {
-		if (this.backgroundImageId === id) {
-			this.backgroundImageId = null;
-			return;
-		}
-		this.backgroundImageId = id;
-		this.activeImageId = null;
+	saveImageEdit() {
+		this.imageEditId = null;
+	}
+
+	cancelImageEdit() {
+		this.imageEditId = null;
+	}
+
+	get imageEditing(): boolean {
+		return this.imageEditId !== null;
 	}
 
 	/** Hex fills currently allowed in the shuffle. */
@@ -136,14 +131,6 @@ class AppState {
 	/** Rock indices currently allowed in the shuffle. */
 	get enabledShapes(): number[] {
 		return this.shapeEnabled.reduce<number[]>((acc, on, i) => {
-			if (on) acc.push(i);
-			return acc;
-		}, []);
-	}
-
-	/** Size indices currently allowed in the shuffle. */
-	get enabledSizes(): number[] {
-		return this.sizeEnabled.reduce<number[]>((acc, on, i) => {
 			if (on) acc.push(i);
 			return acc;
 		}, []);
@@ -204,10 +191,6 @@ class AppState {
 		this.shapeEnabled = this.toggleAt(this.shapeEnabled, i);
 	}
 
-	toggleSize(i: number) {
-		this.sizeEnabled = this.toggleAt(this.sizeEnabled, i);
-	}
-
 	shuffle() {
 		this.shuffleSeed++;
 	}
@@ -242,6 +225,7 @@ class AppState {
 		this.canRedo = canRedo;
 	}
 
+	/** Open the download dialog (PNG or SVG). */
 	exportPng() {
 		this.exportVersion++;
 	}

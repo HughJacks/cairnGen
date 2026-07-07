@@ -1,9 +1,9 @@
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
 	import paper from 'paper';
-	import { app, ASPECTS } from './state.svelte';
+	import { app, ASPECTS, ROCK_COLORS } from './state.svelte';
 	import { ROCK_SVGS } from './rocks';
-	import { resolveSnap, outlineDistance, GROUP_EPS } from './snapping';
+	import { resolveSnap, getShapeContacts, outlineDistance, GROUP_EPS } from './snapping';
 	import { generateShuffle } from './shuffle';
 
 	/** Height (in canvas px) of the tallest rock; all rocks share the same scale factor. */
@@ -21,9 +21,12 @@
 	let seenUndoVersion = app.undoVersion;
 	let seenRedoVersion = app.redoVersion;
 	let lastDesignMode = app.designMode;
+	let imageEditBaseline: CanvasSnapshot | null = null;
 
-	// Download dialog: pick a solid white or transparent background before saving.
+	// Download dialog: pick format and a solid white or transparent background before saving.
 	let showExportDialog = $state(false);
+	type ExportFormat = 'png' | 'svg';
+	let exportFormat = $state<ExportFormat>('png');
 	let exportTransparent = $state(false);
 	let dialogEl = $state<HTMLDialogElement | null>(null);
 
@@ -37,7 +40,8 @@
 	let sourcePaths: paper.Path[] = [];
 	let placed: paper.Path[] = [];
 	let ghost: paper.Path | null = null;
-	let markers: paper.Path[] = [];
+	let ghostMarkers: paper.Path[] = [];
+	let contactMarkers: paper.Path[] = [];
 	let balanceLine: paper.Path | null = null;
 	let pointer: paper.Point | null = null;
 
@@ -85,6 +89,14 @@
 	let imageLoadTick = $state(0);
 	let imageDrag: { kind: 'pin' | 'bg'; fill: PinFill | BgFill; last: paper.Point } | null = null;
 	let didDragImage = false;
+	let shapeDrag: {
+		path: paper.Path;
+		grabOffset: paper.Point;
+		lastValidPathData: string;
+	} | null = null;
+	let didDragShape = false;
+	let selectedPath: paper.Path | null = null;
+	let selectionOutline: paper.Path | null = null;
 	let ghostRaf = 0;
 
 	// --- Undo / redo ---------------------------------------------------------
@@ -195,6 +207,7 @@
 
 		if (bgFill) reapplyBg();
 		app.placedCount = placed.length;
+		selectShape(null);
 		updateGhost();
 	}
 
@@ -531,24 +544,46 @@
 		return null;
 	}
 
-	/** Pin the active tray image to a clicked rock (or unpin if already there). */
-	function attachActiveImage(path: paper.Path) {
-		const id = app.activeImageId;
+	/** Toggle the image being edited onto a shape (or remove it from that shape). */
+	function toggleImageMask(path: paper.Path) {
+		const id = app.imageEditId;
 		if (!id) return;
 		if (attach.get(path) === id) {
 			attach.delete(path);
 		} else {
-			// Becoming a per-instance pin means it can't also be the background.
 			if (app.backgroundImageId === id) app.backgroundImageId = null;
-			// One image lives on one shape: remove it from any previous rock.
 			for (const [p, iid] of [...attach]) {
 				if (iid === id) attach.delete(p);
 			}
 			attach.set(path, id);
-			// Return to placing rocks after a single attach.
-			app.activeImageId = null;
 		}
 		syncFills();
+	}
+
+	function maskAllDuringEdit() {
+		const id = app.imageEditId;
+		if (!id) return;
+		app.backgroundImageId = id;
+		for (const [path, iid] of [...attach]) {
+			if (iid === id) attach.delete(path);
+		}
+		syncFills();
+	}
+
+	function saveImageEditSession() {
+		imageEditBaseline = null;
+		app.saveImageEdit();
+		commitHistory();
+	}
+
+	function cancelImageEditSession() {
+		if (imageEditBaseline) {
+			historyRecording = false;
+			restoreSnapshot(imageEditBaseline);
+			historyRecording = true;
+		}
+		imageEditBaseline = null;
+		app.cancelImageEdit();
 	}
 
 	/** Apply the active palette color to an already-placed rock. */
@@ -557,6 +592,116 @@
 		const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
 		if (cur === hex) return false;
 		path.fillColor = new paper.Color(hex);
+		return true;
+	}
+
+	function snapOptions() {
+		return {
+			mode: app.mode,
+			getComponent,
+			requireContact: app.mode === 'stack'
+		} as const;
+	}
+
+	/** Resolve a placed rock against every other rock using the same snap rules
+	 *  as new placements. Restores `fallbackPathData` when the result is invalid. */
+	function resolveShapeSnap(path: paper.Path, fallbackPathData: string): boolean {
+		const others = placed.filter((p) => p !== path);
+		const snap = resolveSnap(path, others, viewBounds(), snapOptions());
+		if (!snap.valid) {
+			path.pathData = fallbackPathData;
+			return false;
+		}
+		return true;
+	}
+
+	function syncColorFromShape(path: paper.Path) {
+		const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
+		if (!cur) return;
+		const idx = ROCK_COLORS.findIndex((c) => c.hex.toLowerCase() === cur.toLowerCase());
+		if (idx >= 0) app.selectColor(idx);
+	}
+
+	function selectShape(path: paper.Path | null, syncColor = false) {
+		selectedPath = path;
+		if (path && syncColor) syncColorFromShape(path);
+		updateSelectionVisuals();
+		updateGhost();
+	}
+
+	function clearContactMarkers() {
+		for (const m of contactMarkers) m.remove();
+		contactMarkers = [];
+	}
+
+	function drawContactMarkers(contacts: paper.Point[]) {
+		clearContactMarkers();
+		for (const contact of contacts) {
+			const m = new paper.Path.Circle({ center: contact, radius: 4 });
+			m.fillColor = new paper.Color('#101A31');
+			paper.project.activeLayer.addChild(m);
+			contactMarkers.push(m);
+		}
+	}
+
+	function updateSelectionOutline() {
+		selectionOutline?.remove();
+		selectionOutline = null;
+		if (!selectedPath || !placed.includes(selectedPath)) {
+			selectedPath = null;
+			return;
+		}
+		const outline = cloneRockGeometry(selectedPath);
+		outline.strokeColor = new paper.Color('#101A31');
+		outline.strokeWidth = 1.5;
+		outline.dashArray = [5, 4];
+		outline.fillColor = null;
+		outline.opacity = 0.55;
+		paper.project.activeLayer.addChild(outline);
+		selectionOutline = outline;
+	}
+
+	function updateSelectionVisuals() {
+		updateSelectionOutline();
+		if (!selectedPath) {
+			clearContactMarkers();
+			return;
+		}
+		drawContactMarkers(getShapeContacts(selectedPath, placed, viewBounds(), app.mode));
+	}
+
+	/** Move a placed rock to follow the cursor, snapping like a new placement. */
+	function moveShapeTo(path: paper.Path, point: paper.Point, grabOffset: paper.Point, fallbackPathData: string): boolean {
+		path.position = point.add(grabOffset);
+		return resolveShapeSnap(path, fallbackPathData);
+	}
+
+	/** Rotate a placed rock and settle it with the same snap rules. */
+	function rotateShapeWithSnap(path: paper.Path, degrees: number): boolean {
+		const before = path.pathData;
+		path.rotate(degrees, path.bounds.center);
+		return resolveShapeSnap(path, before);
+	}
+
+	/** After moving or rotating a rock, rebuild fills and regroup contacts. */
+	function finalizeShapeTransform() {
+		syncFills();
+		updateSelectionVisuals();
+		recomputeGroups();
+	}
+
+	/** Remove a placed rock and any image fill pinned to it. */
+	function eraseShape(path: paper.Path): boolean {
+		const idx = placed.indexOf(path);
+		if (idx === -1) return false;
+		removeFill(path);
+		attach.delete(path);
+		path.remove();
+		placed.splice(idx, 1);
+		if (selectedPath === path) selectShape(null);
+		recomputeGroups();
+		if (app.backgroundImageId) syncFills();
+		app.placedCount = placed.length;
 		return true;
 	}
 
@@ -605,17 +750,6 @@
 	 *  as the position the user meant. */
 	const CURSOR_ATTACH_DIST = 24;
 
-	/** A CSS cursor showing a filled circle of the given color — used when
-	 *  hovering a rock in place mode to signal the color that will be dropped. */
-	function colorDropCursor(hex: string): string {
-		const svg =
-			`<svg xmlns='http://www.w3.org/2000/svg' width='26' height='26'>` +
-			`<circle cx='13' cy='13' r='9' fill='${hex}' stroke='#101A31' stroke-width='1.5'/>` +
-			`</svg>`;
-		const encoded = svg.replace(/#/g, '%23').replace(/</g, '%3C').replace(/>/g, '%3E');
-		return `url("data:image/svg+xml,${encoded}") 13 13, pointer`;
-	}
-
 	/** Scaled clone of the active rock, positioned at the cursor and snapped.
 	 *  `placeable` is true only when the snap is valid AND the resolved shape
 	 *  is still under (or right next to) the cursor. */
@@ -624,7 +758,7 @@
 		cand.scale(sizeScale);
 		cand.rotate(app.rotation);
 		cand.position = point;
-		const snap = resolveSnap(cand, placed, viewBounds(), { mode: app.mode, getComponent });
+		const snap = resolveSnap(cand, placed, viewBounds(), snapOptions());
 		const nearCursor =
 			cand.contains(point) || cand.getNearestPoint(point).getDistance(point) <= CURSOR_ATTACH_DIST;
 		return { cand, snap, placeable: snap.valid && nearCursor };
@@ -632,19 +766,14 @@
 
 	function updateGhost() {
 		ghost?.remove();
-		for (const m of markers) m.remove();
+		for (const m of ghostMarkers) m.remove();
 		balanceLine?.remove();
 		ghost = null;
-		markers = [];
+		ghostMarkers = [];
 		balanceLine = null;
-		if (!pointer || !ready || app.designMode === 'shuffle') return;
+		if (!pointer || !ready || app.designMode === 'shuffle' || app.imageEditId || selectedPath) return;
 
-		// With an image selected, hovering a shape will attach the image rather
-		// than place a new rock, so don't show the placement ghost there.
-		if (app.activeImageId && shapeAt(pointer)) return;
-
-		// Hovering an existing rock recolors it on click. Skip the placement
-		// ghost there — the colored circle cursor communicates the drop instead.
+		// Don't show a placement ghost over existing rocks — click to select instead.
 		if (shapeAt(pointer)) return;
 
 		const { cand, snap, placeable } = makeSnappedCandidate(pointer);
@@ -678,7 +807,7 @@
 			const m = new paper.Path.Circle({ center: contact, radius: 4 });
 			m.fillColor = new paper.Color('#101A31');
 			paper.project.activeLayer.addChild(m);
-			markers.push(m);
+			ghostMarkers.push(m);
 		}
 	}
 
@@ -689,17 +818,19 @@
 		for (const p of placed) p.remove();
 		placed = [];
 		groupParent = [];
+		selectShape(null);
 		placedArtboard = { w: artboard.w, h: artboard.h };
 		app.placedCount = 0;
 	}
 
 	function resetOverlay() {
 		ghost?.remove();
-		for (const m of markers) m.remove();
+		for (const m of ghostMarkers) m.remove();
 		balanceLine?.remove();
 		ghost = null;
-		markers = [];
+		ghostMarkers = [];
 		balanceLine = null;
+		updateSelectionVisuals();
 	}
 
 	function clearCanvas() {
@@ -707,6 +838,84 @@
 		resetOverlay();
 		updateGhost();
 		if (app.designMode === 'place') commitHistory();
+	}
+
+	function escapeXml(value: string): string {
+		return value
+			.replace(/&/g, '&amp;')
+			.replace(/</g, '&lt;')
+			.replace(/>/g, '&gt;')
+			.replace(/"/g, '&quot;');
+	}
+
+	function imageDataUrl(el: HTMLImageElement): string {
+		if (el.src.startsWith('data:')) return el.src;
+		const canvas = document.createElement('canvas');
+		canvas.width = el.naturalWidth;
+		canvas.height = el.naturalHeight;
+		const ctx = canvas.getContext('2d');
+		if (!ctx) return el.src;
+		ctx.drawImage(el, 0, 0);
+		return canvas.toDataURL('image/png');
+	}
+
+	function rasterSvgImage(el: HTMLImageElement, raster: paper.Raster): string {
+		const dw = el.naturalWidth * raster.scaling.x;
+		const dh = el.naturalHeight * raster.scaling.y;
+		const x = raster.position.x - dw / 2;
+		const y = raster.position.y - dh / 2;
+		const href = escapeXml(imageDataUrl(el));
+		return (
+			`<image x="${x}" y="${y}" width="${dw}" height="${dh}" ` +
+			`href="${href}" xlink:href="${href}" preserveAspectRatio="none"/>`
+		);
+	}
+
+	function exportSvg(transparent = false) {
+		const w = Math.max(Math.round(artboard.w), 1);
+		const h = Math.max(Math.round(artboard.h), 1);
+		const body: string[] = [];
+		const clips: string[] = [];
+		let clipIdx = 0;
+
+		if (!transparent) {
+			body.push(`<rect width="${w}" height="${h}" fill="#FFFFFF"/>`);
+		}
+
+		for (const path of placed) {
+			const fill = fills.get(path);
+			const el = fill ? imageEls.get(fill.imageId) : undefined;
+			if (fill && el) {
+				const id = `clip-${clipIdx++}`;
+				clips.push(`<clipPath id="${id}"><path d="${escapeXml(fill.clip.pathData)}"/></clipPath>`);
+				body.push(`<g clip-path="url(#${id})">${rasterSvgImage(el, fill.raster)}</g>`);
+				continue;
+			}
+			if (bgFill) continue;
+			const color = path.fillColor as paper.Color | null;
+			if (!color) continue;
+			body.push(`<path d="${escapeXml(path.pathData)}" fill="${color.toCSS(true)}"/>`);
+		}
+
+		const bgEl = app.backgroundImageId ? imageEls.get(app.backgroundImageId) : undefined;
+		if (bgFill && bgEl) {
+			for (const { clip, raster } of bgFill.groups) {
+				const id = `clip-${clipIdx++}`;
+				clips.push(`<clipPath id="${id}"><path d="${escapeXml(clip.pathData)}"/></clipPath>`);
+				body.push(`<g clip-path="url(#${id})">${rasterSvgImage(bgEl, raster)}</g>`);
+			}
+		}
+
+		const defs = clips.length ? `<defs>${clips.join('')}</defs>` : '';
+		const svg =
+			`<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" ` +
+			`width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">${defs}${body.join('')}</svg>`;
+
+		const link = document.createElement('a');
+		link.href = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
+		link.download = `cairn-${app.aspect.replace(':', 'x')}.svg`;
+		link.click();
+		URL.revokeObjectURL(link.href);
 	}
 
 	function exportPng(transparent = false) {
@@ -786,7 +995,7 @@
 			mode: app.mode,
 			colors: app.enabledColors,
 			shapes: app.enabledShapes,
-			sizes: app.enabledSizes,
+			sizeIndex: app.sizeIndex,
 			seed: app.shuffleSeed
 		});
 
@@ -890,6 +1099,10 @@
 			// button held, so there's no separate drag event to use.) Background
 			// images pan as one unified image; pinned images pan per-rock.
 			if (imageDrag) {
+				if (!app.imageEditId) {
+					imageDrag = null;
+					return;
+				}
 				const delta = event.point.subtract(imageDrag.last);
 				imageDrag.last = event.point;
 				if (imageDrag.kind === 'bg' && bgCenter) {
@@ -904,21 +1117,26 @@
 				if (canvasEl) canvasEl.style.cursor = 'grabbing';
 				return;
 			}
-			if (canvasEl) {
-				const shape = shapeAt(event.point);
-				// Grab over a picture; copy where the active image could attach;
-				// a colored circle where dropping the active color recolors a rock.
-				canvasEl.style.cursor = hitAt(event.point)
-					? 'grab'
-					: app.activeImageId && shape
-						? 'copy'
-						: shape
-							? app.designMode === 'place'
-								? colorDropCursor(app.nextColor.hex)
-								: 'pointer'
-							: '';
+			if (shapeDrag) {
+				const { path, grabOffset, lastValidPathData } = shapeDrag;
+				if (moveShapeTo(path, event.point, grabOffset, lastValidPathData)) {
+					shapeDrag.lastValidPathData = path.pathData;
+				}
+				updateSelectionVisuals();
+				didDragShape = true;
+				if (canvasEl) canvasEl.style.cursor = 'grabbing';
+				return;
 			}
-			if (app.designMode !== 'place') return;
+			if (canvasEl) {
+				if (app.imageEditId) {
+					const shape = shapeAt(event.point);
+					const hit = hitAt(event.point);
+					canvasEl.style.cursor = hit ? 'grab' : shape ? 'copy' : '';
+				} else {
+					canvasEl.style.cursor = '';
+				}
+			}
+			if (app.designMode !== 'place' || app.imageEditId) return;
 			pointer = event.point;
 			scheduleGhostUpdate();
 		};
@@ -930,31 +1148,51 @@
 		};
 		paper.view.onMouseDown = (event: paper.MouseEvent) => {
 			didDragImage = false;
-			const hit = hitAt(event.point);
-			if (hit) imageDrag = { kind: hit.kind, fill: hit.fill, last: event.point };
-		};
-		paper.view.onMouseUp = () => {
-			if (imageDrag && didDragImage) commitHistory();
-			imageDrag = null;
-			if (canvasEl) canvasEl.style.cursor = '';
-		};
-		paper.view.onClick = (event: paper.MouseEvent) => {
-			// A drag that repositioned an image must not also place/attach/recolor.
-			if (didDragImage) {
-				didDragImage = false;
+			didDragShape = false;
+			if (app.imageEditId) {
+				const hit = hitAt(event.point);
+				if (hit) imageDrag = { kind: hit.kind, fill: hit.fill, last: event.point };
 				return;
 			}
 			const shape = shapeAt(event.point);
-			// With an image selected, clicking a rock pins the image to it.
-			if (app.activeImageId && shape) {
-				attachActiveImage(shape);
+			if (app.designMode === 'place' && shape) {
+				selectShape(shape, true);
+				shapeDrag = {
+					path: shape,
+					grabOffset: shape.position.subtract(event.point),
+					lastValidPathData: shape.pathData
+				};
+			}
+		};
+		paper.view.onMouseUp = () => {
+			if (imageDrag && didDragImage && !app.imageEditId) commitHistory();
+			if (shapeDrag && didDragShape) {
+				finalizeShapeTransform();
 				commitHistory();
+			}
+			imageDrag = null;
+			shapeDrag = null;
+			if (canvasEl) canvasEl.style.cursor = '';
+		};
+		paper.view.onClick = (event: paper.MouseEvent) => {
+			if (didDragImage || didDragShape) {
+				didDragImage = false;
+				didDragShape = false;
+				return;
+			}
+			if (app.imageEditId) {
+				const shape = shapeAt(event.point);
+				if (shape) toggleImageMask(shape);
 				return;
 			}
 			if (app.designMode !== 'place') return;
-			// Clicking an existing rock applies the active color.
+			const shape = shapeAt(event.point);
 			if (shape) {
-				if (recolorShape(shape)) commitHistory();
+				selectShape(shape, true);
+				return;
+			}
+			if (selectedPath) {
+				selectShape(null);
 				return;
 			}
 			placeRock(event.point);
@@ -975,6 +1213,9 @@
 			fills = new Map();
 			attach = new Map();
 			imageDrag = null;
+			shapeDrag = null;
+			selectedPath = null;
+			selectionOutline = null;
 			bgCenter = null;
 			bgId = null;
 			paper.project.clear();
@@ -1018,6 +1259,7 @@
 		// Geometry moved/scaled, so fills (separate clip clones + rasters) are
 		// stale: rebuild them against the new layout and shared baseline.
 		rebuildFills();
+		updateSelectionVisuals();
 	}
 
 	// Keep the Paper view sized to the computed artboard and refit the
@@ -1037,8 +1279,30 @@
 		void app.rotation;
 		void app.mode;
 		void app.designMode;
-		void app.activeImageId;
+		void app.imageEditId;
 		updateGhost();
+	});
+
+	// Enter image edit: snapshot for cancel and clear shape selection.
+	$effect(() => {
+		if (!ready) return;
+		const id = app.imageEditId;
+		if (!id) return;
+		untrack(() => {
+			imageEditBaseline = captureSnapshot();
+			selectShape(null);
+			resetOverlay();
+		});
+	});
+
+	// When a shape is selected, palette changes recolor it.
+	$effect(() => {
+		const idx = app.colorIndex;
+		if (!ready || app.designMode !== 'place' || app.imageEditId || !selectedPath) return;
+		untrack(() => {
+			void idx;
+			if (recolorShape(selectedPath!)) commitHistory();
+		});
 	});
 
 	// Load new uploads, drop removed ones, and re-sync fills. Runs when the
@@ -1062,7 +1326,7 @@
 		// (same length) still regenerates.
 		void app.enabledColors.join(',');
 		void app.enabledShapes.join(',');
-		void app.enabledSizes.join(',');
+		void app.sizeIndex;
 		if (app.designMode !== 'shuffle') return;
 		untrack(() => runShuffle());
 	});
@@ -1119,7 +1383,8 @@
 
 	function confirmExport() {
 		showExportDialog = false;
-		exportPng(exportTransparent);
+		if (exportFormat === 'svg') exportSvg(exportTransparent);
+		else exportPng(exportTransparent);
 	}
 
 	function cancelExport() {
@@ -1128,9 +1393,9 @@
 
 	function onWheel(event: WheelEvent) {
 		const point = new paper.Point(event.offsetX, event.offsetY);
-		const hit = hitAt(point);
-		if (hit) {
-			// Resize the image inside its mask, zooming toward the cursor.
+		if (app.imageEditId) {
+			const hit = hitAt(point);
+			if (!hit) return;
 			event.preventDefault();
 			const factor = event.deltaY < 0 ? 1.08 : 1 / 1.08;
 			if (hit.kind === 'bg' && bgCenter) {
@@ -1143,7 +1408,14 @@
 				coverClamp(hit.fill.raster, hit.fill.clip.bounds);
 				if (el) clampPinRaster(hit.fill.raster, hit.fill.clip, el);
 			}
-			commitHistory();
+			return;
+		}
+		if (app.designMode === 'place' && selectedPath) {
+			event.preventDefault();
+			if (rotateShapeWithSnap(selectedPath, event.deltaY * 0.25)) {
+				finalizeShapeTransform();
+				commitHistory();
+			}
 			return;
 		}
 		if (app.designMode !== 'place') return;
@@ -1168,7 +1440,19 @@
 			else app.undo();
 			return;
 		}
+		if (app.imageEditId) {
+			if (event.key === 'Escape') {
+				event.preventDefault();
+				cancelImageEditSession();
+			}
+			return;
+		}
 		if (app.designMode !== 'place') return;
+		if ((event.key === 'Delete' || event.key === 'Backspace') && selectedPath) {
+			event.preventDefault();
+			if (eraseShape(selectedPath)) commitHistory();
+			return;
+		}
 		if (event.key === 'ArrowRight') {
 			event.preventDefault();
 			app.cycleRock(1);
@@ -1187,7 +1471,37 @@
 
 <svelte:window onkeydown={onKeydown} />
 
-<div class="wrap" class:shuffle={app.designMode === 'shuffle'} bind:clientWidth={stageW} bind:clientHeight={stageH}>
+<div class="wrap" class:shuffle={app.designMode === 'shuffle'} class:image-editing={!!app.imageEditId} bind:clientWidth={stageW} bind:clientHeight={stageH}>
+	{#if app.imageEditId}
+		<div class="image-edit-dim" aria-hidden="true"></div>
+		<div class="image-edit-bar" role="toolbar" aria-label="Image edit controls">
+			<button class="image-edit-action" type="button" onclick={maskAllDuringEdit}>Mask all</button>
+			<div class="image-edit-confirm">
+				<button
+					class="image-edit-icon save"
+					type="button"
+					onclick={saveImageEditSession}
+					title="Save image edits"
+					aria-label="Save image edits"
+				>
+					<svg viewBox="0 0 16 16" aria-hidden="true">
+						<path d="M3.5 8.5l3 3 6-6" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+					</svg>
+				</button>
+				<button
+					class="image-edit-icon cancel"
+					type="button"
+					onclick={cancelImageEditSession}
+					title="Cancel image edits"
+					aria-label="Cancel image edits"
+				>
+					<svg viewBox="0 0 16 16" aria-hidden="true">
+						<path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" />
+					</svg>
+				</button>
+			</div>
+		</div>
+	{/if}
 	<canvas
 		bind:this={canvasEl}
 		style:width="{artboard.w}px"
@@ -1206,7 +1520,20 @@
 	}}
 >
 	<div class="modal-body">
-		<h2 id="export-title" class="modal-title">Download PNG</h2>
+		<h2 id="export-title" class="modal-title">Download</h2>
+		<fieldset class="format-field">
+			<legend class="format-legend">Format</legend>
+			<div class="format-options">
+				<label class="format-option">
+					<input type="radio" name="export-format" value="png" bind:group={exportFormat} />
+					<span>PNG</span>
+				</label>
+				<label class="format-option">
+					<input type="radio" name="export-format" value="svg" bind:group={exportFormat} />
+					<span>SVG</span>
+				</label>
+			</div>
+		</fieldset>
 		<label class="toggle-row">
 			<input type="checkbox" bind:checked={exportTransparent} />
 			<span class="toggle-text">
@@ -1224,6 +1551,7 @@
 
 <style>
 	.wrap {
+		position: relative;
 		width: 100%;
 		height: 100%;
 		display: flex;
@@ -1231,11 +1559,95 @@
 		justify-content: center;
 	}
 
+	.image-edit-dim {
+		position: absolute;
+		inset: 0;
+		background: rgba(16, 26, 49, 0.28);
+		pointer-events: none;
+		z-index: 1;
+	}
+
+	.image-edit-bar {
+		position: absolute;
+		top: 12px;
+		left: 50%;
+		transform: translateX(-50%);
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 6px 8px;
+		background: var(--paper);
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		box-shadow: 0 4px 20px rgba(16, 26, 49, 0.16);
+		z-index: 3;
+	}
+
+	.image-edit-action {
+		font: inherit;
+		height: 28px;
+		padding: 0 10px;
+		font-size: 11px;
+		font-weight: 600;
+		color: var(--ink);
+		background: var(--paper);
+		border: 1px solid var(--border);
+		border-radius: 4px;
+		cursor: pointer;
+	}
+
+	.image-edit-action:hover {
+		border-color: var(--ink);
+	}
+
+	.image-edit-confirm {
+		display: flex;
+		gap: 4px;
+	}
+
+	.image-edit-icon {
+		width: 28px;
+		height: 28px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 0;
+		border-radius: 4px;
+		border: 1px solid var(--border);
+		background: var(--paper);
+		cursor: pointer;
+	}
+
+	.image-edit-icon svg {
+		width: 14px;
+		height: 14px;
+	}
+
+	.image-edit-icon.save {
+		color: var(--paper);
+		background: var(--ink);
+		border-color: var(--ink);
+	}
+
+	.image-edit-icon.save:hover {
+		opacity: 0.88;
+	}
+
+	.image-edit-icon.cancel:hover {
+		border-color: #ed4e3d;
+		color: #ed4e3d;
+	}
+
+	.wrap.image-editing canvas {
+		z-index: 2;
+		position: relative;
+	}
+
 	canvas {
 		background: var(--paper);
 		border-radius: 4px;
 		box-shadow: 0 2px 16px rgba(16, 26, 49, 0.14);
-		cursor: crosshair;
+		cursor: default;
 	}
 
 	.wrap.shuffle canvas {
@@ -1271,6 +1683,52 @@
 		font-size: 14px;
 		font-weight: 700;
 		color: var(--ink);
+	}
+
+	.format-field {
+		margin: 0;
+		padding: 0;
+		border: none;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+
+	.format-legend {
+		padding: 0;
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--ink);
+	}
+
+	.format-options {
+		display: flex;
+		gap: 8px;
+	}
+
+	.format-option {
+		flex: 1;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 6px;
+		height: 32px;
+		border: 1px solid var(--border);
+		border-radius: 4px;
+		font-size: 13px;
+		font-weight: 600;
+		cursor: pointer;
+	}
+
+	.format-option:has(input:checked) {
+		border-color: var(--ink);
+		background: rgba(16, 26, 49, 0.06);
+	}
+
+	.format-option input {
+		margin: 0;
+		accent-color: var(--ink);
+		cursor: pointer;
 	}
 
 	.toggle-row {

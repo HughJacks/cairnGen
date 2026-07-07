@@ -11,9 +11,10 @@ A generator tool for building clusters and stacked rock shapes ("cairns") from a
 - Toggle between place and shuffle via the leftmost toolbar button (crosshair ↔ shuffle arrows).
 
 In **place mode**:
-- **Cluster** — rocks snap to touch other rocks; may run off canvas edges.
+- Click empty canvas to drop rocks; click a shape to select it, then change its color from the palette. Drag to move or scroll over a selected shape to rotate — all using the same snap rules as placement. Press **Delete** or **Backspace** to remove the selected shape.
+- **Images** — upload to the bank, hover a thumbnail and click **Edit** to enter image edit mode: the canvas dims, click shapes to mask the image, drag to pan and scroll to zoom inside a mask. Use **Mask all** to fill every shape, then **✓** to save or **✕** to cancel.
+- **Cluster** — rocks may be placed anywhere (no overlap); nearby rocks snap together. May run off canvas edges.
 - **Stack** — rocks rest on the ground or on top of each other, balanced near the stack's center-of-mass line.
-- Ghost preview only appears at genuinely placeable spots; gray hint follows the cursor elsewhere.
 
 ## Development
 

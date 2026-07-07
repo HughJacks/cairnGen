@@ -39,7 +39,7 @@ const stats = async (label) => {
 	console.log(label, JSON.stringify(s));
 };
 
-await page.locator('.thumb').first().click(); // deselect
+await page.locator('.thumb-edit').first().click(); // not needed for placement
 await page.waitForTimeout(100);
 let box = await canvas.boundingBox();
 const A = { x: box.x + box.width * 0.4, y: box.y + box.height * 0.45 };
@@ -48,13 +48,15 @@ await page.mouse.click(A.x, A.y); await page.waitForTimeout(120);
 await page.mouse.move(B.x, B.y); await page.mouse.click(B.x, B.y); await page.waitForTimeout(150);
 await stats('2 rocks:');
 
-// Enable "fill every shape" background.
-await page.locator('.thumb-bg').first().click();
+// Enable "fill every shape" background via image edit.
+await page.locator('.thumb-edit').first().click();
+await page.waitForTimeout(200);
+await page.locator('.image-edit-action', { hasText: 'Mask all' }).click();
 await page.waitForTimeout(250);
 await stats('bg fill ON (2 rocks):');
 await page.screenshot({ path: 'scripts/b1-bg-on.png' });
 
-// Click on a rock while bg is on.
+// Click on a rock while in edit mode toggles mask.
 await page.mouse.click(A.x, A.y); await page.waitForTimeout(200);
 await stats('after click on rock (bg on):');
 await page.screenshot({ path: 'scripts/b2-click-bg.png' });
@@ -74,6 +76,10 @@ await page.waitForTimeout(200);
 await stats('after big wheel zoom-in bg:');
 await page.screenshot({ path: 'scripts/b4-wheel-bg.png' });
 
+// Save image edit before placing more rocks.
+await page.locator('.image-edit-icon.save').click();
+await page.waitForTimeout(200);
+
 // Place NEW shapes while bg on.
 const pts = [ {x:0.5,y:0.25}, {x:0.3,y:0.75}, {x:0.7,y:0.4} ];
 for (const p of pts) {
@@ -84,10 +90,18 @@ for (const p of pts) {
 await stats('after placing 3 new shapes (bg on):');
 await page.screenshot({ path: 'scripts/b5-newshapes-bg.png' });
 
-// Toggle bg off then on again.
-await page.locator('.thumb-bg').first().click(); await page.waitForTimeout(200);
+// Toggle bg off then on again via image edit.
+await page.locator('.thumb-edit').first().click();
+await page.waitForTimeout(200);
+await page.locator('.image-edit-icon.cancel').click();
+await page.waitForTimeout(200);
 await stats('bg OFF:');
-await page.locator('.thumb-bg').first().click(); await page.waitForTimeout(200);
+await page.locator('.thumb-edit').first().click();
+await page.waitForTimeout(200);
+await page.locator('.image-edit-action', { hasText: 'Mask all' }).click();
+await page.waitForTimeout(200);
+await page.locator('.image-edit-icon.save').click();
+await page.waitForTimeout(200);
 await stats('bg ON again:');
 await page.screenshot({ path: 'scripts/b6-bg-toggle.png' });
 

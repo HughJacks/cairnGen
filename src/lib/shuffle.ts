@@ -8,8 +8,8 @@ export interface ShuffleOptions {
 	colors: string[];
 	/** Rock indices to draw from. */
 	shapes: number[];
-	/** Size indices to draw from. */
-	sizes: number[];
+	/** One size for every rock in the composition. */
+	sizeIndex: number;
 	seed: number;
 }
 
@@ -37,24 +37,24 @@ function pick<T>(rand: () => number, arr: T[]): T {
 /** Pools to draw each independent rock from, with safe fallbacks. */
 interface Pools {
 	shapes: number[];
-	sizes: number[];
+	sizeIndex: number;
 	colors: string[];
 }
 
 function poolsFrom(opts: ShuffleOptions): Pools {
 	return {
 		shapes: opts.shapes.length ? opts.shapes : [0],
-		sizes: opts.sizes.length ? opts.sizes : [1],
+		sizeIndex: opts.sizeIndex,
 		colors: opts.colors.length ? opts.colors : ['#101A31']
 	};
 }
 
-/** One independently random rock: shape, size, and color are each picked fresh
- *  from the available pools. Rotation is (re)assigned per placement attempt. */
+/** One independently random rock: shape and color are picked from their pools;
+ *  size is shared across the whole shuffle. Rotation is (re)assigned per attempt. */
 function randomPiece(rand: () => number, pools: Pools): PieceSpec {
 	return {
 		rockIndex: pick(rand, pools.shapes),
-		sizeIndex: pick(rand, pools.sizes),
+		sizeIndex: pools.sizeIndex,
 		colorHex: pick(rand, pools.colors),
 		rotation: rand() * 360
 	};

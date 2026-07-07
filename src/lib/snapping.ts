@@ -22,6 +22,9 @@ export interface SnapOptions {
 	mode: Mode;
 	/** All rocks transitively touching the given one (its stack/cluster). */
 	getComponent: (path: paper.Path) => paper.Path[];
+	/** When false (manual cluster placement), rocks may rest anywhere that
+	 *  doesn't overlap; nearby rocks still snap together. Defaults to true. */
+	requireContact?: boolean;
 }
 
 /** How close (px) the cursor's rock has to be before it snaps to a target. */
@@ -268,6 +271,19 @@ function centerOfMass(paths: paper.Path[]): paper.Point {
 	return new paper.Point(sx / mass, sy / mass);
 }
 
+/** Every point where a placed rock touches another rock or the ground. */
+export function getShapeContacts(
+	path: paper.Path,
+	placed: paper.Path[],
+	bounds: paper.Rectangle,
+	mode: Mode
+): paper.Point[] {
+	const others = placed.filter((p) => p !== path);
+	const nearby = others.filter((p) => p.bounds.expand(SNAP_RADIUS * 2).intersects(path.bounds));
+	const cand = new Candidate(path);
+	return allContacts(cand, nearby, bounds, mode);
+}
+
 // ---------------------------------------------------------------------------
 // Main entry
 // ---------------------------------------------------------------------------
@@ -276,8 +292,10 @@ function centerOfMass(paths: paper.Path[]): paper.Point {
  * Move `candidatePath` (already scaled/rotated and positioned at the cursor)
  * to the nearest valid resting spot. The candidate path is mutated in place.
  *
- * Cluster mode: rocks must touch another rock (the very first rock is free),
- * may run off the canvas, and borders are not snap targets.
+ * Cluster mode: by default rocks must touch another rock (the very first rock
+ * is free). With `requireContact: false`, rocks may go anywhere without
+ * overlapping; nearby rocks still snap together. Cluster rocks may run off the
+ * canvas, and borders are not snap targets.
  *
  * Stack mode: rocks rest on the ground (bottom border) or on top of other
  * rocks and must sit close to the vertical line through the supporting
@@ -290,7 +308,7 @@ export function resolveSnap(
 	bounds: paper.Rectangle,
 	opts: SnapOptions
 ): SnapResult {
-	const { mode } = opts;
+	const { mode, requireContact = true } = opts;
 	const cand = new Candidate(candidatePath);
 	// Cluster rocks may overflow the artboard freely. Stack rocks are only
 	// constrained by the ground: they may overflow the left, right, and top.
@@ -372,6 +390,8 @@ export function resolveSnap(
 		if (nearby.some((p) => overlaps(candidatePath, p))) {
 			return { valid: false, position: candidatePath.position, contacts: [], balance: null };
 		}
+	} else if (mode === 'cluster' && !requireContact) {
+		// Manual cluster placement: no snap target in range, rest at the cursor.
 	} else if (mode === 'cluster' && placed.length === 0) {
 		// The first rock of a cluster can go anywhere.
 		return { valid: true, position: candidatePath.position, contacts: [], balance: null };
@@ -380,7 +400,7 @@ export function resolveSnap(
 	}
 
 	const contact = findContact(cand, nearby, bounds, mode);
-	if (!contact) {
+	if (!contact && requireContact) {
 		return { valid: false, position: candidatePath.position, contacts: [], balance: null };
 	}
 
@@ -388,7 +408,7 @@ export function resolveSnap(
 	// must sit close to the supporting stack's center-of-mass line and rest on
 	// top of it (not stick to its side or underside).
 	let balance: BalanceInfo | null = null;
-	if (mode === 'stack' && contact.rock) {
+	if (mode === 'stack' && contact?.rock) {
 		const component = opts.getComponent(contact.rock);
 		const com = centerOfMass(component);
 		const tolerance = Math.max(candidatePath.bounds.width * 0.45, 20);
