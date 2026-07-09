@@ -221,7 +221,7 @@
 			title="Add shape"
 			aria-label="Add shape"
 		>
-			<img src={ROCK_IMAGE_URLS[2]} alt="" />
+			<img src={ROCK_IMAGE_URLS[1]} alt="" />
 		</button>
 
 		<div class="lucky-pill">
