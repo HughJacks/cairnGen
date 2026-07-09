@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { app, ROCK_COLORS, ROCK_SIZES } from './state.svelte';
+	import { app, ROCK_COLORS, ROCK_SIZES, type ToolPanel } from './state.svelte';
 	import { ROCK_SVGS } from './rocks';
 
 	const ROCK_IMAGE_URLS = ROCK_SVGS.map(
@@ -7,6 +7,41 @@
 	);
 
 	let fileInput: HTMLInputElement | undefined = $state();
+	/** Which panel content to render — kept mounted until the fade-out finishes. */
+	let displayPanel = $state<ToolPanel>('none');
+	let subOpen = $state(false);
+
+	$effect(() => {
+		if (app.toolPanel !== 'none') {
+			displayPanel = app.toolPanel;
+			subOpen = true;
+		} else {
+			subOpen = false;
+		}
+	});
+
+	function onSubTransitionEnd(event: TransitionEvent) {
+		if (event.target !== event.currentTarget || event.propertyName !== 'opacity') return;
+		if (!subOpen) displayPanel = 'none';
+	}
+
+	function subTabIndex(panel: ToolPanel) {
+		return subOpen && displayPanel === panel ? 0 : -1;
+	}
+
+	let diceRolling = $state(false);
+
+	function rollLayout() {
+		app.generate();
+		diceRolling = false;
+		requestAnimationFrame(() => {
+			diceRolling = true;
+		});
+	}
+
+	function onDiceAnimEnd(event: AnimationEvent) {
+		if (event.animationName === 'dice-roll-click') diceRolling = false;
+	}
 
 	function readAsDataURL(file: File): Promise<string> {
 		return new Promise((resolve, reject) => {
@@ -27,16 +62,20 @@
 	}
 </script>
 
-<aside class={['dock', { open: app.toolPanel !== 'none' }]} aria-label="Tools">
-	<div class={['sub', { open: app.toolPanel !== 'none' }]} aria-hidden={app.toolPanel === 'none'}>
+<aside class={['dock', { open: subOpen }]} aria-label="Tools">
+	<div
+		class={['sub', { open: subOpen }]}
+		aria-hidden={!subOpen}
+		ontransitionend={onSubTransitionEnd}
+	>
 		<div class="pill sub-pill">
-			{#if app.toolPanel === 'shape'}
+			{#if displayPanel === 'shape'}
 				<button
 					class="tool cycle-tool shape"
 					onclick={() => app.cycleRock(1)}
 					title="Cycle shape"
 					aria-label="Cycle shape"
-					tabindex={app.toolPanel === 'shape' ? 0 : -1}
+					tabindex={subTabIndex('shape')}
 				>
 					<img src={ROCK_IMAGE_URLS[app.rockIndex]} alt="" />
 				</button>
@@ -45,7 +84,7 @@
 					onclick={() => app.cycleSize()}
 					title="Cycle size"
 					aria-label="Cycle size"
-					tabindex={app.toolPanel === 'shape' ? 0 : -1}
+					tabindex={subTabIndex('shape')}
 				>
 					{ROCK_SIZES[app.sizeIndex].label}
 				</button>
@@ -58,17 +97,17 @@
 							title={color.name}
 							aria-label={color.name}
 							aria-pressed={app.colorIndex === i}
-							tabindex={app.toolPanel === 'shape' ? 0 : -1}
+							tabindex={subTabIndex('shape')}
 						></button>
 					{/each}
 				</div>
-			{:else if app.toolPanel === 'lucky'}
+			{:else if displayPanel === 'lucky'}
 				<button
 					class="tool cycle-tool"
 					onclick={() => app.cycleSize()}
 					title="Cycle size"
 					aria-label="Cycle size"
-					tabindex={app.toolPanel === 'lucky' ? 0 : -1}
+					tabindex={subTabIndex('lucky')}
 				>
 					{ROCK_SIZES[app.sizeIndex].label}
 				</button>
@@ -77,7 +116,7 @@
 					onclick={() => app.cycleMode()}
 					title={app.mode === 'cluster' ? 'Cluster' : 'Stack'}
 					aria-label={app.mode === 'cluster' ? 'Cluster' : 'Stack'}
-					tabindex={app.toolPanel === 'lucky' ? 0 : -1}
+					tabindex={subTabIndex('lucky')}
 				>
 					{#if app.mode === 'cluster'}
 						<svg viewBox="0 0 16 16" aria-hidden="true">
@@ -101,7 +140,7 @@
 							title="Shape {i + 1}"
 							aria-label="Shape {i + 1}"
 							aria-pressed={app.shapeEnabled[i]}
-							tabindex={app.toolPanel === 'lucky' ? 0 : -1}
+							tabindex={subTabIndex('lucky')}
 						>
 							<img src={ROCK_IMAGE_URLS[i]} alt="" />
 						</button>
@@ -116,7 +155,7 @@
 							title={color.name}
 							aria-label={color.name}
 							aria-pressed={app.colorEnabled[i]}
-							tabindex={app.toolPanel === 'lucky' ? 0 : -1}
+							tabindex={subTabIndex('lucky')}
 						></button>
 					{/each}
 				</div>
@@ -153,32 +192,51 @@
 			<img src={ROCK_IMAGE_URLS[2]} alt="" />
 		</button>
 
-		<button
-			class={[
-				'tool icon-tool dice-tool',
-				{ active: app.canvasTool === 'lucky', armed: app.toolPanel === 'lucky' }
-			]}
-			onclick={() => app.toggleLuckyTool()}
-			aria-pressed={app.canvasTool === 'lucky'}
-			title={app.toolPanel === 'lucky' ? 'Roll layout' : "I'm feeling lucky"}
-			aria-label={app.toolPanel === 'lucky' ? 'Roll layout' : "I'm feeling lucky"}
-		>
-			<svg viewBox="0 0 16 16" aria-hidden="true">
-				<rect
-					x="2.5"
-					y="2.5"
-					width="11"
-					height="11"
-					rx="2"
-					stroke="currentColor"
-					stroke-width="1.3"
-					fill="none"
-				/>
-				<circle cx="5.5" cy="5.5" r="1.1" fill="currentColor" />
-				<circle cx="8" cy="8" r="1.1" fill="currentColor" />
-				<circle cx="10.5" cy="10.5" r="1.1" fill="currentColor" />
-			</svg>
-		</button>
+		<div class="lucky-pill">
+			<button
+				class={['tool icon-tool lucky-roll', { rolling: diceRolling }]}
+				onclick={rollLayout}
+				onanimationend={onDiceAnimEnd}
+				title="Roll layout"
+				aria-label="Roll layout"
+			>
+				<svg viewBox="0 0 16 16" aria-hidden="true">
+					<rect
+						x="2.5"
+						y="2.5"
+						width="11"
+						height="11"
+						rx="2"
+						stroke="currentColor"
+						stroke-width="1.3"
+						fill="none"
+					/>
+					<circle cx="5.5" cy="5.5" r="1.1" fill="currentColor" />
+					<circle cx="8" cy="8" r="1.1" fill="currentColor" />
+					<circle cx="10.5" cy="10.5" r="1.1" fill="currentColor" />
+				</svg>
+			</button>
+			<button
+				class={['tool icon-tool lucky-settings', { active: app.toolPanel === 'lucky' }]}
+				onclick={() => app.toggleLuckySettings()}
+				aria-pressed={app.toolPanel === 'lucky'}
+				title="Roll settings"
+				aria-label="Roll settings"
+			>
+				<svg viewBox="0 0 16 16" aria-hidden="true">
+					<path
+						d="M2 4.5h12M2 8h12M2 11.5h12"
+						stroke="currentColor"
+						stroke-width="1.3"
+						stroke-linecap="round"
+						fill="none"
+					/>
+					<circle cx="5" cy="4.5" r="1.2" fill="currentColor" />
+					<circle cx="11" cy="8" r="1.2" fill="currentColor" />
+					<circle cx="7" cy="11.5" r="1.2" fill="currentColor" />
+				</svg>
+			</button>
+		</div>
 
 		<button class="tool" onclick={() => app.cycleAspect()} title="Cycle aspect ratio">
 			{app.aspect}
@@ -312,18 +370,11 @@
 		z-index: 20;
 		pointer-events: none;
 		display: flex;
-		flex-wrap: wrap;
-		justify-content: center;
+		flex-direction: column;
 		align-items: center;
-		align-content: center;
 		gap: 0;
 		width: fit-content;
 		max-width: calc(100% - 24px);
-	}
-
-	.dock.open {
-		/* Side-by-side or stacked: same gap either way. */
-		gap: 8px;
 	}
 
 	.pill {
@@ -346,42 +397,29 @@
 	}
 
 	.main-pill {
-		/* When wrapping, keep the main bar on the lower row. */
-		order: 1;
-	}
-
-	.sub {
-		order: 0;
-		display: grid;
-		grid-template-columns: 0fr;
-		transition: grid-template-columns 220ms ease;
-		min-width: 0;
-		max-width: 100%;
-		/* Don't shrink — wrap onto the row above the main bar instead. */
 		flex: 0 0 auto;
 	}
 
+	.sub {
+		position: absolute;
+		bottom: calc(100% + 8px);
+		left: 50%;
+		transform: translateX(-50%);
+		max-width: calc(100vw - 24px);
+		opacity: 0;
+		pointer-events: none;
+		transition: opacity 180ms ease;
+	}
+
 	.sub.open {
-		grid-template-columns: 1fr;
+		opacity: 1;
+		pointer-events: auto;
 	}
 
 	.sub-pill {
 		min-width: 0;
 		max-width: 100%;
-		overflow: hidden;
-		opacity: 0;
-		transform: translateX(8px);
-		pointer-events: none;
-		transition:
-			opacity 180ms ease,
-			transform 220ms ease;
-	}
-
-	.sub.open .sub-pill {
-		opacity: 1;
-		transform: translateX(0);
 		overflow: visible;
-		pointer-events: auto;
 	}
 
 	.sep {
@@ -551,34 +589,59 @@
 		filter: invert(1);
 	}
 
-	.dice-tool.armed {
-		animation: dice-nudge 1.1s ease-in-out infinite;
+	.lucky-pill {
+		display: inline-flex;
+		align-items: center;
+		gap: 0;
+		padding: 0;
+		border-radius: 999px;
+		border: 1px solid var(--border);
+		background: color-mix(in srgb, var(--ink) 4%, transparent);
+		flex: 0 0 auto;
+		overflow: hidden;
 	}
 
-	.dice-tool.armed svg {
-		animation: dice-roll 1.1s ease-in-out infinite;
+	.lucky-pill .tool {
+		width: 28px;
+		min-width: 28px;
+		height: 28px;
+		padding: 0;
+		border: none;
+		border-radius: 0;
 	}
 
-	@keyframes dice-nudge {
-		0%,
-		100% {
-			box-shadow: 0 0 0 0 color-mix(in srgb, var(--ink) 0%, transparent);
-		}
-		50% {
-			box-shadow: 0 0 0 3px color-mix(in srgb, var(--ink) 12%, transparent);
-		}
+	.lucky-pill .tool:first-child {
+		border-radius: 999px 0 0 999px;
 	}
 
-	@keyframes dice-roll {
-		0%,
-		100% {
-			transform: rotate(0deg) scale(1);
+	.lucky-pill .tool:last-child {
+		border-radius: 0 999px 999px 0;
+	}
+
+	.lucky-pill .tool:hover:not(:disabled) {
+		background: color-mix(in srgb, var(--ink) 7%, transparent);
+	}
+
+	.lucky-pill .tool.active {
+		color: var(--paper);
+		background: var(--ink);
+	}
+
+	.lucky-pill .tool svg {
+		width: 14px;
+		height: 14px;
+	}
+
+	.lucky-roll.rolling svg {
+		animation: dice-roll-click 560ms ease-in-out;
+	}
+
+	@keyframes dice-roll-click {
+		from {
+			transform: rotate(0deg);
 		}
-		25% {
-			transform: rotate(-12deg) scale(1.06);
-		}
-		75% {
-			transform: rotate(12deg) scale(1.06);
+		to {
+			transform: rotate(360deg);
 		}
 	}
 
@@ -713,8 +776,8 @@
 			bottom: 12px;
 		}
 
-		.dock.open {
-			gap: 6px;
+		.sub {
+			bottom: calc(100% + 6px);
 		}
 
 		.pill {

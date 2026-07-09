@@ -120,7 +120,11 @@ function snapCandidate(
 		return null;
 	}
 	cand.fillColor = new paper.Color(spec.colorHex);
-	cand.data = { rockIndex: spec.rockIndex, sizeIndex: spec.sizeIndex };
+	cand.data = {
+		rockIndex: spec.rockIndex,
+		sizeIndex: spec.sizeIndex,
+		rotation: spec.rotation
+	};
 	return cand;
 }
 

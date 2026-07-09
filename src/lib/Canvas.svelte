@@ -8,7 +8,7 @@
 
 	/** Height (in canvas px) of the tallest rock; all rocks share the same scale factor. */
 	const ROCK_HEIGHT = 140;
-	const STAGE_PADDING = 72;
+	const STAGE_PADDING = 28;
 	/** Max image zoom as a multiple of the cover scale that fills a mask. */
 	const MAX_ZOOM = 4;
 
@@ -90,14 +90,16 @@
 	let imageDrag: { kind: 'pin' | 'bg'; fill: PinFill | BgFill; last: paper.Point } | null = null;
 	let didDragImage = false;
 	let shapeDrag: {
-		path: paper.Path;
+		paths: paper.Path[];
 		grabOffset: paper.Point;
-		lastValidPathData: string;
+		lastValidPathData: string[];
 	} | null = null;
 	let didDragShape = false;
 	let draggingShape = $state(false);
-	let selectedPath = $state.raw<paper.Path | null>(null);
-	let selectionOutline: paper.Path | null = null;
+	let selectedPaths = $state.raw<paper.Path[]>([]);
+	const selectedPath = $derived(selectedPaths.at(-1) ?? null);
+	const multiSelected = $derived(selectedPaths.length > 1);
+	let selectionOutlines: paper.Path[] = [];
 	let ghostRaf = 0;
 	let shiftHeld = $state(false);
 
@@ -105,6 +107,7 @@
 	interface RockMeta {
 		rockIndex: number;
 		sizeIndex: number;
+		rotation: number;
 	}
 	let rockMeta = new WeakMap<paper.Path, RockMeta>();
 	/** Rocks that stay solid-colored even when a background image fill is active. */
@@ -168,7 +171,13 @@
 	}
 
 	interface CanvasSnapshot {
-		rocks: { pathData: string; fillColor: string; rockIndex: number; sizeIndex: number }[];
+		rocks: {
+			pathData: string;
+			fillColor: string;
+			rockIndex: number;
+			sizeIndex: number;
+			rotation: number;
+		}[];
 		attach: [number, string][];
 		/** Indices of rocks that opt out of the background image fill. */
 		solidOnly: number[];
@@ -191,7 +200,8 @@
 					pathData: p.pathData,
 					fillColor: (p.fillColor as paper.Color | null)?.toCSS(true) ?? app.nextColor.hex,
 					rockIndex: meta?.rockIndex ?? 0,
-					sizeIndex: meta?.sizeIndex ?? app.sizeIndex
+					sizeIndex: meta?.sizeIndex ?? app.sizeIndex,
+					rotation: meta?.rotation ?? p.rotation
 				};
 			}),
 			attach: placed.flatMap((p, i) => {
@@ -251,7 +261,8 @@
 			placed.push(path);
 			rockMeta.set(path, {
 				rockIndex: rock.rockIndex ?? 0,
-				sizeIndex: rock.sizeIndex ?? app.sizeIndex
+				sizeIndex: rock.sizeIndex ?? app.sizeIndex,
+				rotation: rock.rotation ?? 0
 			});
 		}
 
@@ -583,8 +594,8 @@
 			}
 			path.visible = !bgFill || !bgFillReady();
 		}
-		if (selectedPath && placed.includes(selectedPath)) raiseSelectionVisuals();
-		syncSelectionUi(selectedPath);
+		if (selectedPaths.length) raiseSelectionVisuals();
+		syncSelectionUi(selectedPaths.at(-1) ?? null);
 	}
 
 	/** Drop loaded elements + pins for images that no longer exist, then sync. */
@@ -733,6 +744,21 @@
 		requestAnimationFrame(placeTip);
 	}
 
+	/** Shared palette index for the selection, or -1 when colors are mixed / unknown. */
+	function sharedSelectionColorIndex(paths: paper.Path[]): number {
+		let shared: number | null = null;
+		for (const p of paths) {
+			const cur = (p.fillColor as paper.Color | null)?.toCSS(true);
+			const idx = cur
+				? ROCK_COLORS.findIndex((c) => c.hex.toLowerCase() === cur.toLowerCase())
+				: -1;
+			if (idx < 0) return -1;
+			if (shared === null) shared = idx;
+			else if (shared !== idx) return -1;
+		}
+		return shared ?? -1;
+	}
+
 	function syncSelectionUi(path: paper.Path | null) {
 		if (!path) {
 			tipPos = null;
@@ -745,11 +771,11 @@
 		const meta = rockMeta.get(path);
 		selectedRockIndex = meta?.rockIndex ?? 0;
 		selectedSizeIndex = meta?.sizeIndex ?? app.sizeIndex;
-		const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
-		const idx = cur
-			? ROCK_COLORS.findIndex((c) => c.hex.toLowerCase() === cur.toLowerCase())
-			: -1;
-		selectedColorIndex = idx >= 0 ? idx : app.colorIndex;
+		const shared = sharedSelectionColorIndex(selectedPaths.length ? selectedPaths : [path]);
+		// Single selection with an unknown fill falls back to the placement palette;
+		// multi with mixed/unknown fills shows no active swatch.
+		selectedColorIndex =
+			shared >= 0 ? shared : selectedPaths.length > 1 ? -1 : app.colorIndex;
 
 		const pinId = attach.get(path);
 		const bgId = app.backgroundImageId;
@@ -763,7 +789,7 @@
 
 	/** Release this rock from its image mask so solid colors return. */
 	function releaseSelectedMask() {
-		if (!selectedPath || !placed.includes(selectedPath)) return;
+		if (selectedPaths.length !== 1 || !selectedPath || !placed.includes(selectedPath)) return;
 		const path = selectedPath;
 		const pinId = attach.get(path);
 		if (pinId) {
@@ -779,17 +805,36 @@
 
 	/** Open mask editing for the image currently on the selected rock. */
 	function editSelectedMask() {
-		if (!selectedMaskId) return;
+		if (selectedPaths.length !== 1 || !selectedMaskId) return;
 		app.startImageEdit(selectedMaskId);
 	}
 
 	function selectShape(path: paper.Path | null, syncColor = false) {
-		selectedPath = path;
+		selectedPaths = path ? [path] : [];
 		if (path) {
 			app.selectCursorTool();
 			if (syncColor) syncColorFromShape(path);
 		}
 		syncSelectionUi(path);
+		updateSelectionVisuals();
+		updateGhost();
+	}
+
+	function toggleSelectShape(path: paper.Path, syncColor = false) {
+		const idx = selectedPaths.indexOf(path);
+		const next =
+			idx >= 0 ? selectedPaths.filter((p) => p !== path) : [...selectedPaths, path];
+		selectedPaths = next;
+		if (next.length) {
+			app.selectCursorTool();
+			const primary = next[next.length - 1]!;
+			// Only sync the global palette for a single selection — otherwise
+			// changing app.colorIndex would recolor every selected rock.
+			if (syncColor && next.length === 1) syncColorFromShape(primary);
+			syncSelectionUi(primary);
+		} else {
+			syncSelectionUi(null);
+		}
 		updateSelectionVisuals();
 		updateGhost();
 	}
@@ -800,26 +845,28 @@
 	}
 
 	/** Rebuild a placed rock's outline as a different shape/size.
-	 *  Keeps the current center when possible; otherwise searches nearby for a
-	 *  free spot. If nowhere fits, reverts and shakes the tip. */
+	 *  Keeps the current center and rotation when possible; otherwise searches
+	 *  nearby for a free spot. If nowhere fits, reverts and shakes the tip. */
 	function reshapeSelected(nextRock: number, nextSize: number): boolean {
-		if (!selectedPath || !placed.includes(selectedPath)) return false;
+		if (selectedPaths.length !== 1 || !selectedPath || !placed.includes(selectedPath)) return false;
 		const path = selectedPath;
 		const meta = rockMeta.get(path);
 		if (meta?.rockIndex === nextRock && meta?.sizeIndex === nextSize) return false;
 
 		const center = path.bounds.center.clone();
+		const rotation = meta?.rotation ?? path.rotation;
 		const fill = (path.fillColor as paper.Color | null)?.clone() ?? new paper.Color(app.nextColor.hex);
 		const beforePathData = path.pathData;
 		const beforeMeta = meta
-			? { rockIndex: meta.rockIndex, sizeIndex: meta.sizeIndex }
-			: { rockIndex: 0, sizeIndex: app.sizeIndex };
+			? { ...meta }
+			: { rockIndex: 0, sizeIndex: app.sizeIndex, rotation };
 		const savedAnchor = tipAnchor ? { ...tipAnchor } : null;
 		const savedTip = tipPos ? { ...tipPos } : null;
 		tipLocked = true;
 
 		const next = sourcePaths[nextRock].clone({ insert: false }) as paper.Path;
 		next.scale(scaleForSize(nextSize));
+		next.rotate(rotation);
 		next.position = center;
 		next.fillColor = fill;
 
@@ -868,7 +915,7 @@
 			}
 		}
 
-		rockMeta.set(path, { rockIndex: nextRock, sizeIndex: nextSize });
+		rockMeta.set(path, { rockIndex: nextRock, sizeIndex: nextSize, rotation });
 		selectedRockIndex = nextRock;
 		selectedSizeIndex = nextSize;
 
@@ -894,17 +941,17 @@
 	}
 
 	function setSelectedColor(i: number) {
-		if (!selectedPath) return;
+		if (!selectedPaths.length) return;
 		app.selectColor(i);
 	}
 
 	function setSelectedRock(i: number) {
-		if (!selectedPath) return;
+		if (selectedPaths.length !== 1) return;
 		if (reshapeSelected(i, selectedSizeIndex)) commitHistory();
 	}
 
 	function setSelectedSize(i: number) {
-		if (!selectedPath) return;
+		if (selectedPaths.length !== 1) return;
 		if (reshapeSelected(selectedRockIndex, i)) commitHistory();
 	}
 
@@ -949,8 +996,8 @@
 			clearEditGhost();
 			return;
 		}
-		// Only preview while editing, or while a masked rock is selected.
-		if (!editId && !selectedPath) {
+		// Only preview while editing, or while a single masked rock is selected.
+		if (!editId && selectedPaths.length !== 1) {
 			clearEditGhost();
 			return;
 		}
@@ -996,31 +1043,35 @@
 	}
 
 	function raiseSelectionVisuals() {
-		selectionOutline?.bringToFront();
+		for (const outline of selectionOutlines) outline.bringToFront();
 		for (const m of contactMarkers) m.bringToFront();
 	}
 
 	function updateSelectionOutline() {
-		selectionOutline?.remove();
-		selectionOutline = null;
-		if (!selectedPath || !placed.includes(selectedPath)) {
-			selectedPath = null;
-			return;
+		for (const outline of selectionOutlines) outline.remove();
+		selectionOutlines = [];
+		const next = selectedPaths.filter((p) => placed.includes(p));
+		if (next.length !== selectedPaths.length) {
+			selectedPaths = next;
+			syncSelectionUi(next.at(-1) ?? null);
 		}
-		const outline = cloneRockGeometry(selectedPath);
-		outline.strokeColor = new paper.Color('#101A31');
-		outline.strokeWidth = 1.5;
-		outline.dashArray = [5, 4];
-		outline.fillColor = null;
-		outline.opacity = 0.55;
-		paper.project.activeLayer.addChild(outline);
-		selectionOutline = outline;
+		if (!selectedPaths.length) return;
+		for (const path of selectedPaths) {
+			const outline = cloneRockGeometry(path);
+			outline.strokeColor = new paper.Color('#101A31');
+			outline.strokeWidth = 1.5;
+			outline.dashArray = [5, 4];
+			outline.fillColor = null;
+			outline.opacity = 0.55;
+			paper.project.activeLayer.addChild(outline);
+			selectionOutlines.push(outline);
+		}
 		raiseSelectionVisuals();
 	}
 
 	function updateSelectionVisuals() {
 		updateSelectionOutline();
-		if (!selectedPath) {
+		if (!selectedPath || multiSelected) {
 			clearContactMarkers();
 			return;
 		}
@@ -1032,39 +1083,104 @@
 		}
 	}
 
-	/** Free move: follow the cursor, reject overlaps. Shift: snap like placement. */
-	function moveShapeTo(
-		path: paper.Path,
+	/** Free move: follow the cursor, reject overlaps. Shift: snap like placement (single only). */
+	function moveShapesTo(
+		paths: paper.Path[],
 		point: paper.Point,
 		grabOffset: paper.Point,
-		fallbackPathData: string,
+		fallbackPathData: string[],
 		snap: boolean
 	): boolean {
-		path.position = point.add(grabOffset);
-		invalidateSamples(path);
-		if (snap) return resolveShapeSnap(path, fallbackPathData);
-
-		const others = placed.filter((p) => p !== path);
-		if (others.some((p) => rocksOverlap(path, p))) {
-			path.pathData = fallbackPathData;
-			invalidateSamples(path);
+		const primary = paths[0];
+		if (!primary) return false;
+		const target = point.add(grabOffset);
+		const delta = target.subtract(primary.position);
+		for (const p of paths) {
+			p.translate(delta);
+			invalidateSamples(p);
+		}
+		if (snap && paths.length === 1) {
+			return resolveShapeSnap(primary, fallbackPathData[0]!);
+		}
+		const group = new Set(paths);
+		const others = placed.filter((p) => !group.has(p));
+		if (paths.some((p) => others.some((o) => rocksOverlap(p, o)))) {
+			for (let i = 0; i < paths.length; i++) {
+				paths[i]!.pathData = fallbackPathData[i]!;
+				invalidateSamples(paths[i]!);
+			}
 			return false;
 		}
 		return true;
 	}
 
 	/** Rotate a placed rock and settle it with the same snap rules. */
-	function rotateShapeWithSnap(path: paper.Path, degrees: number): boolean {
+	function rotateShapeWithSnap(
+		path: paper.Path,
+		degrees: number,
+		ignore: Set<paper.Path> = new Set()
+	): boolean {
 		const before = path.pathData;
+		const meta = rockMeta.get(path);
+		const beforeRotation = meta?.rotation ?? path.rotation;
 		path.rotate(degrees, path.bounds.center);
 		invalidateSamples(path);
-		if (shiftHeld) return resolveShapeSnap(path, before);
 
-		const others = placed.filter((p) => p !== path);
+		const commitRotation = () => {
+			if (!meta) return;
+			rockMeta.set(path, {
+				...meta,
+				rotation: ((beforeRotation + degrees) % 360 + 360) % 360
+			});
+		};
+
+		if (shiftHeld && ignore.size <= 1) {
+			const ok = resolveShapeSnap(path, before);
+			if (ok) commitRotation();
+			return ok;
+		}
+
+		const others = placed.filter((p) => p !== path && !ignore.has(p));
 		if (others.some((p) => rocksOverlap(path, p))) {
 			path.pathData = before;
 			invalidateSamples(path);
 			return false;
+		}
+		commitRotation();
+		return true;
+	}
+
+	/** Rotate all selected rocks around their own centers (all-or-nothing). */
+	function rotateSelectedShapes(degrees: number): boolean {
+		if (!selectedPaths.length) return false;
+		if (selectedPaths.length === 1) {
+			return rotateShapeWithSnap(selectedPaths[0]!, degrees);
+		}
+		const ignore = new Set(selectedPaths);
+		const befores = selectedPaths.map((p) => ({
+			path: p,
+			pathData: p.pathData,
+			meta: rockMeta.get(p),
+			rotation: rockMeta.get(p)?.rotation ?? p.rotation
+		}));
+		for (const p of selectedPaths) {
+			p.rotate(degrees, p.bounds.center);
+			invalidateSamples(p);
+		}
+		const others = placed.filter((p) => !ignore.has(p));
+		if (selectedPaths.some((p) => others.some((o) => rocksOverlap(p, o)))) {
+			for (const b of befores) {
+				b.path.pathData = b.pathData;
+				invalidateSamples(b.path);
+			}
+			return false;
+		}
+		for (const b of befores) {
+			if (!b.meta) continue;
+			rockMeta.set(b.path, {
+				...b.meta,
+				rotation: ((b.rotation + degrees) % 360 + 360) % 360
+			});
 		}
 		return true;
 	}
@@ -1084,7 +1200,16 @@
 		attach.delete(path);
 		path.remove();
 		placed.splice(idx, 1);
-		if (selectedPath === path) selectShape(null);
+		const next = selectedPaths.filter((p) => p !== path);
+		if (next.length !== selectedPaths.length) {
+			selectedPaths = next;
+			if (!next.length) {
+				selectShape(null);
+			} else {
+				syncSelectionUi(next[next.length - 1]!);
+				updateSelectionVisuals();
+			}
+		}
 		recomputeGroups();
 		if (app.backgroundImageId) syncFills();
 		app.placedCount = placed.length;
@@ -1169,7 +1294,8 @@
 		ghost = null;
 		ghostMarkers = [];
 		balanceLine = null;
-		if (!pointer || !ready || app.imageEditId || app.canvasTool !== 'shape' || selectedPath) return;
+		if (!pointer || !ready || app.imageEditId || app.canvasTool !== 'shape' || selectedPaths.length)
+			return;
 
 		// Don't show a placement ghost over existing rocks — click to select instead.
 		if (shapeAt(pointer)) return;
@@ -1403,10 +1529,15 @@
 			paper.project.activeLayer.addChild(rock);
 			placed.push(rock);
 			groupParent.push(placed.length - 1);
-			const data = rock.data as { rockIndex?: number; sizeIndex?: number } | undefined;
+			const data = rock.data as {
+				rockIndex?: number;
+				sizeIndex?: number;
+				rotation?: number;
+			} | undefined;
 			rockMeta.set(rock, {
 				rockIndex: data?.rockIndex ?? 0,
-				sizeIndex: data?.sizeIndex ?? app.sizeIndex
+				sizeIndex: data?.sizeIndex ?? app.sizeIndex,
+				rotation: data?.rotation ?? rock.rotation
 			});
 		}
 
@@ -1442,7 +1573,11 @@
 		paper.project.activeLayer.addChild(cand);
 		cand.fillColor = new paper.Color(app.nextColor.hex);
 		placed.push(cand);
-		rockMeta.set(cand, { rockIndex: app.rockIndex, sizeIndex: app.sizeIndex });
+		rockMeta.set(cand, {
+			rockIndex: app.rockIndex,
+			sizeIndex: app.sizeIndex,
+			rotation: app.rotation
+		});
 
 		// Union the new rock with every placed rock it touches.
 		const idx = placed.length - 1;
@@ -1526,11 +1661,13 @@
 				return;
 			}
 			if (shapeDrag) {
-				const { path, grabOffset, lastValidPathData } = shapeDrag;
+				const { paths, grabOffset, lastValidPathData } = shapeDrag;
 				const snap =
-					!!(event as paper.MouseEvent & { event?: MouseEvent }).event?.shiftKey || shiftHeld;
-				if (moveShapeTo(path, event.point, grabOffset, lastValidPathData, snap)) {
-					shapeDrag.lastValidPathData = path.pathData;
+					paths.length === 1 &&
+					(!!(event as paper.MouseEvent & { event?: MouseEvent }).event?.shiftKey ||
+						shiftHeld);
+				if (moveShapesTo(paths, event.point, grabOffset, lastValidPathData, snap)) {
+					shapeDrag.lastValidPathData = paths.map((p) => p.pathData);
 				}
 				updateSelectionVisuals();
 				updateTipPos();
@@ -1567,11 +1704,23 @@
 			}
 			const shape = shapeAt(event.point);
 			if (shape) {
-				selectShape(shape, true);
+				const shift =
+					!!(event as paper.MouseEvent & { event?: MouseEvent }).event?.shiftKey || shiftHeld;
+				if (shift) {
+					toggleSelectShape(shape, true);
+				} else if (!selectedPaths.includes(shape)) {
+					selectShape(shape, true);
+				}
+				// else: keep existing multi-selection for group drag
+				if (!selectedPaths.includes(shape)) {
+					// was toggled off
+					return;
+				}
+				const paths = [shape, ...selectedPaths.filter((p) => p !== shape)];
 				shapeDrag = {
-					path: shape,
+					paths,
 					grabOffset: shape.position.subtract(event.point),
-					lastValidPathData: shape.pathData
+					lastValidPathData: paths.map((p) => p.pathData)
 				};
 			}
 		};
@@ -1600,10 +1749,10 @@
 			}
 			const shape = shapeAt(event.point);
 			if (shape) {
-				selectShape(shape, true);
+				// Selection already handled on mousedown — don't wipe multi-select.
 				return;
 			}
-			if (selectedPath) {
+			if (selectedPaths.length) {
 				selectShape(null);
 				return;
 			}
@@ -1626,8 +1775,8 @@
 			attach = new Map();
 			imageDrag = null;
 			shapeDrag = null;
-			selectedPath = null;
-			selectionOutline = null;
+			selectedPaths = [];
+			selectionOutlines = [];
 			bgCenter = null;
 			bgId = null;
 			paper.project.clear();
@@ -1694,7 +1843,7 @@
 	$effect(() => {
 		if (!ready || app.canvasTool !== 'shape') return;
 		untrack(() => {
-			if (selectedPath) selectShape(null);
+			if (selectedPaths.length) selectShape(null);
 		});
 	});
 
@@ -1727,14 +1876,21 @@
 		});
 	});
 
-	// When a shape is selected, palette changes from the main toolbar recolor it.
+	// When shapes are selected, palette changes from the main toolbar recolor them.
+	// Selection membership is untracked so shift-selecting another rock doesn't
+	// recolor the whole set to the current palette color.
 	$effect(() => {
 		const idx = app.colorIndex;
-		if (!ready || app.imageEditId || !selectedPath) return;
+		if (!ready || app.imageEditId) return;
 		untrack(() => {
+			if (!selectedPaths.length) return;
 			void idx;
 			selectedColorIndex = idx;
-			if (recolorShape(selectedPath!)) commitHistory();
+			let changed = false;
+			for (const path of selectedPaths) {
+				if (recolorShape(path)) changed = true;
+			}
+			if (changed) commitHistory();
 		});
 	});
 
@@ -1836,9 +1992,9 @@
 			}
 			return;
 		}
-		if (selectedPath) {
+		if (selectedPaths.length) {
 			event.preventDefault();
-			if (rotateShapeWithSnap(selectedPath, event.deltaY * 0.25)) {
+			if (rotateSelectedShapes(event.deltaY * 0.25)) {
 				finalizeShapeTransform();
 				updateTipPos();
 				commitHistory();
@@ -1875,33 +2031,41 @@
 			}
 			return;
 		}
-		if ((event.key === 'Delete' || event.key === 'Backspace') && selectedPath) {
+		if ((event.key === 'Delete' || event.key === 'Backspace') && selectedPaths.length) {
 			event.preventDefault();
-			if (eraseShape(selectedPath)) commitHistory();
+			const toErase = [...selectedPaths];
+			let erased = false;
+			for (const path of toErase) {
+				if (eraseShape(path)) erased = true;
+			}
+			if (erased) commitHistory();
 			return;
 		}
-		if (event.key === 'Escape' && selectedPath) {
+		if (event.key === 'Escape' && selectedPaths.length) {
 			event.preventDefault();
 			selectShape(null);
 			return;
 		}
 		if (event.key === 'ArrowRight') {
 			event.preventDefault();
-			if (selectedPath) setSelectedRock((selectedRockIndex + 1) % ROCK_SVGS.length);
-			else app.cycleRock(1);
+			if (selectedPaths.length === 1) setSelectedRock((selectedRockIndex + 1) % ROCK_SVGS.length);
+			else if (!selectedPaths.length) app.cycleRock(1);
 		} else if (event.key === 'ArrowLeft') {
 			event.preventDefault();
-			if (selectedPath) {
+			if (selectedPaths.length === 1) {
 				setSelectedRock((selectedRockIndex - 1 + ROCK_SVGS.length) % ROCK_SVGS.length);
-			} else app.cycleRock(-1);
+			} else if (!selectedPaths.length) app.cycleRock(-1);
 		} else if (event.key === 'ArrowUp') {
 			event.preventDefault();
-			if (selectedPath) setSelectedColor((selectedColorIndex + 1) % ROCK_COLORS.length);
-			else app.advanceColor(1);
+			if (selectedPaths.length) {
+				const base = selectedColorIndex >= 0 ? selectedColorIndex : app.colorIndex;
+				setSelectedColor((base + 1) % ROCK_COLORS.length);
+			} else app.advanceColor(1);
 		} else if (event.key === 'ArrowDown') {
 			event.preventDefault();
-			if (selectedPath) {
-				setSelectedColor((selectedColorIndex - 1 + ROCK_COLORS.length) % ROCK_COLORS.length);
+			if (selectedPaths.length) {
+				const base = selectedColorIndex >= 0 ? selectedColorIndex : app.colorIndex;
+				setSelectedColor((base - 1 + ROCK_COLORS.length) % ROCK_COLORS.length);
 			} else app.advanceColor(-1);
 		}
 	}
@@ -1952,7 +2116,7 @@
 	></canvas>
 </div>
 
-{#if tipAnchor && selectedPath && !app.imageEditId && !draggingShape}
+{#if tipAnchor && selectedPaths.length && !app.imageEditId && !draggingShape}
 	<div
 		class={['sel-tip', { shake: tipShake }]}
 		style:left={tipPos ? `${tipPos.left}px` : '-9999px'}
@@ -1964,23 +2128,25 @@
 		{@attach clampTip}
 		onpointerdown={(e) => e.stopPropagation()}
 	>
-		<button
-			class="sel-cycle shape"
-			onclick={cycleSelectedRock}
-			title="Cycle shape"
-			aria-label="Cycle shape"
-		>
-			<img src={ROCK_IMAGE_URLS[selectedRockIndex]} alt="" />
-		</button>
-		<button
-			class="sel-cycle size"
-			onclick={cycleSelectedSize}
-			title="Cycle size"
-			aria-label="Cycle size"
-		>
-			{ROCK_SIZES[selectedSizeIndex].label}
-		</button>
-		{#if selectedMaskSrc}
+		{#if !multiSelected}
+			<button
+				class="sel-cycle shape"
+				onclick={cycleSelectedRock}
+				title="Cycle shape"
+				aria-label="Cycle shape"
+			>
+				<img src={ROCK_IMAGE_URLS[selectedRockIndex]} alt="" />
+			</button>
+			<button
+				class="sel-cycle size"
+				onclick={cycleSelectedSize}
+				title="Cycle size"
+				aria-label="Cycle size"
+			>
+				{ROCK_SIZES[selectedSizeIndex].label}
+			</button>
+		{/if}
+		{#if !multiSelected && selectedMaskSrc}
 			<div class="sel-mask-wrap">
 				<button
 					class="sel-mask-thumb"

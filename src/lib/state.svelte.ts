@@ -53,8 +53,8 @@ export const ROCK_SIZES: RockSize[] = [
 ];
 
 export type Mode = 'cluster' | 'stack';
-/** Active canvas interaction tool. Cursor selects/moves; shape places; lucky opens generate settings. */
-export type CanvasTool = 'cursor' | 'shape' | 'lucky';
+/** Active canvas interaction tool. Cursor selects/moves; shape places rocks. */
+export type CanvasTool = 'cursor' | 'shape';
 /** Which bottom-toolbar settings pill is open. Cursor has no sub-items. */
 export type ToolPanel = 'none' | 'shape' | 'lucky';
 
@@ -181,13 +181,13 @@ class AppState {
 		this.mode = mode;
 	}
 
-	/** Select/move existing rocks. Deactivates shape and lucky. */
+	/** Select/move existing rocks. Closes shape settings only; generate settings stay open. */
 	selectCursorTool() {
 		this.canvasTool = 'cursor';
-		this.toolPanel = 'none';
+		if (this.toolPanel === 'shape') this.toolPanel = 'none';
 	}
 
-	/** Place new rocks. Opens shape settings; deactivates cursor and lucky. */
+	/** Place new rocks. Opens shape settings; deactivates cursor. */
 	selectShapeTool() {
 		if (this.canvasTool === 'shape') {
 			this.toolPanel = this.toolPanel === 'shape' ? 'none' : 'shape';
@@ -197,24 +197,18 @@ class AppState {
 		this.toolPanel = 'shape';
 	}
 
-	/**
-	 * Lucky / generate: first click opens settings; second click closes and rolls.
-	 * Deactivates cursor and shape while the panel is open.
-	 */
-	toggleLuckyTool() {
+	/** Open/close lucky-roll parameter settings. */
+	toggleLuckySettings() {
 		if (this.toolPanel === 'lucky') {
-			this.generate();
 			this.toolPanel = 'none';
-			this.canvasTool = 'cursor';
 			return;
 		}
-		this.canvasTool = 'lucky';
+		this.canvasTool = 'cursor';
 		this.toolPanel = 'lucky';
 	}
 
 	closeToolPanel() {
 		this.toolPanel = 'none';
-		if (this.canvasTool === 'lucky') this.canvasTool = 'cursor';
 	}
 
 	/** Flip one entry on/off, but never leave a category completely empty. */
