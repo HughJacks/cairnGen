@@ -177,20 +177,6 @@
 						</button>
 					{/each}
 				</div>
-				<div class="cluster colors">
-					{#each app.availableRockColors as color (color.hex)}
-						{@const i = rockColorIndex(color.hex)}
-						<button
-							class={['dot', { on: app.colorEnabled[i] }]}
-							style:background={color.hex}
-							onclick={() => app.toggleColor(i)}
-							title={color.name}
-							aria-label={color.name}
-							aria-pressed={app.colorEnabled[i]}
-							tabindex={subTabIndex('lucky')}
-						></button>
-					{/each}
-				</div>
 			{/if}
 		</div>
 	</div>

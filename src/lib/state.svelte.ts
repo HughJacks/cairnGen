@@ -1,3 +1,5 @@
+import { ROCK_COUNT } from './rocks';
+
 export type AspectId = '1:1' | '4:5' | '16:9';
 
 export interface Aspect {
@@ -69,7 +71,40 @@ export const CANVAS_BG_COLORS: CanvasBgSwatch[] = [
 	{ name: 'Transparent', hex: null }
 ];
 
-import { ROCK_COUNT } from './rocks';
+/** Reorderable top-bar swatch: stable key, solid fill hex, dice-pool flag.
+ *  `hex` stays `string | null` for typing; the bar never inserts null. */
+export interface BgSwatch {
+	key: string;
+	hex: string | null;
+	enabled: boolean;
+}
+
+function defaultBgSwatches(): BgSwatch[] {
+	return [
+		{ key: PAPER_HEX, hex: PAPER_HEX, enabled: true },
+		...PALETTE.filter((p) => !hexEq(p.hex, PAPER_HEX)).map((p) => ({
+			key: p.hex,
+			hex: p.hex,
+			enabled: true
+		}))
+	];
+}
+
+function bgHexEq(a: string | null, b: string | null): boolean {
+	if (a === null || b === null) return a === b;
+	return hexEq(a, b);
+}
+
+/** Enabled swatches first (order preserved), then disabled (order preserved). */
+export function partitionBgSwatches(list: BgSwatch[]): BgSwatch[] {
+	const enabled: BgSwatch[] = [];
+	const disabled: BgSwatch[] = [];
+	for (const s of list) {
+		if (s.enabled) enabled.push(s);
+		else disabled.push(s);
+	}
+	return [...enabled, ...disabled];
+}
 
 export { ROCK_COUNT };
 
@@ -136,45 +171,39 @@ class AppState {
 	bgRecolor: { from: string; to: string } | null = $state(null);
 	/** Set while coercing colorIndex on bg change so Canvas won't recolor the selection. */
 	skipSelectionColorApply = false;
+	/** Top-bar bg swatches (leftmost = canvas background). */
+	bgSwatches: BgSwatch[] = $state(defaultBgSwatches());
+	/** Bumped by the top-bar dice to shuffle unlocked rock fill colors. */
+	colorShuffleVersion = $state(0);
 	private imageSeq = 0;
 
-	/** Rock colors shown in pickers / used by shuffle for the current background. */
+	/** Enabled top-bar colors that are not the current canvas bg (shape/tip pickers). */
 	get availableRockColors(): Swatch[] {
-		return rockColorsForUi(this.canvasBg);
+		return this.bgSwatches.flatMap((s) => {
+			if (!s.enabled || s.hex === null || isRockColorExcluded(s.hex, this.canvasBg)) return [];
+			const named = PALETTE.find((p) => hexEq(p.hex, s.hex!));
+			return [{ name: named?.name ?? s.hex, hex: s.hex }];
+		});
 	}
 
-	/** True when this ROCK_COLORS index is usable with the current background. */
+	/** True when this ROCK_COLORS index is in the enabled non-bg canvas-bar pool. */
 	isRockColorAvailable(i: number): boolean {
 		const swatch = ROCK_COLORS[i];
-		return !!swatch && !isRockColorExcluded(swatch.hex, this.canvasBg);
+		return !!swatch && this.availableRockColors.some((c) => hexEq(c.hex, swatch.hex));
 	}
 
-	/** If colorIndex points at an excluded swatch, move it to the first available. */
+	/** If colorIndex points outside the picker pool, move it to the first available. */
 	private coerceColorIndex() {
 		const available = this.availableRockColors;
 		if (!available.length) return;
 		const current = ROCK_COLORS[this.colorIndex];
-		if (current && !isRockColorExcluded(current.hex, this.canvasBg)) return;
+		if (current && available.some((c) => hexEq(c.hex, current.hex))) return;
 		const next = rockColorIndex(available[0].hex);
 		if (next >= 0) this.colorIndex = next;
 	}
 
-	/** Keep at least one available lucky-color toggle on after a bg change. */
-	private coerceColorEnabled() {
-		const availableIdx = ROCK_COLORS.flatMap((c, i) =>
-			isRockColorExcluded(c.hex, this.canvasBg) ? [] : [i]
-		);
-		if (!availableIdx.length) return;
-		if (availableIdx.some((i) => this.colorEnabled[i])) return;
-		const next = this.colorEnabled.slice();
-		next[availableIdx[0]] = true;
-		this.colorEnabled = next;
-	}
-
 	selectCanvasBg(hex: string | null) {
-		if (hex === this.canvasBg || (hex !== null && this.canvasBg !== null && hexEq(hex, this.canvasBg))) {
-			return;
-		}
+		if (bgHexEq(hex, this.canvasBg)) return;
 		const prev = this.canvasBg;
 		const next = hex;
 		this.canvasBg = next;
@@ -196,11 +225,110 @@ class AppState {
 		this.canvasBgVersion++;
 		this.skipSelectionColorApply = true;
 		this.coerceColorIndex();
-		this.coerceColorEnabled();
 		// Effects flush before this microtask, so selection recolor can see the flag.
 		queueMicrotask(() => {
 			this.skipSelectionColorApply = false;
 		});
+	}
+
+	/** Enabled top-bar hexes valid as rock fills for the current canvas bg. */
+	get enabledBgRockColors(): string[] {
+		return this.bgSwatches.flatMap((s) =>
+			s.enabled && s.hex !== null && !isRockColorExcluded(s.hex, this.canvasBg) ? [s.hex] : []
+		);
+	}
+
+	/** When a swatch becomes canvas bg (index 0), it must stay in the pool UI as on. */
+	private ensureLeftmostEnabled() {
+		const left = this.bgSwatches[0];
+		if (!left || left.enabled) return;
+		const next = this.bgSwatches.slice();
+		next[0] = { ...left, enabled: true };
+		this.bgSwatches = next;
+	}
+
+	/**
+	 * Splice-reorder top-bar swatches.
+	 * With `deferBg`, only mutates order (for live drag); call `finalizeBgSwatchOrder` on drag end.
+	 */
+	reorderBgSwatch(from: number, to: number, opts?: { deferBg?: boolean }) {
+		const n = this.bgSwatches.length;
+		if (from === to || from < 0 || to < 0 || from >= n || to >= n) return;
+		const next = this.bgSwatches.slice();
+		const [item] = next.splice(from, 1);
+		if (!item) return;
+		// Dragging onto the bg slot reactivates a disabled swatch.
+		const placed = to === 0 && !item.enabled ? { ...item, enabled: true } : item;
+		next.splice(to, 0, placed);
+		this.bgSwatches = next;
+		if (opts?.deferBg) return;
+		this.ensureLeftmostEnabled();
+		const newLeft = this.bgSwatches[0]?.hex ?? null;
+		if (!bgHexEq(this.canvasBg, newLeft)) this.selectCanvasBg(newLeft);
+	}
+
+	/** After drag: re-enable leftmost (so a disabled drag-to-bg sticks), then partition, apply bg. */
+	finalizeBgSwatchOrder() {
+		this.ensureLeftmostEnabled();
+		this.bgSwatches = partitionBgSwatches(this.bgSwatches);
+		const left = this.bgSwatches[0]?.hex ?? null;
+		if (!bgHexEq(left, this.canvasBg)) this.selectCanvasBg(left);
+		else this.coerceColorIndex();
+	}
+
+	/**
+	 * Toggle a swatch in/out of the color-shuffle pool.
+	 * Off → partition (disabled to the right); if it was canvas bg, new leftmost becomes bg.
+	 * On → partition so it joins the end of the enabled group. Never empties the rock-color pool.
+	 * Always keeps shape-tool `colorIndex` on an enabled non-bg color when the pool changes.
+	 */
+	toggleBgSwatch(index: number) {
+		const swatch = this.bgSwatches[index];
+		if (!swatch) return;
+
+		if (!swatch.enabled) {
+			const next = this.bgSwatches.slice();
+			next[index] = { ...swatch, enabled: true };
+			this.bgSwatches = partitionBgSwatches(next);
+			this.coerceColorIndex();
+			return;
+		}
+
+		const wasLeft = index === 0;
+		const next = this.bgSwatches.slice();
+		next[index] = { ...swatch, enabled: false };
+		const partitioned = partitionBgSwatches(next);
+
+		let newCanvasBg = this.canvasBg;
+		if (wasLeft) {
+			const left = partitioned[0];
+			if (left && !left.enabled) partitioned[0] = { ...left, enabled: true };
+			newCanvasBg = partitioned[0]?.hex ?? this.canvasBg;
+		}
+
+		const poolAfter = partitioned.flatMap((s) =>
+			s.enabled && s.hex !== null && !isRockColorExcluded(s.hex, newCanvasBg) ? [s.hex] : []
+		);
+		if (poolAfter.length === 0) return;
+
+		this.bgSwatches = partitioned;
+		if (wasLeft) {
+			this.ensureLeftmostEnabled();
+			this.selectCanvasBg(this.bgSwatches[0]?.hex ?? null);
+		} else {
+			this.coerceColorIndex();
+		}
+	}
+
+	/** Move a swatch to index 0 and select it as the canvas background. */
+	moveBgSwatchToFront(index: number) {
+		if (index <= 0 || index >= this.bgSwatches.length) return;
+		this.reorderBgSwatch(index, 0);
+	}
+
+	/** Shuffle unlocked rock fill colors (Canvas watches `colorShuffleVersion`). */
+	shuffleRockColors() {
+		this.colorShuffleVersion++;
 	}
 
 	imageById(id: string | null): UploadedImage | undefined {
@@ -234,13 +362,10 @@ class AppState {
 		return this.imageEditId !== null;
 	}
 
-	/** Hex fills currently allowed in the shuffle (never the active bg / banned white). */
+	/** Hex fills for generate shuffle — same pool as the canvas-bar rock colors. */
 	get enabledColors(): string[] {
-		const colors = ROCK_COLORS.filter(
-			(c, i) => this.colorEnabled[i] && !isRockColorExcluded(c.hex, this.canvasBg)
-		).map((c) => c.hex);
-		if (colors.length) return colors;
-		return this.availableRockColors.map((c) => c.hex);
+		const colors = this.enabledBgRockColors;
+		return colors.length ? colors : this.availableRockColors.map((c) => c.hex);
 	}
 
 	/** Rock indices currently allowed in the shuffle. */
@@ -253,7 +378,9 @@ class AppState {
 
 	get nextColor(): Swatch {
 		const current = ROCK_COLORS[this.colorIndex];
-		if (current && !isRockColorExcluded(current.hex, this.canvasBg)) return current;
+		if (current && this.availableRockColors.some((c) => hexEq(c.hex, current.hex))) {
+			return current;
+		}
 		return this.availableRockColors[0] ?? ROCK_COLORS[0];
 	}
 

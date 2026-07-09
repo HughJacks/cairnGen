@@ -1,11 +1,12 @@
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
+	import { flip } from 'svelte/animate';
 	import paper from 'paper';
 	import {
 		app,
 		ASPECTS,
-		CANVAS_BG_COLORS,
 		hexEq,
+		PALETTE,
 		rockColorIndex,
 		ROCK_SIZES
 	} from './state.svelte';
@@ -39,6 +40,8 @@
 	const BG_BAR_SPACE = 48;
 	/** Max image zoom as a multiple of the cover scale that fills a mask. */
 	const MAX_ZOOM = 4;
+	const BG_DRAG_THRESHOLD = 2;
+	const PAPER_HEX = '#FFFFFF';
 
 	let stageW = $state(0);
 	let stageH = $state(0);
@@ -50,13 +53,140 @@
 	let seenRedoVersion = app.redoVersion;
 	let seenShuffleSeed = app.shuffleSeed;
 	let seenCanvasBgVersion = app.canvasBgVersion;
+	let seenColorShuffleVersion = app.colorShuffleVersion;
 	let imageEditBaseline: CanvasSnapshot | null = null;
+	let bgDiceSvg: SVGSVGElement | undefined = $state();
+	let bgColorsEl: HTMLDivElement | null = $state(null);
+	let bgDragIndex: number | null = $state(null);
+	let bgDragMoved = false;
+	let bgDragStartX = 0;
+	let bgDragStartY = 0;
+	let bgDragPointerId: number | null = null;
+	/** Fixed slot-center X positions from pointerdown. Not spliced on reorder —
+	 *  absolute mids must stay sorted for hit-testing (splicing caused an infinite loop). */
+	let bgSlotMids: number[] = [];
+	let bgDragRaf = 0;
+	let bgDragPendingX: number | null = null;
 
-	// Download dialog: pick format; backdrop uses the canvas background color.
+	function bgSwatchTitle(hex: string | null): string {
+		if (hex === null) return 'Transparent';
+		return PALETTE.find((p) => hexEq(p.hex, hex))?.name ?? hex;
+	}
+
+	function rollBgColors() {
+		bgDiceSvg?.getAnimations().forEach((a) => a.cancel());
+		bgDiceSvg?.animate(
+			[
+				{ transform: 'rotate(0deg) scale(1)' },
+				{ transform: 'rotate(180deg) scale(1.25)' },
+				{ transform: 'rotate(360deg) scale(1)' }
+			],
+			{ duration: 320, easing: 'cubic-bezier(0.2, 0.7, 0.2, 1)' }
+		);
+		app.shuffleRockColors();
+	}
+
+	function cacheBgSlotMids() {
+		if (!bgColorsEl) {
+			bgSlotMids = [];
+			return;
+		}
+		const slots = Array.from(bgColorsEl.querySelectorAll<HTMLElement>('.bg-slot'));
+		bgSlotMids = slots.map((el) => {
+			const rect = el.getBoundingClientRect();
+			return rect.left + rect.width / 2;
+		});
+	}
+
+	function bgTargetIndexFromClientX(clientX: number): number {
+		if (bgDragIndex === null || !bgSlotMids.length) return bgDragIndex ?? 0;
+		let target = 0;
+		for (let i = 0; i < bgSlotMids.length; i++) {
+			if (clientX < bgSlotMids[i]!) {
+				target = i;
+				break;
+			}
+			target = i;
+		}
+		return target;
+	}
+
+	function applyBgReorder(clientX: number) {
+		if (bgDragIndex === null) return;
+		const target = bgTargetIndexFromClientX(clientX);
+		if (target === bgDragIndex) return;
+		const from = bgDragIndex;
+		bgDragIndex = target;
+		app.reorderBgSwatch(from, target, { deferBg: true });
+	}
+
+	function onBgSlotPointerDown(e: PointerEvent, index: number) {
+		if (e.button !== 0) return;
+		e.preventDefault();
+		bgDragIndex = index;
+		bgDragMoved = false;
+		bgDragStartX = e.clientX;
+		bgDragStartY = e.clientY;
+		bgDragPointerId = e.pointerId;
+		bgDragPendingX = null;
+		if (bgDragRaf) {
+			cancelAnimationFrame(bgDragRaf);
+			bgDragRaf = 0;
+		}
+		cacheBgSlotMids();
+		try {
+			(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+		} catch {
+			/* capture optional; window listeners are source of truth */
+		}
+	}
+
+	function onBgDragMove(e: PointerEvent) {
+		if (bgDragIndex === null) return;
+		if (bgDragPointerId !== null && e.pointerId !== bgDragPointerId) return;
+		const dx = e.clientX - bgDragStartX;
+		const dy = e.clientY - bgDragStartY;
+		if (!bgDragMoved && Math.hypot(dx, dy) < BG_DRAG_THRESHOLD) return;
+		bgDragMoved = true;
+		bgDragPendingX = e.clientX;
+		if (bgDragRaf) return;
+		bgDragRaf = requestAnimationFrame(() => {
+			bgDragRaf = 0;
+			const x = bgDragPendingX;
+			bgDragPendingX = null;
+			if (x === null || bgDragIndex === null) return;
+			applyBgReorder(x);
+		});
+	}
+
+	function onBgDragEnd(e: PointerEvent) {
+		if (bgDragIndex === null) return;
+		if (bgDragPointerId !== null && e.pointerId !== bgDragPointerId) return;
+		if (bgDragRaf) {
+			cancelAnimationFrame(bgDragRaf);
+			bgDragRaf = 0;
+			if (bgDragPendingX !== null && bgDragMoved) applyBgReorder(bgDragPendingX);
+			bgDragPendingX = null;
+		}
+		const index = bgDragIndex;
+		const wasDrag = bgDragMoved;
+		bgDragIndex = null;
+		bgDragMoved = false;
+		bgDragPointerId = null;
+		bgSlotMids = [];
+		if (wasDrag) app.finalizeBgSwatchOrder();
+		else app.toggleBgSwatch(index);
+	}
+
+	// Download dialog: pick format; optional transparent export when bg is white.
 	let showExportDialog = $state(false);
 	type ExportFormat = 'png' | 'svg';
 	let exportFormat = $state<ExportFormat>('png');
+	let exportTransparent = $state(false);
 	let dialogEl = $state<HTMLDialogElement | null>(null);
+	const canExportTransparent = $derived(
+		typeof app.canvasBg === 'string' && hexEq(app.canvasBg, PAPER_HEX)
+	);
 
 	function exportDialog(node: HTMLDialogElement) {
 		dialogEl = node;
@@ -1426,6 +1556,25 @@
 		return { cand, placeable: !blocked };
 	}
 
+	/** White stroke on dark canvas bgs, ink on light/transparent — keeps ghosts readable. */
+	function ghostContrastStroke(): paper.Color {
+		const bg = app.canvasBg;
+		if (!bg) return new paper.Color('#101A31');
+		const c = new paper.Color(bg);
+		const lum = 0.2126 * c.red + 0.7152 * c.green + 0.0722 * c.blue;
+		return new paper.Color(lum < 0.45 ? '#FFFFFF' : '#101A31');
+	}
+
+	function styleGhostPath(path: paper.Path, fill: paper.Color, strokeAlpha: number) {
+		const stroke = ghostContrastStroke();
+		stroke.alpha = strokeAlpha;
+		path.fillColor = fill;
+		path.strokeColor = stroke;
+		path.strokeWidth = 1.5;
+		path.dashArray = [5, 4];
+		path.opacity = 1;
+	}
+
 	function updateGhost() {
 		if (performance.now() < ghostSuppressedUntil) return;
 
@@ -1439,24 +1588,25 @@
 
 		const { cand, placeable } = makePlacementCandidate(pointer);
 
-		// At unplaceable spots, show a faint gray shape following the cursor
-		// exactly — clicks do nothing there.
+		// At unplaceable spots, show a faint contrasting hint — clicks do nothing there.
 		if (!placeable) {
 			cand.remove();
 			const hint = sourcePaths[app.rockIndex].clone({ insert: false }) as paper.Path;
 			hint.scale(sizeScale);
 			hint.rotate(app.rotation);
 			hint.position = pointer;
-			hint.fillColor = new paper.Color('#101A31');
-			hint.opacity = 0.08;
+			const fill = ghostContrastStroke();
+			fill.alpha = 0.12;
+			styleGhostPath(hint, fill, 0.55);
 			paper.project.activeLayer.addChild(hint);
 			ghost = hint;
 			return;
 		}
 
 		paper.project.activeLayer.addChild(cand);
-		cand.fillColor = new paper.Color(app.nextColor.hex);
-		cand.opacity = 0.65;
+		const fill = new paper.Color(app.nextColor.hex);
+		fill.alpha = 0.65;
+		styleGhostPath(cand, fill, 0.8);
 		ghost = cand;
 	}
 
@@ -1758,7 +1908,7 @@
 		}
 	}
 
-	function exportSvg() {
+	function exportSvg(transparentBg = false) {
 		withCleanExport(() => {
 			const w = Math.max(Math.round(artboard.w), 1);
 			const h = Math.max(Math.round(artboard.h), 1);
@@ -1766,7 +1916,7 @@
 			const clips: string[] = [];
 			let clipIdx = 0;
 
-			if (app.canvasBg) {
+			if (!transparentBg && app.canvasBg) {
 				body.push(`<rect width="${w}" height="${h}" fill="${escapeXml(app.canvasBg)}"/>`);
 			}
 
@@ -1814,7 +1964,7 @@
 		});
 	}
 
-	function exportPng() {
+	function exportPng(transparentBg = false) {
 		if (!canvasEl) return;
 
 		withCleanExport(() => {
@@ -1830,7 +1980,7 @@
 			if (!ctx) return;
 
 			// Leave empty for a transparent PNG; otherwise paint the chosen backdrop.
-			if (app.canvasBg) {
+			if (!transparentBg && app.canvasBg) {
 				ctx.fillStyle = app.canvasBg;
 				ctx.fillRect(0, 0, output.width, output.height);
 			}
@@ -1959,6 +2109,10 @@
 
 		paper.project.activeLayer.addChild(cand);
 		cand.fillColor = new paper.Color(app.nextColor.hex);
+		cand.strokeColor = null;
+		cand.strokeWidth = 0;
+		cand.dashArray = [];
+		cand.opacity = 1;
 		placed.push(cand);
 		syncBody(cand);
 		rockMeta.set(cand, {
@@ -2301,7 +2455,8 @@
 		});
 	});
 
-	// Rebuild the ghost when the active rock, upcoming color, size, rotation, or mode changes.
+	// Rebuild the ghost when the active rock, upcoming color, size, rotation,
+	// mode, or canvas background changes (stroke contrast depends on bg).
 	$effect(() => {
 		void app.rockIndex;
 		void app.colorIndex;
@@ -2310,6 +2465,8 @@
 		void app.mode;
 		void app.canvasTool;
 		void app.imageEditId;
+		void app.canvasBg;
+		void app.canvasBgVersion;
 		updateGhost();
 	});
 
@@ -2374,6 +2531,32 @@
 		});
 	});
 
+	// Top-bar dice: shuffle solid fills on unlocked, non-image-masked rocks.
+	$effect(() => {
+		if (!ready) return;
+		const version = app.colorShuffleVersion;
+		if (version === seenColorShuffleVersion) return;
+		seenColorShuffleVersion = version;
+		untrack(() => {
+			const pool = app.enabledBgRockColors;
+			if (!pool.length) return;
+			let changed = false;
+			for (const path of placed) {
+				if (isLocked(path)) continue;
+				if (attach.has(path)) continue;
+				if (app.backgroundImageId && !solidOnly.has(path)) continue;
+				const hex = pool[Math.floor(Math.random() * pool.length)]!;
+				const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
+				if (cur && hexEq(cur, hex)) continue;
+				path.fillColor = new paper.Color(hex);
+				changed = true;
+			}
+			if (selectedPaths.length) syncSelectionUi(selectedPaths.at(-1) ?? null);
+			updateGhost();
+			if (changed) commitHistory();
+		});
+	});
+
 	// Keep the floating tip pinned above the selection as the artboard resizes.
 	$effect(() => {
 		void stageW;
@@ -2415,6 +2598,7 @@
 		const version = app.exportVersion;
 		if (version === seenExportVersion) return;
 		seenExportVersion = version;
+		exportTransparent = false;
 		showExportDialog = true;
 	});
 
@@ -2444,8 +2628,9 @@
 
 	function confirmExport() {
 		showExportDialog = false;
-		if (exportFormat === 'svg') exportSvg();
-		else exportPng();
+		const transparent = canExportTransparent && exportTransparent;
+		if (exportFormat === 'svg') exportSvg(transparent);
+		else exportPng(transparent);
 	}
 
 	function cancelExport() {
@@ -2568,6 +2753,10 @@
 	/** Outside-canvas moves: skip when the event is on the canvas itself so
 	 *  paper.view.onMouseMove remains the sole in-bounds handler. */
 	function onWindowPointerMove(event: PointerEvent) {
+		if (bgDragIndex !== null) {
+			onBgDragMove(event);
+			return;
+		}
 		if (!ready || !canvasEl) return;
 		if (event.target === canvasEl) return;
 		const point = clientToView(event.clientX, event.clientY);
@@ -2577,7 +2766,11 @@
 
 	/** Always end interactions on window up so release outside the canvas
 	 *  commits/cancels. Idempotent with paper.view.onMouseUp. */
-	function onWindowPointerUp(_event: PointerEvent) {
+	function onWindowPointerUp(event: PointerEvent) {
+		if (bgDragIndex !== null) {
+			onBgDragEnd(event);
+			return;
+		}
 		if (!ready) return;
 		handleViewUp();
 	}
@@ -2625,22 +2818,57 @@
 	<div class="artboard" style:width="{artboard.w}px" style:height="{artboard.h}px">
 		{#if !app.imageEditId}
 			<div class="bg-bar" role="toolbar" aria-label="Canvas background">
-				{#each CANVAS_BG_COLORS as swatch (swatch.name)}
-					<button
-						class={[
-							'bg-dot',
-							{
-								on: app.canvasBg === swatch.hex,
-								transparent: swatch.hex === null
-							}
-						]}
-						style:background={swatch.hex ?? undefined}
-						onclick={() => app.selectCanvasBg(swatch.hex)}
-						title={swatch.name}
-						aria-label={swatch.name}
-						aria-pressed={app.canvasBg === swatch.hex}
-					></button>
-				{/each}
+				<button
+					class="bg-dice"
+					type="button"
+					onclick={rollBgColors}
+					title="Shuffle rock colors"
+					aria-label="Shuffle rock colors"
+				>
+					<svg bind:this={bgDiceSvg} viewBox="0 0 16 16" aria-hidden="true">
+						<rect
+							x="2.5"
+							y="2.5"
+							width="11"
+							height="11"
+							rx="2"
+							stroke="currentColor"
+							stroke-width="1.3"
+							fill="none"
+						/>
+						<circle cx="5.5" cy="5.5" r="1.1" fill="currentColor" />
+						<circle cx="8" cy="8" r="1.1" fill="currentColor" />
+						<circle cx="10.5" cy="10.5" r="1.1" fill="currentColor" />
+					</svg>
+				</button>
+				<div class="bg-colors" bind:this={bgColorsEl}>
+					{#each app.bgSwatches as swatch, i (swatch.key)}
+						<div
+							class={['bg-slot', { active: i === 0, dragging: bgDragIndex === i }]}
+							role="button"
+							tabindex="0"
+							animate:flip={{ duration: 90 }}
+							title={bgSwatchTitle(swatch.hex)}
+							aria-label={bgSwatchTitle(swatch.hex)}
+							aria-pressed={swatch.enabled}
+							style:background={i === 0 && swatch.hex
+								? `color-mix(in srgb, ${swatch.hex} 80%, transparent)`
+								: undefined}
+							onpointerdown={(e) => onBgSlotPointerDown(e, i)}
+							onkeydown={(e) => {
+								if (e.key === 'Enter' || e.key === ' ') {
+									e.preventDefault();
+									app.toggleBgSwatch(i);
+								}
+							}}
+						>
+							<span
+								class={['bg-dot', { on: swatch.enabled }]}
+								style:background={swatch.hex ?? undefined}
+							></span>
+						</div>
+					{/each}
+				</div>
 			</div>
 		{/if}
 		<canvas
@@ -2648,7 +2876,7 @@
 			class:transparent-bg={app.canvasBg === null}
 			style:width="{artboard.w}px"
 			style:height="{artboard.h}px"
-			style:background={app.canvasBg ?? undefined}
+			style:background={app.canvasBg ?? '#FFFFFF'}
 			onwheel={onWheel}
 		></canvas>
 	</div>
@@ -2807,6 +3035,12 @@
 				</label>
 			</div>
 		</fieldset>
+		{#if canExportTransparent}
+			<label class="export-transparent">
+				<input type="checkbox" bind:checked={exportTransparent} />
+				<span>Transparent (instead of white)</span>
+			</label>
+		{/if}
 		<div class="modal-actions">
 			<button class="modal-btn ghost" onclick={cancelExport}>Cancel</button>
 			<button class="modal-btn primary" onclick={confirmExport}>Download</button>
@@ -2919,57 +3153,112 @@
 		bottom: calc(100% + 12px);
 		transform: translateX(-50%);
 		display: flex;
-		align-items: center;
+		align-items: stretch;
 		justify-content: center;
-		gap: 5px;
-		padding: 5px 6px;
+		gap: 6px;
+		padding: 0;
 		border-radius: 999px;
-		background: color-mix(in srgb, var(--paper) 92%, transparent);
-		border: 1px solid var(--border);
-		box-shadow: 0 2px 10px rgba(16, 26, 49, 0.1);
-		backdrop-filter: blur(8px);
+		color: #fff;
+		background-color: #fff;
+		border: none;
+		box-shadow: 0px 4px 12px 0px rgba(0, 0, 0, 0.15);
 		z-index: 4;
 		pointer-events: auto;
+		overflow: visible;
+	}
+
+	.bg-dice {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 34px;
+		padding: 0;
+		border: none;
+		border-radius: 999px;
+		background: color-mix(in srgb, var(--paper) 92%, transparent);
+		box-shadow: none;
+		backdrop-filter: none;
+		color: var(--ink);
+		cursor: pointer;
+		flex: 0 0 auto;
+	}
+
+	.bg-dice:hover {
+		background: color-mix(in srgb, var(--ink) 8%, var(--paper));
+	}
+
+	.bg-dice svg {
+		width: 16px;
+		height: 16px;
+		display: block;
+	}
+
+	.bg-colors {
+		display: flex;
+		align-items: stretch;
+		justify-content: center;
+		flex: 0 0 auto;
+		padding: 0;
+		border: 1px solid var(--border);
+		border-radius: 999px;
+		background: color-mix(in srgb, var(--paper) 92%, transparent);
+		box-shadow: none;
+		backdrop-filter: none;
+		overflow: hidden;
+	}
+
+	.bg-slot {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 5px 4px;
+		touch-action: none;
+		cursor: grab;
+		user-select: none;
+		background: transparent;
+	}
+
+	.bg-slot.active {
+		border-radius: 999px;
+	}
+
+	.bg-slot.dragging {
+		cursor: grabbing;
+		z-index: 1;
 	}
 
 	.bg-dot {
+		display: block;
 		width: 24px;
 		height: 24px;
-		padding: 0;
-		border: 1px solid rgba(16, 26, 49, 0.14);
+		border: 1.5px dashed rgba(16, 26, 49, 0.28);
 		border-radius: 50%;
-		cursor: pointer;
-		opacity: 0.55;
+		opacity: 0.4;
 		flex: 0 0 auto;
+		pointer-events: none;
+		box-sizing: border-box;
 		transition:
 			opacity 100ms ease,
-			box-shadow 100ms ease;
+			border-color 100ms ease,
+			border-style 100ms ease;
 	}
 
-	.bg-dot:hover {
-		opacity: 0.9;
+	.bg-slot:hover .bg-dot {
+		opacity: 0.65;
 	}
 
 	.bg-dot.on {
 		opacity: 1;
-		box-shadow:
-			0 0 0 1px var(--paper),
-			0 0 0 2px var(--ink);
+		border: 2px solid var(--ink);
 	}
 
-	.bg-dot.transparent {
-		background-color: #ffffff;
-		background-image:
-			linear-gradient(45deg, #d7dbe3 25%, transparent 25%),
-			linear-gradient(-45deg, #d7dbe3 25%, transparent 25%),
-			linear-gradient(45deg, transparent 75%, #d7dbe3 75%),
-			linear-gradient(-45deg, transparent 75%, #d7dbe3 75%);
-		background-size: 8px 8px;
-		background-position:
-			0 0,
-			0 4px,
-			4px -4px,
-			-4px 0;
+	.bg-slot.active .bg-dot {
+		opacity: 1;
+		border: 2px solid #c5cad3;
+	}
+
+	.bg-slot:hover .bg-dot.on {
+		opacity: 1;
 	}
 
 	canvas {
@@ -3067,6 +3356,23 @@
 	}
 
 	.format-option input {
+		margin: 0;
+		accent-color: var(--ink);
+		cursor: pointer;
+	}
+
+	.export-transparent {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--ink);
+		cursor: pointer;
+		user-select: none;
+	}
+
+	.export-transparent input {
 		margin: 0;
 		accent-color: var(--ink);
 		cursor: pointer;
