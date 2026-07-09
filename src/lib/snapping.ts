@@ -66,6 +66,11 @@ function getSamples(path: paper.Path): paper.Point[] {
 	return s;
 }
 
+/** Drop cached outline samples after a path's geometry changes (move/reshape). */
+export function invalidateSamples(path: paper.Path) {
+	staticSampleCache.delete(path);
+}
+
 /** Candidate path plus its sample cache, kept in sync through translations. */
 class Candidate {
 	samples: paper.Point[];

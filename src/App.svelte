@@ -4,15 +4,15 @@
 </script>
 
 <div class="app">
-	<Toolbar />
 	<main class="stage">
 		<Canvas />
 	</main>
+	<Toolbar />
 </div>
 
 <style>
 	.app {
-		display: flex;
+		position: relative;
 		height: 100%;
 		overflow: hidden;
 		background:
@@ -21,9 +21,8 @@
 	}
 
 	.stage {
-		flex: 1;
-		min-width: 0;
 		height: 100%;
+		min-width: 0;
 		padding: 12px;
 		box-sizing: border-box;
 	}

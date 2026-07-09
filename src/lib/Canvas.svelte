@@ -1,9 +1,9 @@
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
 	import paper from 'paper';
-	import { app, ASPECTS, ROCK_COLORS } from './state.svelte';
+	import { app, ASPECTS, ROCK_COLORS, ROCK_SIZES } from './state.svelte';
 	import { ROCK_SVGS } from './rocks';
-	import { resolveSnap, getShapeContacts, outlineDistance, GROUP_EPS } from './snapping';
+	import { resolveSnap, getShapeContacts, outlineDistance, rocksOverlap, invalidateSamples, GROUP_EPS } from './snapping';
 	import { generateShuffle } from './shuffle';
 
 	/** Height (in canvas px) of the tallest rock; all rocks share the same scale factor. */
@@ -20,7 +20,7 @@
 	let seenExportVersion = app.exportVersion;
 	let seenUndoVersion = app.undoVersion;
 	let seenRedoVersion = app.redoVersion;
-	let lastDesignMode = app.designMode;
+	let seenShuffleSeed = app.shuffleSeed;
 	let imageEditBaseline: CanvasSnapshot | null = null;
 
 	// Download dialog: pick format and a solid white or transparent background before saving.
@@ -95,9 +95,68 @@
 		lastValidPathData: string;
 	} | null = null;
 	let didDragShape = false;
-	let selectedPath: paper.Path | null = null;
+	let draggingShape = $state(false);
+	let selectedPath = $state.raw<paper.Path | null>(null);
 	let selectionOutline: paper.Path | null = null;
 	let ghostRaf = 0;
+	let shiftHeld = $state(false);
+
+	/** Per-rock shape/size metadata (pathData alone can't recover these). */
+	interface RockMeta {
+		rockIndex: number;
+		sizeIndex: number;
+	}
+	let rockMeta = new WeakMap<paper.Path, RockMeta>();
+	/** Rocks that stay solid-colored even when a background image fill is active. */
+	let solidOnly = new WeakSet<paper.Path>();
+
+	let selectedRockIndex = $state(0);
+	let selectedSizeIndex = $state(1);
+	let selectedColorIndex = $state(0);
+	/** Image src shown in the tip when the selection is masked; null = show colors. */
+	let selectedMaskSrc = $state<string | null>(null);
+	let selectedMaskId = $state<string | null>(null);
+	/** Unclipped translucent copy of the active mask image (edit / masked selection). */
+	let editGhost: paper.Raster | null = null;
+	let tipShake = $state(false);
+	let tipShakeTimer: ReturnType<typeof setTimeout> | null = null;
+	/** When true, reshape/fill sync won't move the tip to the rock's new center. */
+	let tipLocked = false;
+	let tipPos = $state<{ left: number; top: number } | null>(null);
+	let tipAnchor = $state<{ x: number; y: number } | null>(null);
+	let tipEl: HTMLElement | undefined;
+
+	const ROCK_IMAGE_URLS = ROCK_SVGS.map(
+		(svg) => `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`
+	);
+
+	function placeTip() {
+		if (!tipEl || !tipAnchor) return;
+		const pad = 8;
+		const { width: tw, height: th } = tipEl.getBoundingClientRect();
+		if (tw < 1 || th < 1) return;
+		const vw = window.innerWidth;
+		const vh = window.innerHeight;
+		// Bottom-left corner of the tip sits on the rock center.
+		let left = tipAnchor.x;
+		let top = tipAnchor.y - th;
+		left = Math.min(Math.max(left, pad), vw - tw - pad);
+		top = Math.min(Math.max(top, pad), vh - th - pad);
+		tipPos = { left, top };
+	}
+
+	function clampTip(node: HTMLElement) {
+		tipEl = node;
+		placeTip();
+		const ro = new ResizeObserver(() => placeTip());
+		ro.observe(node);
+		window.addEventListener('resize', placeTip);
+		return () => {
+			if (tipEl === node) tipEl = undefined;
+			ro.disconnect();
+			window.removeEventListener('resize', placeTip);
+		};
+	}
 
 	// --- Undo / redo ---------------------------------------------------------
 	interface PinTransform {
@@ -109,8 +168,10 @@
 	}
 
 	interface CanvasSnapshot {
-		rocks: { pathData: string; fillColor: string }[];
+		rocks: { pathData: string; fillColor: string; rockIndex: number; sizeIndex: number }[];
 		attach: [number, string][];
+		/** Indices of rocks that opt out of the background image fill. */
+		solidOnly: number[];
 		pins: [number, PinTransform][];
 		backgroundImageId: string | null;
 		bgScale: number;
@@ -124,14 +185,20 @@
 
 	function captureSnapshot(): CanvasSnapshot {
 		return {
-			rocks: placed.map((p) => ({
-				pathData: p.pathData,
-				fillColor: (p.fillColor as paper.Color | null)?.toCSS(true) ?? app.nextColor.hex
-			})),
+			rocks: placed.map((p) => {
+				const meta = rockMeta.get(p);
+				return {
+					pathData: p.pathData,
+					fillColor: (p.fillColor as paper.Color | null)?.toCSS(true) ?? app.nextColor.hex,
+					rockIndex: meta?.rockIndex ?? 0,
+					sizeIndex: meta?.sizeIndex ?? app.sizeIndex
+				};
+			}),
 			attach: placed.flatMap((p, i) => {
 				const id = attach.get(p);
 				return id ? ([[i, id]] as [number, string][]) : [];
 			}),
+			solidOnly: placed.flatMap((p, i) => (solidOnly.has(p) ? [i] : [])),
 			pins: placed.flatMap((p, i) => {
 				const fill = fills.get(p);
 				if (!fill) return [];
@@ -173,6 +240,8 @@
 		placed = [];
 		groupParent = [];
 		attach.clear();
+		solidOnly = new WeakSet();
+		rockMeta = new WeakMap();
 
 		for (const rock of snap.rocks) {
 			const path = new paper.Path({ insert: false });
@@ -180,6 +249,10 @@
 			path.fillColor = new paper.Color(rock.fillColor);
 			paper.project.activeLayer.addChild(path);
 			placed.push(path);
+			rockMeta.set(path, {
+				rockIndex: rock.rockIndex ?? 0,
+				sizeIndex: rock.sizeIndex ?? app.sizeIndex
+			});
 		}
 
 		recomputeGroups();
@@ -188,6 +261,10 @@
 		for (const [i, imageId] of snap.attach) {
 			const path = placed[i];
 			if (path) attach.set(path, imageId);
+		}
+		for (const i of snap.solidOnly ?? []) {
+			const path = placed[i];
+			if (path) solidOnly.add(path);
 		}
 
 		app.backgroundImageId = snap.backgroundImageId;
@@ -366,6 +443,7 @@
 			raster.position = bgCenter;
 			coverClamp(raster, clip.bounds);
 		}
+		updateEditGhost();
 	}
 
 	function addPinFill(path: paper.Path, imageId: string) {
@@ -385,6 +463,7 @@
 			coverClamp(raster, clip.bounds);
 			clampPinRaster(raster, clip, el);
 			path.visible = false;
+			updateEditGhost();
 			paper.view.update();
 		});
 	}
@@ -406,6 +485,7 @@
 	function clearFills() {
 		for (const path of [...fills.keys()]) removeFill(path);
 		removeBgFill();
+		clearEditGhost();
 	}
 
 	/** Clone a placed rock's geometry for masking. Hidden paths can produce
@@ -428,7 +508,7 @@
 		const bg = app.backgroundImageId;
 		const el = bg ? imageEls.get(bg) : undefined;
 		if (!el) return;
-		const bgPaths = placed.filter((p) => !attach.has(p));
+		const bgPaths = placed.filter((p) => !attach.has(p) && !solidOnly.has(p));
 		if (bgPaths.length === 0) return;
 
 		const groups: BgFillGroup[] = [];
@@ -490,7 +570,12 @@
 
 		// Un-pinned rocks hide behind the background union once its raster has
 		// painted; pinned rocks hide once their own raster is ready.
+		// solidOnly rocks always keep their solid fill visible.
 		for (const path of placed) {
+			if (solidOnly.has(path)) {
+				path.visible = true;
+				continue;
+			}
 			const pin = fills.get(path);
 			if (pin) {
 				path.visible = !pin.raster.loaded;
@@ -499,6 +584,7 @@
 			path.visible = !bgFill || !bgFillReady();
 		}
 		if (selectedPath && placed.includes(selectedPath)) raiseSelectionVisuals();
+		syncSelectionUi(selectedPath);
 	}
 
 	/** Drop loaded elements + pins for images that no longer exist, then sync. */
@@ -557,6 +643,7 @@
 				if (iid === id) attach.delete(p);
 			}
 			attach.set(path, id);
+			solidOnly.delete(path);
 		}
 		syncFills();
 	}
@@ -568,6 +655,8 @@
 		for (const [path, iid] of [...attach]) {
 			if (iid === id) attach.delete(path);
 		}
+		// Re-include every rock, including ones previously released from the mask.
+		solidOnly = new WeakSet();
 		syncFills();
 	}
 
@@ -589,6 +678,8 @@
 
 	/** Apply the active palette color to an already-placed rock. */
 	function recolorShape(path: paper.Path): boolean {
+		if (attach.has(path)) return false;
+		if (app.backgroundImageId && !solidOnly.has(path)) return false;
 		const hex = app.nextColor.hex;
 		const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
 		if (cur === hex) return false;
@@ -596,11 +687,11 @@
 		return true;
 	}
 
-	function snapOptions() {
+	function snapOptions(constrained: boolean) {
 		return {
 			mode: app.mode,
 			getComponent,
-			requireContact: app.mode === 'stack'
+			requireContact: constrained && app.mode === 'stack'
 		} as const;
 	}
 
@@ -608,7 +699,7 @@
 	 *  as new placements. Restores `fallbackPathData` when the result is invalid. */
 	function resolveShapeSnap(path: paper.Path, fallbackPathData: string): boolean {
 		const others = placed.filter((p) => p !== path);
-		const snap = resolveSnap(path, others, viewBounds(), snapOptions());
+		const snap = resolveSnap(path, others, viewBounds(), snapOptions(true));
 		if (!snap.valid) {
 			path.pathData = fallbackPathData;
 			return false;
@@ -620,14 +711,209 @@
 		const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
 		if (!cur) return;
 		const idx = ROCK_COLORS.findIndex((c) => c.hex.toLowerCase() === cur.toLowerCase());
-		if (idx >= 0) app.selectColor(idx);
+		if (idx >= 0) {
+			app.selectColor(idx);
+			selectedColorIndex = idx;
+		}
+	}
+
+	function updateTipPos(force = false) {
+		if (tipLocked && !force) return;
+		if (!selectedPath || !canvasEl || !placed.includes(selectedPath)) {
+			tipPos = null;
+			tipAnchor = null;
+			return;
+		}
+		const rect = canvasEl.getBoundingClientRect();
+		const c = selectedPath.bounds.center;
+		tipAnchor = {
+			x: rect.left + c.x,
+			y: rect.top + c.y
+		};
+		requestAnimationFrame(placeTip);
+	}
+
+	function syncSelectionUi(path: paper.Path | null) {
+		if (!path) {
+			tipPos = null;
+			tipAnchor = null;
+			selectedMaskSrc = null;
+			selectedMaskId = null;
+			updateEditGhost();
+			return;
+		}
+		const meta = rockMeta.get(path);
+		selectedRockIndex = meta?.rockIndex ?? 0;
+		selectedSizeIndex = meta?.sizeIndex ?? app.sizeIndex;
+		const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
+		const idx = cur
+			? ROCK_COLORS.findIndex((c) => c.hex.toLowerCase() === cur.toLowerCase())
+			: -1;
+		selectedColorIndex = idx >= 0 ? idx : app.colorIndex;
+
+		const pinId = attach.get(path);
+		const bgId = app.backgroundImageId;
+		const maskId =
+			pinId ?? (bgId && !solidOnly.has(path) ? bgId : null);
+		selectedMaskId = maskId;
+		selectedMaskSrc = maskId ? (app.imageById(maskId)?.src ?? null) : null;
+		updateTipPos();
+		updateEditGhost();
+	}
+
+	/** Release this rock from its image mask so solid colors return. */
+	function releaseSelectedMask() {
+		if (!selectedPath || !placed.includes(selectedPath)) return;
+		const path = selectedPath;
+		const pinId = attach.get(path);
+		if (pinId) {
+			attach.delete(path);
+		} else if (app.backgroundImageId && !solidOnly.has(path)) {
+			solidOnly.add(path);
+		} else {
+			return;
+		}
+		syncFills();
+		commitHistory();
+	}
+
+	/** Open mask editing for the image currently on the selected rock. */
+	function editSelectedMask() {
+		if (!selectedMaskId) return;
+		app.startImageEdit(selectedMaskId);
 	}
 
 	function selectShape(path: paper.Path | null, syncColor = false) {
 		selectedPath = path;
-		if (path && syncColor) syncColorFromShape(path);
+		if (path) {
+			app.selectCursorTool();
+			if (syncColor) syncColorFromShape(path);
+		}
+		syncSelectionUi(path);
 		updateSelectionVisuals();
 		updateGhost();
+	}
+
+	/** Scale factor for a given size index at the current artboard. */
+	function scaleForSize(sizeIndex: number): number {
+		return (ROCK_SIZES[sizeIndex].fraction * Math.sqrt(artboard.w * artboard.h)) / ROCK_HEIGHT;
+	}
+
+	/** Rebuild a placed rock's outline as a different shape/size.
+	 *  Keeps the current center when possible; otherwise searches nearby for a
+	 *  free spot. If nowhere fits, reverts and shakes the tip. */
+	function reshapeSelected(nextRock: number, nextSize: number): boolean {
+		if (!selectedPath || !placed.includes(selectedPath)) return false;
+		const path = selectedPath;
+		const meta = rockMeta.get(path);
+		if (meta?.rockIndex === nextRock && meta?.sizeIndex === nextSize) return false;
+
+		const center = path.bounds.center.clone();
+		const fill = (path.fillColor as paper.Color | null)?.clone() ?? new paper.Color(app.nextColor.hex);
+		const beforePathData = path.pathData;
+		const beforeMeta = meta
+			? { rockIndex: meta.rockIndex, sizeIndex: meta.sizeIndex }
+			: { rockIndex: 0, sizeIndex: app.sizeIndex };
+		const savedAnchor = tipAnchor ? { ...tipAnchor } : null;
+		const savedTip = tipPos ? { ...tipPos } : null;
+		tipLocked = true;
+
+		const next = sourcePaths[nextRock].clone({ insert: false }) as paper.Path;
+		next.scale(scaleForSize(nextSize));
+		next.position = center;
+		next.fillColor = fill;
+
+		path.pathData = next.pathData;
+		path.fillColor = fill;
+		next.remove();
+		invalidateSamples(path);
+
+		const others = placed.filter((p) => p !== path);
+		const free = () => !others.some((p) => rocksOverlap(path, p));
+
+		if (!free()) {
+			// Prefer snap settle (pushes out of overlaps), then spiral search.
+			const snap = resolveSnap(path, others, viewBounds(), snapOptions(false));
+			if (!snap.valid || !free()) {
+				path.position = center;
+				invalidateSamples(path);
+				let found = false;
+				for (let ring = 1; ring <= 28 && !found; ring++) {
+					const steps = Math.max(8, ring * 6);
+					const radius = ring * 14;
+					for (let s = 0; s < steps; s++) {
+						const angle = (s / steps) * Math.PI * 2;
+						path.position = center.add(
+							new paper.Point(Math.cos(angle) * radius, Math.sin(angle) * radius)
+						);
+						invalidateSamples(path);
+						if (free()) {
+							found = true;
+							break;
+						}
+					}
+				}
+				if (!found) {
+					path.pathData = beforePathData;
+					path.fillColor = fill;
+					invalidateSamples(path);
+					rockMeta.set(path, beforeMeta);
+					tipLocked = false;
+					if (savedAnchor) tipAnchor = savedAnchor;
+					if (savedTip) tipPos = savedTip;
+					shakeTip();
+					updateSelectionVisuals();
+					return false;
+				}
+			}
+		}
+
+		rockMeta.set(path, { rockIndex: nextRock, sizeIndex: nextSize });
+		selectedRockIndex = nextRock;
+		selectedSizeIndex = nextSize;
+
+		finalizeShapeTransform();
+		tipLocked = false;
+		// Restore the tip where it was before the rock moved.
+		if (savedAnchor) tipAnchor = savedAnchor;
+		if (savedTip) tipPos = savedTip;
+		else requestAnimationFrame(placeTip);
+		return true;
+	}
+
+	function shakeTip() {
+		tipShake = false;
+		requestAnimationFrame(() => {
+			tipShake = true;
+			if (tipShakeTimer) clearTimeout(tipShakeTimer);
+			tipShakeTimer = setTimeout(() => {
+				tipShake = false;
+				tipShakeTimer = null;
+			}, 420);
+		});
+	}
+
+	function setSelectedColor(i: number) {
+		if (!selectedPath) return;
+		app.selectColor(i);
+	}
+
+	function setSelectedRock(i: number) {
+		if (!selectedPath) return;
+		if (reshapeSelected(i, selectedSizeIndex)) commitHistory();
+	}
+
+	function setSelectedSize(i: number) {
+		if (!selectedPath) return;
+		if (reshapeSelected(selectedRockIndex, i)) commitHistory();
+	}
+
+	function cycleSelectedRock() {
+		setSelectedRock((selectedRockIndex + 1) % ROCK_SVGS.length);
+	}
+
+	function cycleSelectedSize() {
+		setSelectedSize((selectedSizeIndex + 1) % ROCK_SIZES.length);
 	}
 
 	function clearContactMarkers() {
@@ -644,6 +930,69 @@
 			contactMarkers.push(m);
 		}
 		raiseSelectionVisuals();
+	}
+
+	function clearEditGhost() {
+		editGhost?.remove();
+		editGhost = null;
+	}
+
+	/** Show a faint full-frame copy of the mask image so pan/zoom is visible. */
+	function updateEditGhost() {
+		if (!ready) {
+			clearEditGhost();
+			return;
+		}
+		const editId = app.imageEditId;
+		const maskId = editId ?? selectedMaskId;
+		if (!maskId) {
+			clearEditGhost();
+			return;
+		}
+		// Only preview while editing, or while a masked rock is selected.
+		if (!editId && !selectedPath) {
+			clearEditGhost();
+			return;
+		}
+		const el = imageEls.get(maskId);
+		if (!el) {
+			clearEditGhost();
+			return;
+		}
+
+		let pos: paper.Point | null = null;
+		let scale = 1;
+		if (editId === app.backgroundImageId || (!editId && maskId === app.backgroundImageId)) {
+			if (!bgCenter) {
+				clearEditGhost();
+				return;
+			}
+			pos = bgCenter;
+			scale = bgScale;
+		} else {
+			// Prefer the selected rock's pin, else any pin of this image.
+			const pin =
+				(selectedPath ? fills.get(selectedPath) : undefined) ??
+				[...fills.values()].find((f) => f.imageId === maskId);
+			if (!pin || pin.imageId !== maskId) {
+				clearEditGhost();
+				return;
+			}
+			pos = pin.raster.position;
+			scale = pin.raster.scaling.x;
+		}
+
+		if (!editGhost || (editGhost.data as { imageId?: string } | undefined)?.imageId !== maskId) {
+			clearEditGhost();
+			editGhost = new paper.Raster(el);
+			editGhost.data = { imageId: maskId };
+			editGhost.locked = true;
+			paper.project.activeLayer.addChild(editGhost);
+		}
+		editGhost.scaling = new paper.Point(scale, scale);
+		editGhost.position = pos;
+		editGhost.opacity = app.imageEditId ? 0.32 : 0.22;
+		editGhost.sendToBack();
 	}
 
 	function raiseSelectionVisuals() {
@@ -675,20 +1024,49 @@
 			clearContactMarkers();
 			return;
 		}
-		drawContactMarkers(getShapeContacts(selectedPath, placed, viewBounds(), app.mode));
+		// Contact markers only matter when snapping (Shift) or in stack mode.
+		if (shiftHeld || app.mode === 'stack') {
+			drawContactMarkers(getShapeContacts(selectedPath, placed, viewBounds(), app.mode));
+		} else {
+			clearContactMarkers();
+		}
 	}
 
-	/** Move a placed rock to follow the cursor, snapping like a new placement. */
-	function moveShapeTo(path: paper.Path, point: paper.Point, grabOffset: paper.Point, fallbackPathData: string): boolean {
+	/** Free move: follow the cursor, reject overlaps. Shift: snap like placement. */
+	function moveShapeTo(
+		path: paper.Path,
+		point: paper.Point,
+		grabOffset: paper.Point,
+		fallbackPathData: string,
+		snap: boolean
+	): boolean {
 		path.position = point.add(grabOffset);
-		return resolveShapeSnap(path, fallbackPathData);
+		invalidateSamples(path);
+		if (snap) return resolveShapeSnap(path, fallbackPathData);
+
+		const others = placed.filter((p) => p !== path);
+		if (others.some((p) => rocksOverlap(path, p))) {
+			path.pathData = fallbackPathData;
+			invalidateSamples(path);
+			return false;
+		}
+		return true;
 	}
 
 	/** Rotate a placed rock and settle it with the same snap rules. */
 	function rotateShapeWithSnap(path: paper.Path, degrees: number): boolean {
 		const before = path.pathData;
 		path.rotate(degrees, path.bounds.center);
-		return resolveShapeSnap(path, before);
+		invalidateSamples(path);
+		if (shiftHeld) return resolveShapeSnap(path, before);
+
+		const others = placed.filter((p) => p !== path);
+		if (others.some((p) => rocksOverlap(path, p))) {
+			path.pathData = before;
+			invalidateSamples(path);
+			return false;
+		}
+		return true;
 	}
 
 	/** After moving or rotating a rock, rebuild fills and regroup contacts. */
@@ -758,15 +1136,27 @@
 	 *  as the position the user meant. */
 	const CURSOR_ATTACH_DIST = 24;
 
-	/** Scaled clone of the active rock, positioned at the cursor and snapped.
-	 *  `placeable` is true only when the snap is valid AND the resolved shape
-	 *  is still under (or right next to) the cursor. */
-	function makeSnappedCandidate(point: paper.Point) {
+	/** Scaled clone of the active rock at the cursor.
+	 *  Free place (default): no overlap only. Shift: snap constraints. */
+	function makePlacementCandidate(point: paper.Point, constrained: boolean) {
 		const cand = sourcePaths[app.rockIndex].clone({ insert: false }) as paper.Path;
 		cand.scale(sizeScale);
 		cand.rotate(app.rotation);
 		cand.position = point;
-		const snap = resolveSnap(cand, placed, viewBounds(), snapOptions());
+		if (!constrained) {
+			const blocked = placed.some((p) => rocksOverlap(cand, p));
+			return {
+				cand,
+				snap: {
+					valid: !blocked,
+					position: cand.position,
+					contacts: [] as paper.Point[],
+					balance: null
+				},
+				placeable: !blocked
+			};
+		}
+		const snap = resolveSnap(cand, placed, viewBounds(), snapOptions(true));
 		const nearCursor =
 			cand.contains(point) || cand.getNearestPoint(point).getDistance(point) <= CURSOR_ATTACH_DIST;
 		return { cand, snap, placeable: snap.valid && nearCursor };
@@ -779,12 +1169,12 @@
 		ghost = null;
 		ghostMarkers = [];
 		balanceLine = null;
-		if (!pointer || !ready || app.designMode === 'shuffle' || app.imageEditId || selectedPath) return;
+		if (!pointer || !ready || app.imageEditId || app.canvasTool !== 'shape' || selectedPath) return;
 
 		// Don't show a placement ghost over existing rocks — click to select instead.
 		if (shapeAt(pointer)) return;
 
-		const { cand, snap, placeable } = makeSnappedCandidate(pointer);
+		const { cand, snap, placeable } = makePlacementCandidate(pointer, shiftHeld);
 
 		// At unplaceable spots, show a faint gray shape following the cursor
 		// exactly — clicks do nothing there.
@@ -826,6 +1216,8 @@
 		for (const p of placed) p.remove();
 		placed = [];
 		groupParent = [];
+		rockMeta = new WeakMap();
+		solidOnly = new WeakSet();
 		selectShape(null);
 		placedArtboard = { w: artboard.w, h: artboard.h };
 		app.placedCount = 0;
@@ -845,7 +1237,7 @@
 		clearPlaced();
 		resetOverlay();
 		updateGhost();
-		if (app.designMode === 'place') commitHistory();
+		commitHistory();
 	}
 
 	function escapeXml(value: string): string {
@@ -1011,6 +1403,11 @@
 			paper.project.activeLayer.addChild(rock);
 			placed.push(rock);
 			groupParent.push(placed.length - 1);
+			const data = rock.data as { rockIndex?: number; sizeIndex?: number } | undefined;
+			rockMeta.set(rock, {
+				rockIndex: data?.rockIndex ?? 0,
+				sizeIndex: data?.sizeIndex ?? app.sizeIndex
+			});
 		}
 
 		// Rocks were just generated at this canvas size, so anchor here without
@@ -1018,6 +1415,7 @@
 		placedArtboard = { w: bounds.width, h: bounds.height };
 		repositionPlaced(bounds.width, bounds.height);
 		app.placedCount = placed.length;
+		commitHistory();
 	}
 
 	function drawBalanceLine(balance: { x: number; top: number }) {
@@ -1036,7 +1434,7 @@
 	}
 
 	function placeRock(point: paper.Point) {
-		const { cand, placeable } = makeSnappedCandidate(point);
+		const { cand, placeable } = makePlacementCandidate(point, shiftHeld);
 		if (!placeable) {
 			cand.remove();
 			return;
@@ -1044,6 +1442,7 @@
 		paper.project.activeLayer.addChild(cand);
 		cand.fillColor = new paper.Color(app.nextColor.hex);
 		placed.push(cand);
+		rockMeta.set(cand, { rockIndex: app.rockIndex, sizeIndex: app.sizeIndex });
 
 		// Union the new rock with every placed rock it touches.
 		const idx = placed.length - 1;
@@ -1120,6 +1519,7 @@
 					const f = imageDrag.fill as PinFill;
 					f.raster.position = f.raster.position.add(delta);
 					coverClamp(f.raster, f.clip.bounds);
+					updateEditGhost();
 				}
 				didDragImage = true;
 				if (canvasEl) canvasEl.style.cursor = 'grabbing';
@@ -1127,11 +1527,15 @@
 			}
 			if (shapeDrag) {
 				const { path, grabOffset, lastValidPathData } = shapeDrag;
-				if (moveShapeTo(path, event.point, grabOffset, lastValidPathData)) {
+				const snap =
+					!!(event as paper.MouseEvent & { event?: MouseEvent }).event?.shiftKey || shiftHeld;
+				if (moveShapeTo(path, event.point, grabOffset, lastValidPathData, snap)) {
 					shapeDrag.lastValidPathData = path.pathData;
 				}
 				updateSelectionVisuals();
+				updateTipPos();
 				didDragShape = true;
+				draggingShape = true;
 				if (canvasEl) canvasEl.style.cursor = 'grabbing';
 				return;
 			}
@@ -1144,13 +1548,12 @@
 					canvasEl.style.cursor = '';
 				}
 			}
-			if (app.designMode !== 'place' || app.imageEditId) return;
+			if (app.imageEditId) return;
 			pointer = event.point;
 			scheduleGhostUpdate();
 		};
 		paper.view.onMouseLeave = () => {
 			if (canvasEl) canvasEl.style.cursor = '';
-			if (app.designMode !== 'place') return;
 			pointer = null;
 			scheduleGhostUpdate();
 		};
@@ -1163,7 +1566,7 @@
 				return;
 			}
 			const shape = shapeAt(event.point);
-			if (app.designMode === 'place' && shape) {
+			if (shape) {
 				selectShape(shape, true);
 				shapeDrag = {
 					path: shape,
@@ -1176,10 +1579,12 @@
 			if (imageDrag && didDragImage && !app.imageEditId) commitHistory();
 			if (shapeDrag && didDragShape) {
 				finalizeShapeTransform();
+				updateTipPos();
 				commitHistory();
 			}
 			imageDrag = null;
 			shapeDrag = null;
+			draggingShape = false;
 			if (canvasEl) canvasEl.style.cursor = '';
 		};
 		paper.view.onClick = (event: paper.MouseEvent) => {
@@ -1193,7 +1598,6 @@
 				if (shape) toggleImageMask(shape);
 				return;
 			}
-			if (app.designMode !== 'place') return;
 			const shape = shapeAt(event.point);
 			if (shape) {
 				selectShape(shape, true);
@@ -1203,7 +1607,7 @@
 				selectShape(null);
 				return;
 			}
-			placeRock(event.point);
+			if (app.canvasTool === 'shape') placeRock(event.point);
 		};
 
 		ready = true;
@@ -1251,7 +1655,10 @@
 			const factor = Math.sqrt((w * h) / prevArea);
 			if (Math.abs(factor - 1) > 1e-4) {
 				const pivot = unitedBounds().center;
-				for (const p of placed) p.scale(factor, pivot);
+				for (const p of placed) {
+					p.scale(factor, pivot);
+					invalidateSamples(p);
+				}
 			}
 		}
 		placedArtboard = { w, h };
@@ -1262,12 +1669,16 @@
 			app.mode === 'stack' ? new paper.Point(w / 2, h) : new paper.Point(w / 2, h / 2);
 
 		const delta = target.subtract(anchor);
-		for (const p of placed) p.translate(delta);
+		for (const p of placed) {
+			p.translate(delta);
+			invalidateSamples(p);
+		}
 
 		// Geometry moved/scaled, so fills (separate clip clones + rasters) are
 		// stale: rebuild them against the new layout and shared baseline.
 		rebuildFills();
 		updateSelectionVisuals();
+		updateTipPos();
 	}
 
 	// Keep the Paper view sized to the computed artboard and refit the
@@ -1279,6 +1690,14 @@
 		untrack(() => repositionPlaced(artboard.w, artboard.h));
 	});
 
+	// Entering shape tool clears selection so the placement ghost can appear.
+	$effect(() => {
+		if (!ready || app.canvasTool !== 'shape') return;
+		untrack(() => {
+			if (selectedPath) selectShape(null);
+		});
+	});
+
 	// Rebuild the ghost when the active rock, upcoming color, size, rotation, or mode changes.
 	$effect(() => {
 		void app.rockIndex;
@@ -1286,8 +1705,9 @@
 		void sizeScale;
 		void app.rotation;
 		void app.mode;
-		void app.designMode;
+		void app.canvasTool;
 		void app.imageEditId;
+		void shiftHeld;
 		updateGhost();
 	});
 
@@ -1295,22 +1715,36 @@
 	$effect(() => {
 		if (!ready) return;
 		const id = app.imageEditId;
-		if (!id) return;
+		if (!id) {
+			untrack(() => updateEditGhost());
+			return;
+		}
 		untrack(() => {
 			imageEditBaseline = captureSnapshot();
 			selectShape(null);
 			resetOverlay();
+			updateEditGhost();
 		});
 	});
 
-	// When a shape is selected, palette changes recolor it.
+	// When a shape is selected, palette changes from the main toolbar recolor it.
 	$effect(() => {
 		const idx = app.colorIndex;
-		if (!ready || app.designMode !== 'place' || app.imageEditId || !selectedPath) return;
+		if (!ready || app.imageEditId || !selectedPath) return;
 		untrack(() => {
 			void idx;
+			selectedColorIndex = idx;
 			if (recolorShape(selectedPath!)) commitHistory();
 		});
+	});
+
+	// Keep the floating tip pinned above the selection as the artboard resizes.
+	$effect(() => {
+		void stageW;
+		void stageH;
+		void app.aspect;
+		if (!selectedPath) return;
+		untrack(() => updateTipPos());
 	});
 
 	// Load new uploads, drop removed ones, and re-sync fills. Runs when the
@@ -1323,19 +1757,12 @@
 		untrack(() => refreshImages());
 	});
 
-	// Run shuffle when entering shuffle mode, changing cluster/stack, or clicking Shuffle.
+	// Generate only when the user clicks Generate (shuffleSeed bumps).
 	$effect(() => {
 		if (!ready) return;
-		void app.designMode;
-		void app.shuffleSeed;
-		void app.mode;
-		// Re-run whenever the enabled color/shape/size pools change — track the
-		// actual contents, not just the count, so swapping one entry for another
-		// (same length) still regenerates.
-		void app.enabledColors.join(',');
-		void app.enabledShapes.join(',');
-		void app.sizeIndex;
-		if (app.designMode !== 'shuffle') return;
+		const seed = app.shuffleSeed;
+		if (seed === seenShuffleSeed) return;
+		seenShuffleSeed = seed;
 		untrack(() => runShuffle());
 	});
 
@@ -1356,7 +1783,7 @@
 	});
 
 	$effect(() => {
-		if (!ready || app.designMode !== 'place') return;
+		if (!ready) return;
 		const version = app.undoVersion;
 		if (version === seenUndoVersion) return;
 		seenUndoVersion = version;
@@ -1364,21 +1791,11 @@
 	});
 
 	$effect(() => {
-		if (!ready || app.designMode !== 'place') return;
+		if (!ready) return;
 		const version = app.redoVersion;
 		if (version === seenRedoVersion) return;
 		seenRedoVersion = version;
 		untrack(() => redoHistory());
-	});
-
-	// Fresh undo stack when returning to place mode from shuffle.
-	$effect(() => {
-		if (!ready) return;
-		const mode = app.designMode;
-		if (mode === 'place' && lastDesignMode !== 'place') {
-			untrack(() => initHistory());
-		}
-		lastDesignMode = mode;
 	});
 
 	// Drive the native <dialog> from the open flag so it gets focus trapping,
@@ -1415,23 +1832,26 @@
 				hit.fill.raster.scale(factor, point);
 				coverClamp(hit.fill.raster, hit.fill.clip.bounds);
 				if (el) clampPinRaster(hit.fill.raster, hit.fill.clip, el);
+				updateEditGhost();
 			}
 			return;
 		}
-		if (app.designMode === 'place' && selectedPath) {
+		if (selectedPath) {
 			event.preventDefault();
 			if (rotateShapeWithSnap(selectedPath, event.deltaY * 0.25)) {
 				finalizeShapeTransform();
+				updateTipPos();
 				commitHistory();
 			}
 			return;
 		}
-		if (app.designMode !== 'place') return;
+		if (app.canvasTool !== 'shape') return;
 		event.preventDefault();
 		app.rotateBy(event.deltaY * 0.25);
 	}
 
 	function onKeydown(event: KeyboardEvent) {
+		if (event.key === 'Shift') shiftHeld = true;
 		// The native <dialog> traps focus and handles Escape itself; just add
 		// Enter as a shortcut to confirm the download.
 		if (showExportDialog) {
@@ -1442,7 +1862,7 @@
 			return;
 		}
 		const mod = event.metaKey || event.ctrlKey;
-		if (mod && event.key === 'z' && app.designMode === 'place') {
+		if (mod && event.key === 'z') {
 			event.preventDefault();
 			if (event.shiftKey) app.redo();
 			else app.undo();
@@ -1455,31 +1875,45 @@
 			}
 			return;
 		}
-		if (app.designMode !== 'place') return;
 		if ((event.key === 'Delete' || event.key === 'Backspace') && selectedPath) {
 			event.preventDefault();
 			if (eraseShape(selectedPath)) commitHistory();
 			return;
 		}
+		if (event.key === 'Escape' && selectedPath) {
+			event.preventDefault();
+			selectShape(null);
+			return;
+		}
 		if (event.key === 'ArrowRight') {
 			event.preventDefault();
-			app.cycleRock(1);
+			if (selectedPath) setSelectedRock((selectedRockIndex + 1) % ROCK_SVGS.length);
+			else app.cycleRock(1);
 		} else if (event.key === 'ArrowLeft') {
 			event.preventDefault();
-			app.cycleRock(-1);
+			if (selectedPath) {
+				setSelectedRock((selectedRockIndex - 1 + ROCK_SVGS.length) % ROCK_SVGS.length);
+			} else app.cycleRock(-1);
 		} else if (event.key === 'ArrowUp') {
 			event.preventDefault();
-			app.advanceColor(1);
+			if (selectedPath) setSelectedColor((selectedColorIndex + 1) % ROCK_COLORS.length);
+			else app.advanceColor(1);
 		} else if (event.key === 'ArrowDown') {
 			event.preventDefault();
-			app.advanceColor(-1);
+			if (selectedPath) {
+				setSelectedColor((selectedColorIndex - 1 + ROCK_COLORS.length) % ROCK_COLORS.length);
+			} else app.advanceColor(-1);
 		}
+	}
+
+	function onKeyup(event: KeyboardEvent) {
+		if (event.key === 'Shift') shiftHeld = false;
 	}
 </script>
 
-<svelte:window onkeydown={onKeydown} />
+<svelte:window onkeydown={onKeydown} onkeyup={onKeyup} />
 
-<div class="wrap" class:shuffle={app.designMode === 'shuffle'} class:image-editing={!!app.imageEditId} bind:clientWidth={stageW} bind:clientHeight={stageH}>
+<div class="wrap" class:image-editing={!!app.imageEditId} bind:clientWidth={stageW} bind:clientHeight={stageH}>
 	{#if app.imageEditId}
 		<div class="image-edit-dim" aria-hidden="true"></div>
 		<div class="image-edit-bar" role="toolbar" aria-label="Image edit controls">
@@ -1517,6 +1951,78 @@
 		onwheel={onWheel}
 	></canvas>
 </div>
+
+{#if tipAnchor && selectedPath && !app.imageEditId && !draggingShape}
+	<div
+		class={['sel-tip', { shake: tipShake }]}
+		style:left={tipPos ? `${tipPos.left}px` : '-9999px'}
+		style:top={tipPos ? `${tipPos.top}px` : '0'}
+		style:visibility={tipPos ? 'visible' : 'hidden'}
+		role="toolbar"
+		tabindex="-1"
+		aria-label="Selected rock"
+		{@attach clampTip}
+		onpointerdown={(e) => e.stopPropagation()}
+	>
+		<button
+			class="sel-cycle shape"
+			onclick={cycleSelectedRock}
+			title="Cycle shape"
+			aria-label="Cycle shape"
+		>
+			<img src={ROCK_IMAGE_URLS[selectedRockIndex]} alt="" />
+		</button>
+		<button
+			class="sel-cycle size"
+			onclick={cycleSelectedSize}
+			title="Cycle size"
+			aria-label="Cycle size"
+		>
+			{ROCK_SIZES[selectedSizeIndex].label}
+		</button>
+		{#if selectedMaskSrc}
+			<div class="sel-mask-wrap">
+				<button
+					class="sel-mask-thumb"
+					onclick={editSelectedMask}
+					title="Edit image mask"
+					aria-label="Edit image mask"
+				>
+					<img src={selectedMaskSrc} alt="" />
+				</button>
+				<button
+					class="sel-mask-remove"
+					onclick={releaseSelectedMask}
+					title="Release from image mask"
+					aria-label="Release from image mask"
+				>
+					<svg viewBox="0 0 16 16" aria-hidden="true">
+						<path
+							d="M4 4l8 8M12 4l-8 8"
+							stroke="currentColor"
+							stroke-width="1.8"
+							fill="none"
+							stroke-linecap="round"
+						/>
+					</svg>
+				</button>
+			</div>
+		{:else}
+			<div class="sel-colors">
+				{#each ROCK_COLORS as color, i (color.hex)}
+					<button
+						class={['sel-dot', { on: selectedColorIndex === i }]}
+						style:background={color.hex}
+						onclick={() => setSelectedColor(i)}
+						title={color.name}
+						aria-label={color.name}
+						aria-pressed={selectedColorIndex === i}
+					></button>
+				{/each}
+			</div>
+		{/if}
+	</div>
+{/if}
 
 <dialog
 	class="modal"
@@ -1655,10 +2161,6 @@
 		background: var(--paper);
 		border-radius: 4px;
 		box-shadow: 0 2px 16px rgba(16, 26, 49, 0.14);
-		cursor: default;
-	}
-
-	.wrap.shuffle canvas {
 		cursor: default;
 	}
 
@@ -1829,5 +2331,171 @@
 	.modal-btn.primary:hover {
 		transform: translateY(-1px);
 		opacity: 0.92;
+	}
+
+	.sel-tip {
+		position: fixed;
+		z-index: 30;
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 6px 8px;
+		border-radius: 999px;
+		background: color-mix(in srgb, var(--paper) 94%, transparent);
+		border: 1px solid var(--border);
+		box-shadow: 0 8px 24px rgba(16, 26, 49, 0.16);
+		backdrop-filter: blur(10px);
+		pointer-events: auto;
+		width: max-content;
+	}
+
+	.sel-tip.shake {
+		border-color: #ed4e3d;
+		box-shadow: 0 8px 24px rgba(237, 78, 61, 0.28);
+		animation: tip-shake 420ms ease;
+	}
+
+	@keyframes tip-shake {
+		0%,
+		100% {
+			transform: translateX(0);
+		}
+		20% {
+			transform: translateX(-6px);
+		}
+		40% {
+			transform: translateX(6px);
+		}
+		60% {
+			transform: translateX(-4px);
+		}
+		80% {
+			transform: translateX(4px);
+		}
+	}
+
+	.sel-colors {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 0;
+	}
+
+	.sel-mask-wrap {
+		position: relative;
+		padding: 3px;
+		margin: -3px;
+		flex: 0 0 auto;
+	}
+
+	.sel-mask-thumb {
+		width: 32px;
+		height: 32px;
+		padding: 0;
+		border-radius: 4px;
+		border: 1px solid var(--border);
+		background: var(--paper);
+		overflow: hidden;
+		cursor: pointer;
+	}
+
+	.sel-mask-thumb:hover {
+		border-color: var(--ink);
+	}
+
+	.sel-mask-thumb img {
+		width: 100%;
+		height: 100%;
+		object-fit: cover;
+		display: block;
+		pointer-events: none;
+	}
+
+	.sel-mask-remove {
+		position: absolute;
+		top: 0;
+		right: 0;
+		width: 14px;
+		height: 14px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 0;
+		border-radius: 2px;
+		border: 1px solid var(--paper);
+		background: var(--ink);
+		color: var(--paper);
+		cursor: pointer;
+	}
+
+	.sel-mask-remove svg {
+		width: 8px;
+		height: 8px;
+	}
+
+	.sel-mask-remove:hover {
+		background: #ed4e3d;
+	}
+
+	.sel-cycle {
+		font: inherit;
+		height: 28px;
+		min-width: 28px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		padding: 0 8px;
+		border-radius: 999px;
+		border: 1px solid var(--border);
+		background: transparent;
+		color: var(--ink);
+		cursor: pointer;
+		flex: 0 0 auto;
+		transition: background-color 100ms ease, border-color 100ms ease;
+	}
+
+	.sel-cycle:hover {
+		border-color: var(--ink);
+		background: color-mix(in srgb, var(--ink) 5%, transparent);
+	}
+
+	.sel-cycle.shape {
+		padding: 3px;
+		width: 28px;
+	}
+
+	.sel-cycle.shape img {
+		max-width: 100%;
+		max-height: 100%;
+		width: auto;
+		height: auto;
+	}
+
+	.sel-cycle.size {
+		font-size: 11px;
+		font-weight: 700;
+		min-width: 28px;
+		padding: 0;
+	}
+
+	.sel-dot {
+		width: 28px;
+		height: 28px;
+		padding: 0;
+		border: none;
+		border-radius: 50%;
+		cursor: pointer;
+		opacity: 0.35;
+		flex: 0 0 auto;
+		transition:
+			opacity 100ms ease,
+			box-shadow 100ms ease;
+	}
+
+	.sel-dot.on {
+		opacity: 1;
+		box-shadow:
+			0 0 0 1px var(--paper),
+			0 0 0 2px var(--ink);
 	}
 </style>

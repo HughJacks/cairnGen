@@ -53,7 +53,10 @@ export const ROCK_SIZES: RockSize[] = [
 ];
 
 export type Mode = 'cluster' | 'stack';
-export type DesignMode = 'place' | 'shuffle';
+/** Active canvas interaction tool. Cursor selects/moves; shape places; lucky opens generate settings. */
+export type CanvasTool = 'cursor' | 'shape' | 'lucky';
+/** Which bottom-toolbar settings pill is open. Cursor has no sub-items. */
+export type ToolPanel = 'none' | 'shape' | 'lucky';
 
 export interface UploadedImage {
 	id: string;
@@ -61,7 +64,8 @@ export interface UploadedImage {
 }
 
 class AppState {
-	designMode: DesignMode = $state('place');
+	canvasTool: CanvasTool = $state('cursor');
+	toolPanel: ToolPanel = $state('none');
 	mode: Mode = $state('cluster');
 	aspect: AspectId = $state('4:5');
 	rockIndex = $state(0);
@@ -76,9 +80,8 @@ class AppState {
 	canUndo = $state(false);
 	canRedo = $state(false);
 
-	/** Per-item shuffle selections — only used in shuffle design mode.
-	 *  Every color and shape is on by default; toggling an entry removes it
-	 *  from the pool the shuffle draws from. Size uses `sizeIndex` (shared). */
+	/** Pool for "I'm feeling lucky" generation. Size uses `sizeIndex` (shared
+	 *  with place). Toggling never leaves a category completely empty. */
 	colorEnabled = $state(ROCK_COLORS.map(() => true));
 	shapeEnabled = $state(Array.from({ length: ROCK_COUNT }, () => true));
 	shuffleSeed = $state(0);
@@ -169,10 +172,49 @@ class AppState {
 		this.mode = this.mode === 'cluster' ? 'stack' : 'cluster';
 	}
 
-	toggleDesignMode() {
-		this.designMode = this.designMode === 'place' ? 'shuffle' : 'place';
-		if (this.designMode === 'shuffle') this.shuffleSeed++;
-		else this.clear();
+	/** Alias for the lucky-panel cycle control. */
+	cycleMode() {
+		this.toggleMode();
+	}
+
+	setMode(mode: Mode) {
+		this.mode = mode;
+	}
+
+	/** Select/move existing rocks. Deactivates shape and lucky. */
+	selectCursorTool() {
+		this.canvasTool = 'cursor';
+		this.toolPanel = 'none';
+	}
+
+	/** Place new rocks. Opens shape settings; deactivates cursor and lucky. */
+	selectShapeTool() {
+		if (this.canvasTool === 'shape') {
+			this.toolPanel = this.toolPanel === 'shape' ? 'none' : 'shape';
+			return;
+		}
+		this.canvasTool = 'shape';
+		this.toolPanel = 'shape';
+	}
+
+	/**
+	 * Lucky / generate: first click opens settings; second click closes and rolls.
+	 * Deactivates cursor and shape while the panel is open.
+	 */
+	toggleLuckyTool() {
+		if (this.toolPanel === 'lucky') {
+			this.generate();
+			this.toolPanel = 'none';
+			this.canvasTool = 'cursor';
+			return;
+		}
+		this.canvasTool = 'lucky';
+		this.toolPanel = 'lucky';
+	}
+
+	closeToolPanel() {
+		this.toolPanel = 'none';
+		if (this.canvasTool === 'lucky') this.canvasTool = 'cursor';
 	}
 
 	/** Flip one entry on/off, but never leave a category completely empty. */
@@ -191,7 +233,8 @@ class AppState {
 		this.shapeEnabled = this.toggleAt(this.shapeEnabled, i);
 	}
 
-	shuffle() {
+	/** Generate a new lucky layout (Canvas watches `shuffleSeed`). */
+	generate() {
 		this.shuffleSeed++;
 	}
 
