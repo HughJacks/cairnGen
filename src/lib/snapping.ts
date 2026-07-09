@@ -36,8 +36,8 @@ const EQUAL_PRIORITY_TOL = 32;
 const TOUCH_EPS = 2.5;
 /** Outline distance used when grouping placed rocks into stacks. */
 export const GROUP_EPS = TOUCH_EPS * 2;
-/** Binary search iterations (1/2^14 px precision is plenty). */
-const SEARCH_ITERS = 14;
+/** Binary search iterations (~1/2^10 px is enough for flush contact). */
+const SEARCH_ITERS = 10;
 
 // ---------------------------------------------------------------------------
 // Outline sampling. Placed rocks never move, so their samples are computed
@@ -45,23 +45,36 @@ const SEARCH_ITERS = 14;
 // shifted incrementally as it translates (avoiding repeated arc-length walks).
 // ---------------------------------------------------------------------------
 
-function computeSamples(path: paper.Path): paper.Point[] {
-	const n = Math.round(Math.min(96, Math.max(32, path.length / 12)));
+function computeSamples(path: paper.Path, density: number, minN: number, maxN: number): paper.Point[] {
+	const n = Math.round(Math.min(maxN, Math.max(minN, path.length / density)));
 	const pts: paper.Point[] = [];
+	const len = path.length;
+	if (len <= 0 || n <= 0) return pts;
 	for (let i = 0; i < n; i++) {
-		const pt = path.getPointAt((path.length * i) / n);
+		const pt = path.getPointAt((len * i) / n);
 		if (pt) pts.push(pt);
 	}
 	return pts;
 }
 
 const staticSampleCache = new WeakMap<paper.Path, paper.Point[]>();
+/** Fewer samples — enough to catch penetration without boolean geometry. */
+const overlapSampleCache = new WeakMap<paper.Path, paper.Point[]>();
 
 function getSamples(path: paper.Path): paper.Point[] {
 	let s = staticSampleCache.get(path);
 	if (!s) {
-		s = computeSamples(path);
+		s = computeSamples(path, 12, 24, 64);
 		staticSampleCache.set(path, s);
+	}
+	return s;
+}
+
+function getOverlapSamples(path: paper.Path): paper.Point[] {
+	let s = overlapSampleCache.get(path);
+	if (!s) {
+		s = computeSamples(path, 18, 16, 36);
+		overlapSampleCache.set(path, s);
 	}
 	return s;
 }
@@ -69,6 +82,21 @@ function getSamples(path: paper.Path): paper.Point[] {
 /** Drop cached outline samples after a path's geometry changes (move/reshape). */
 export function invalidateSamples(path: paper.Path) {
 	staticSampleCache.delete(path);
+	overlapSampleCache.delete(path);
+}
+
+/** Translate a path and keep any cached outline samples in sync (no recompute). */
+export function translatePath(path: paper.Path, offset: paper.Point) {
+	if (offset.x === 0 && offset.y === 0) return;
+	path.translate(offset);
+	const snap = staticSampleCache.get(path);
+	if (snap) {
+		for (let i = 0; i < snap.length; i++) snap[i] = snap[i]!.add(offset);
+	}
+	const overlap = overlapSampleCache.get(path);
+	if (overlap) {
+		for (let i = 0; i < overlap.length; i++) overlap[i] = overlap[i]!.add(offset);
+	}
 }
 
 /** Candidate path plus its sample cache, kept in sync through translations. */
@@ -76,11 +104,11 @@ class Candidate {
 	samples: paper.Point[];
 
 	constructor(public path: paper.Path) {
-		this.samples = computeSamples(path);
+		this.samples = computeSamples(path, 12, 24, 64);
 	}
 
 	translate(offset: paper.Point) {
-		this.path.translate(offset);
+		translatePath(this.path, offset);
 		this.samples = this.samples.map((p) => p.add(offset));
 	}
 }
@@ -94,26 +122,81 @@ function overlaps(a: paper.Path, b: paper.Path): boolean {
 	return a.intersects(b) || a.contains(b.interiorPoint) || b.contains(a.interiorPoint);
 }
 
-/** Overlap area (px²) below which two outlines count as merely touching rather
- *  than overlapping. Real rock overlaps are hundreds of px²; this only absorbs
- *  tangency slivers and boolean-op noise. */
-const OVERLAP_AREA_EPS = 4;
+/** Depth (px) past the boundary that counts as real penetration, not tangency. */
+const PENETRATION_EPS = 1.15;
+/** Shallower hits need a few agreeing samples before we call it an overlap. */
+const SHALLOW_PENETRATION_EPS = 0.4;
+const SHALLOW_HIT_COUNT = 2;
 
 /**
- * Authoritative overlap test used as a final guard: two rocks overlap only when
- * their filled regions share more than a negligible area. This catches partial
- * overlaps (crossing outlines) and full containment alike, and — unlike the
- * fast `overlaps` primitive — won't false-positive on rocks that merely touch.
+ * True when samples of `inner` sit clearly inside `outer` (not just on the rim).
+ * Avoids Paper boolean ops so this stays cheap enough for per-frame drag checks.
+ */
+function hasSamplePenetration(inner: paper.Path, outer: paper.Path): boolean {
+	const samples = getOverlapSamples(inner);
+	const ob = outer.bounds;
+	let shallow = 0;
+	for (const pt of samples) {
+		if (pt.x < ob.left || pt.x > ob.right || pt.y < ob.top || pt.y > ob.bottom) continue;
+		if (!outer.contains(pt)) continue;
+		const depth = pt.getDistance(outer.getNearestPoint(pt));
+		if (depth > PENETRATION_EPS) return true;
+		if (depth > SHALLOW_PENETRATION_EPS) {
+			shallow++;
+			if (shallow >= SHALLOW_HIT_COUNT) return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Authoritative overlap test: filled regions penetrate, not merely touch.
+ * Uses curve intersection / containment as a cheap filter, then sample depth
+ * instead of boolean `intersect` (which was too slow for frame-by-frame use).
  */
 export function rocksOverlap(a: paper.Path, b: paper.Path): boolean {
 	if (!a.bounds.intersects(b.bounds)) return false;
-	if (!(a.intersects(b) || a.contains(b.interiorPoint) || b.contains(a.interiorPoint))) {
-		return false;
+	if (a.contains(b.interiorPoint) || b.contains(a.interiorPoint)) return true;
+	if (!a.intersects(b)) return false;
+	return hasSamplePenetration(a, b) || hasSamplePenetration(b, a);
+}
+
+/**
+ * Largest fraction of `delta` a set of paths can travel together without
+ * penetrating `obstacles`. Used by free-drag so rocks nestle flush instead of
+ * rejecting the whole step and stopping short of contact.
+ */
+export function maxFreeDelta(
+	paths: paper.Path[],
+	delta: paper.Point,
+	obstacles: paper.Path[],
+	iters = 10
+): number {
+	if (delta.length < 1e-6) return 0;
+	const pad = Math.abs(delta.x) + Math.abs(delta.y) + 8;
+	const nearby = obstacles.filter((o) =>
+		paths.some((p) => o.bounds.expand(pad).intersects(p.bounds))
+	);
+	if (!nearby.length) return 1;
+
+	const hits = () => paths.some((p) => nearby.some((o) => rocksOverlap(p, o)));
+
+	for (const p of paths) translatePath(p, delta);
+	const freeFull = !hits();
+	for (const p of paths) translatePath(p, delta.multiply(-1));
+	if (freeFull) return 1;
+
+	let lo = 0;
+	let hi = 1;
+	for (let i = 0; i < iters; i++) {
+		const mid = (lo + hi) / 2;
+		const step = delta.multiply(mid);
+		for (const p of paths) translatePath(p, step);
+		if (hits()) hi = mid;
+		else lo = mid;
+		for (const p of paths) translatePath(p, step.multiply(-1));
 	}
-	const inter = a.intersect(b, { insert: false }) as paper.Path;
-	const area = Math.abs(inter.area);
-	inter.remove();
-	return area > OVERLAP_AREA_EPS;
+	return lo;
 }
 
 interface Pair {
@@ -433,11 +516,10 @@ export function resolveSnap(
 		}
 	}
 
-	// Final authoritative guard: `nearby` is captured from the candidate's
-	// starting bounds, so travel during separation/relaxation could leave it
-	// overlapping a rock that fell outside that set. Reject any real overlap
-	// against the full placed set so a resolved position never overlaps.
-	if (placed.some((p) => rocksOverlap(candidatePath, p))) {
+	// Final guard against the rocks whose bounds still intersect after travel
+	// (cheaper than re-testing the whole placed set every snap).
+	const finalNearby = placed.filter((p) => p.bounds.expand(4).intersects(candidatePath.bounds));
+	if (finalNearby.some((p) => rocksOverlap(candidatePath, p))) {
 		return { valid: false, position: candidatePath.position, contacts: [], balance };
 	}
 

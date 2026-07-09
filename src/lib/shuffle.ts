@@ -187,14 +187,14 @@ function buildCenteredCluster(
 
 	// Seed rock: a fresh random piece dropped dead-center to anchor the mass.
 	let first: paper.Path | null = null;
-	for (let i = 0; i < 12 && !first; i++) {
+	for (let i = 0; i < 8 && !first; i++) {
 		const seed = randomPiece(rand, pools);
 		first = tryPlace(sourcePaths, ctx, seed, center, bounds, 'cluster');
 	}
 	if (!first) return;
 
 	for (let i = 1; i < count; i++) {
-		placeTowardCenter(sourcePaths, ctx, pools, center, bounds, rand, 14);
+		placeTowardCenter(sourcePaths, ctx, pools, center, bounds, rand, 10);
 	}
 }
 
@@ -211,12 +211,12 @@ function buildStack(
 	for (let d = 0; d < depth; d++) {
 		const piece = randomPiece(rand, pools);
 		let ok = false;
-		for (let i = 0; i < 48; i++) {
+		for (let i = 0; i < 24; i++) {
 			piece.rotation = rand() * 360;
 			const x = baseX + (rand() - 0.5) * 24;
 			const y = bounds.bottom - 60 - rand() * bounds.height * 0.5;
 			if (tryPlace(sourcePaths, ctx, piece, new paper.Point(x, y), bounds, 'stack')) {
-				added.push(ctx.placed[ctx.placed.length - 1]);
+				added.push(ctx.placed[ctx.placed.length - 1]!);
 				ok = true;
 				break;
 			}

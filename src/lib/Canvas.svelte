@@ -3,7 +3,7 @@
 	import paper from 'paper';
 	import { app, ASPECTS, ROCK_COLORS, ROCK_SIZES } from './state.svelte';
 	import { ROCK_SVGS } from './rocks';
-	import { resolveSnap, getShapeContacts, outlineDistance, rocksOverlap, invalidateSamples, GROUP_EPS } from './snapping';
+	import { resolveSnap, getShapeContacts, outlineDistance, rocksOverlap, invalidateSamples, translatePath, maxFreeDelta, GROUP_EPS } from './snapping';
 	import { generateShuffle } from './shuffle';
 
 	/** Height (in canvas px) of the tallest rock; all rocks share the same scale factor. */
@@ -96,12 +96,30 @@
 	} | null = null;
 	let didDragShape = false;
 	let draggingShape = $state(false);
+	const MARQUEE_THRESHOLD = 4;
+	let marqueeDrag: {
+		start: paper.Point;
+		additive: boolean;
+		baseline: paper.Path[];
+	} | null = null;
+	let didDragMarquee = false;
+	let marqueePath: paper.Path | null = null;
+	let draggingMarquee = $state(false);
 	let selectedPaths = $state.raw<paper.Path[]>([]);
 	const selectedPath = $derived(selectedPaths.at(-1) ?? null);
 	const multiSelected = $derived(selectedPaths.length > 1);
 	let selectionOutlines: paper.Path[] = [];
 	let ghostRaf = 0;
 	let shiftHeld = $state(false);
+
+	/** In-flight slam placement animations (cancelled on clear). */
+	let slamGeneration = 0;
+	const slamRafs = new Set<number>();
+	const slamTimeouts = new Set<ReturnType<typeof setTimeout>>();
+	/** While set, skip rebuilding the placement ghost so it doesn't cover the settle-in. */
+	let ghostSuppressedUntil = 0;
+	const ghostFadeRafs = new Set<number>();
+	let ghostResumeTid: ReturnType<typeof setTimeout> | null = null;
 
 	/** Per-rock shape/size metadata (pathData alone can't recover these). */
 	interface RockMeta {
@@ -140,8 +158,8 @@
 		if (tw < 1 || th < 1) return;
 		const vw = window.innerWidth;
 		const vh = window.innerHeight;
-		// Bottom-left corner of the tip sits on the rock center.
-		let left = tipAnchor.x;
+		// Single: bottom-left on the rock center. Multi: centered above the group.
+		let left = selectedPaths.length > 1 ? tipAnchor.x - tw / 2 : tipAnchor.x;
 		let top = tipAnchor.y - th;
 		left = Math.min(Math.max(left, pad), vw - tw - pad);
 		top = Math.min(Math.max(top, pad), vh - th - pad);
@@ -191,6 +209,9 @@
 	let historyRecording = true;
 	let historyStack: CanvasSnapshot[] = [];
 	let historyIndex = -1;
+	let rotateHistoryGesture = false;
+	let rotateHistoryIdleTimer: ReturnType<typeof setTimeout> | null = null;
+	const ROTATE_HISTORY_IDLE_MS = 400;
 
 	function captureSnapshot(): CanvasSnapshot {
 		return {
@@ -245,6 +266,7 @@
 	}
 
 	function restoreSnapshot(snap: CanvasSnapshot) {
+		cancelSlamAnimations();
 		clearFills();
 		for (const p of placed) p.remove();
 		placed = [];
@@ -309,7 +331,32 @@
 		syncHistoryFlags();
 	}
 
+	function endRotateHistoryGesture() {
+		rotateHistoryGesture = false;
+		if (rotateHistoryIdleTimer) {
+			clearTimeout(rotateHistoryIdleTimer);
+			rotateHistoryIdleTimer = null;
+		}
+	}
+
+	function commitRotateHistory() {
+		if (!historyRecording || !ready) return;
+		const snap = captureSnapshot();
+		if (rotateHistoryGesture && historyIndex >= 0) {
+			historyStack[historyIndex] = snap;
+		} else {
+			historyStack = historyStack.slice(0, historyIndex + 1);
+			historyStack.push(snap);
+			historyIndex++;
+			rotateHistoryGesture = true;
+		}
+		syncHistoryFlags();
+		if (rotateHistoryIdleTimer) clearTimeout(rotateHistoryIdleTimer);
+		rotateHistoryIdleTimer = setTimeout(endRotateHistoryGesture, ROTATE_HISTORY_IDLE_MS);
+	}
+
 	function commitHistory() {
+		endRotateHistoryGesture();
 		if (!historyRecording || !ready) return;
 		const snap = captureSnapshot();
 		historyStack = historyStack.slice(0, historyIndex + 1);
@@ -319,6 +366,7 @@
 	}
 
 	function undoHistory() {
+		endRotateHistoryGesture();
 		if (historyIndex <= 0) return;
 		historyIndex--;
 		historyRecording = false;
@@ -328,6 +376,7 @@
 	}
 
 	function redoHistory() {
+		endRotateHistoryGesture();
 		if (historyIndex >= historyStack.length - 1) return;
 		historyIndex++;
 		historyRecording = false;
@@ -730,16 +779,36 @@
 
 	function updateTipPos(force = false) {
 		if (tipLocked && !force) return;
-		if (!selectedPath || !canvasEl || !placed.includes(selectedPath)) {
+		if (!selectedPaths.length || !canvasEl || !selectedPaths.every((p) => placed.includes(p))) {
 			tipPos = null;
 			tipAnchor = null;
 			return;
 		}
 		const rect = canvasEl.getBoundingClientRect();
-		const c = selectedPath.bounds.center;
+		let cx: number;
+		let cy: number;
+		if (selectedPaths.length === 1) {
+			const c = selectedPaths[0]!.bounds.center;
+			cx = c.x;
+			cy = c.y;
+		} else {
+			let left = Infinity;
+			let top = Infinity;
+			let right = -Infinity;
+			let bottom = -Infinity;
+			for (const p of selectedPaths) {
+				const b = p.bounds;
+				if (b.left < left) left = b.left;
+				if (b.top < top) top = b.top;
+				if (b.right > right) right = b.right;
+				if (b.bottom > bottom) bottom = b.bottom;
+			}
+			cx = (left + right) / 2;
+			cy = (top + bottom) / 2;
+		}
 		tipAnchor = {
-			x: rect.left + c.x,
-			y: rect.top + c.y
+			x: rect.left + cx,
+			y: rect.top + cy
 		};
 		requestAnimationFrame(placeTip);
 	}
@@ -839,14 +908,58 @@
 		updateGhost();
 	}
 
+	function clearMarquee() {
+		if (marqueePath) {
+			marqueePath.remove();
+			marqueePath = null;
+		}
+	}
+
+	function updateMarqueeVisual(start: paper.Point, current: paper.Point) {
+		clearMarquee();
+		const rect = new paper.Rectangle(start, current);
+		marqueePath = new paper.Path.Rectangle(rect);
+		marqueePath.strokeColor = new paper.Color('#101A31');
+		marqueePath.strokeWidth = 1.5;
+		marqueePath.dashArray = [5, 4];
+		const fill = new paper.Color('#101A31');
+		fill.alpha = 0.08;
+		marqueePath.fillColor = fill;
+		marqueePath.opacity = 0.55;
+		paper.project.activeLayer.addChild(marqueePath);
+		marqueePath.bringToFront();
+	}
+
+	function applyMarqueeSelection(
+		rect: paper.Rectangle,
+		additive: boolean,
+		baseline: paper.Path[]
+	) {
+		const hits = placed.filter((p) => p.bounds.intersects(rect));
+		const next = additive
+			? [...baseline, ...hits.filter((p) => !baseline.includes(p))]
+			: hits;
+		selectedPaths = next;
+		if (next.length) {
+			app.selectCursorTool();
+			const primary = next[next.length - 1]!;
+			if (next.length === 1) syncColorFromShape(primary);
+			syncSelectionUi(primary);
+		} else {
+			syncSelectionUi(null);
+		}
+		updateSelectionVisuals();
+		updateGhost();
+	}
+
 	/** Scale factor for a given size index at the current artboard. */
 	function scaleForSize(sizeIndex: number): number {
 		return (ROCK_SIZES[sizeIndex].fraction * Math.sqrt(artboard.w * artboard.h)) / ROCK_HEIGHT;
 	}
 
-	/** Rebuild a placed rock's outline as a different shape/size.
-	 *  Keeps the current center and rotation when possible; otherwise searches
-	 *  nearby for a free spot. If nowhere fits, reverts and shakes the tip. */
+	/** Rebuild a placed rock's outline as a different shape/size in place.
+	 *  Only succeeds if the new outline fits at the current center — no jump.
+	 *  On overlap, reverts and shakes the tip. */
 	function reshapeSelected(nextRock: number, nextSize: number): boolean {
 		if (selectedPaths.length !== 1 || !selectedPath || !placed.includes(selectedPath)) return false;
 		const path = selectedPath;
@@ -876,43 +989,17 @@
 		invalidateSamples(path);
 
 		const others = placed.filter((p) => p !== path);
-		const free = () => !others.some((p) => rocksOverlap(path, p));
-
-		if (!free()) {
-			// Prefer snap settle (pushes out of overlaps), then spiral search.
-			const snap = resolveSnap(path, others, viewBounds(), snapOptions(false));
-			if (!snap.valid || !free()) {
-				path.position = center;
-				invalidateSamples(path);
-				let found = false;
-				for (let ring = 1; ring <= 28 && !found; ring++) {
-					const steps = Math.max(8, ring * 6);
-					const radius = ring * 14;
-					for (let s = 0; s < steps; s++) {
-						const angle = (s / steps) * Math.PI * 2;
-						path.position = center.add(
-							new paper.Point(Math.cos(angle) * radius, Math.sin(angle) * radius)
-						);
-						invalidateSamples(path);
-						if (free()) {
-							found = true;
-							break;
-						}
-					}
-				}
-				if (!found) {
-					path.pathData = beforePathData;
-					path.fillColor = fill;
-					invalidateSamples(path);
-					rockMeta.set(path, beforeMeta);
-					tipLocked = false;
-					if (savedAnchor) tipAnchor = savedAnchor;
-					if (savedTip) tipPos = savedTip;
-					shakeTip();
-					updateSelectionVisuals();
-					return false;
-				}
-			}
+		if (others.some((p) => rocksOverlap(path, p))) {
+			path.pathData = beforePathData;
+			path.fillColor = fill;
+			invalidateSamples(path);
+			rockMeta.set(path, beforeMeta);
+			tipLocked = false;
+			if (savedAnchor) tipAnchor = savedAnchor;
+			if (savedTip) tipPos = savedTip;
+			shakeTip();
+			updateSelectionVisuals();
+			return false;
 		}
 
 		rockMeta.set(path, { rockIndex: nextRock, sizeIndex: nextSize, rotation });
@@ -1083,7 +1170,7 @@
 		}
 	}
 
-	/** Free move: follow the cursor, reject overlaps. Shift: snap like placement (single only). */
+	/** Free move: follow the cursor, nestle flush against collisions. Shift: snap like placement (single only). */
 	function moveShapesTo(
 		paths: paper.Path[],
 		point: paper.Point,
@@ -1095,22 +1182,18 @@
 		if (!primary) return false;
 		const target = point.add(grabOffset);
 		const delta = target.subtract(primary.position);
-		for (const p of paths) {
-			p.translate(delta);
-			invalidateSamples(p);
-		}
+		if (delta.length < 1e-6) return true;
+
 		if (snap && paths.length === 1) {
+			translatePath(primary, delta);
 			return resolveShapeSnap(primary, fallbackPathData[0]!);
 		}
+
 		const group = new Set(paths);
 		const others = placed.filter((p) => !group.has(p));
-		if (paths.some((p) => others.some((o) => rocksOverlap(p, o)))) {
-			for (let i = 0; i < paths.length; i++) {
-				paths[i]!.pathData = fallbackPathData[i]!;
-				invalidateSamples(paths[i]!);
-			}
-			return false;
-		}
+		const t = maxFreeDelta(paths, delta, others);
+		if (t <= 1e-4) return false;
+		for (const p of paths) translatePath(p, delta.multiply(t));
 		return true;
 	}
 
@@ -1150,12 +1233,27 @@
 		return true;
 	}
 
-	/** Rotate all selected rocks around their own centers (all-or-nothing). */
+	/** Rotate selected rocks. Single: around its own center. Multi: around the
+	 *  selection's shared center so the group turns as one rigid body. */
 	function rotateSelectedShapes(degrees: number): boolean {
 		if (!selectedPaths.length) return false;
 		if (selectedPaths.length === 1) {
 			return rotateShapeWithSnap(selectedPaths[0]!, degrees);
 		}
+
+		let left = Infinity;
+		let top = Infinity;
+		let right = -Infinity;
+		let bottom = -Infinity;
+		for (const p of selectedPaths) {
+			const b = p.bounds;
+			if (b.left < left) left = b.left;
+			if (b.top < top) top = b.top;
+			if (b.right > right) right = b.right;
+			if (b.bottom > bottom) bottom = b.bottom;
+		}
+		const pivot = new paper.Point((left + right) / 2, (top + bottom) / 2);
+
 		const ignore = new Set(selectedPaths);
 		const befores = selectedPaths.map((p) => ({
 			path: p,
@@ -1164,7 +1262,7 @@
 			rotation: rockMeta.get(p)?.rotation ?? p.rotation
 		}));
 		for (const p of selectedPaths) {
-			p.rotate(degrees, p.bounds.center);
+			p.rotate(degrees, pivot);
 			invalidateSamples(p);
 		}
 		const others = placed.filter((p) => !ignore.has(p));
@@ -1288,6 +1386,8 @@
 	}
 
 	function updateGhost() {
+		if (performance.now() < ghostSuppressedUntil) return;
+
 		ghost?.remove();
 		for (const m of ghostMarkers) m.remove();
 		balanceLine?.remove();
@@ -1335,7 +1435,160 @@
 		}
 	}
 
+	/** Fade the placement ghost out so the settle-in isn't covered by it. */
+	function dismissGhost() {
+		for (const id of ghostFadeRafs) cancelAnimationFrame(id);
+		ghostFadeRafs.clear();
+		if (ghostResumeTid !== null) {
+			clearTimeout(ghostResumeTid);
+			ghostResumeTid = null;
+		}
+
+		const fading = ghost;
+		const markers = ghostMarkers;
+		const line = balanceLine;
+		ghost = null;
+		ghostMarkers = [];
+		balanceLine = null;
+
+		for (const m of markers) m.remove();
+		line?.remove();
+
+		// Keep the ghost suppressed through the settle so mousemove doesn't rebuild it.
+		ghostSuppressedUntil = performance.now() + 280;
+		ghostResumeTid = setTimeout(() => {
+			ghostResumeTid = null;
+			ghostSuppressedUntil = 0;
+			updateGhost();
+		}, 280);
+
+		if (!fading || !fading.project) return;
+
+		const startOp = fading.opacity;
+		const duration = 120;
+		const t0 = performance.now();
+		let rafId = 0;
+
+		const frame = (now: number) => {
+			ghostFadeRafs.delete(rafId);
+			if (!fading.project) return;
+			const t = Math.min(1, (now - t0) / duration);
+			fading.opacity = startOp * (1 - t);
+			paper.view.update();
+			if (t < 1) {
+				rafId = requestAnimationFrame(frame);
+				ghostFadeRafs.add(rafId);
+				return;
+			}
+			fading.remove();
+			paper.view.update();
+		};
+
+		rafId = requestAnimationFrame(frame);
+		ghostFadeRafs.add(rafId);
+	}
+
+	function cancelSlamAnimations() {
+		slamGeneration++;
+		for (const id of slamRafs) cancelAnimationFrame(id);
+		slamRafs.clear();
+		for (const id of slamTimeouts) clearTimeout(id);
+		slamTimeouts.clear();
+	}
+
+	function easeOutCubic(t: number) {
+		return 1 - Math.pow(1 - t, 3);
+	}
+
+	/** Soft settle-in for a newly placed rock — fade, light drop, no bounce. */
+	function slamRock(
+		path: paper.Path,
+		opts?: { delay?: number; onComplete?: () => void }
+	): Promise<void> {
+		const delay = opts?.delay ?? 0;
+		const gen = slamGeneration;
+
+		// Hide immediately so the rock never flashes at its final pose.
+		path.opacity = 0;
+
+		return new Promise((resolve) => {
+			const done = (completed: boolean) => {
+				if (completed) opts?.onComplete?.();
+				resolve();
+			};
+
+			const run = () => {
+				if (gen !== slamGeneration || !path.project) {
+					done(false);
+					return;
+				}
+
+				const landX = path.position.x;
+				const landY = path.position.y;
+				const drop = Math.min(22, Math.max(14, path.bounds.height * 0.12));
+				const startScale = 0.9;
+				const duration = 260;
+
+				let prevS = 1;
+				const pivot = () => path.bounds.center.clone();
+
+				path.position = new paper.Point(landX, landY - drop);
+				path.scale(startScale, startScale, pivot());
+				prevS = startScale;
+				path.opacity = 0;
+				paper.view.update();
+
+				const t0 = performance.now();
+				let rafId = 0;
+
+				const frame = (now: number) => {
+					slamRafs.delete(rafId);
+					if (gen !== slamGeneration || !path.project) {
+						done(false);
+						return;
+					}
+
+					const t = Math.min(1, (now - t0) / duration);
+					const u = easeOutCubic(t);
+					const s = startScale + (1 - startScale) * u;
+
+					path.scale(s / prevS, s / prevS, pivot());
+					prevS = s;
+					path.position = new paper.Point(landX, landY - drop * (1 - u));
+					path.opacity = u;
+					paper.view.update();
+
+					if (t < 1) {
+						rafId = requestAnimationFrame(frame);
+						slamRafs.add(rafId);
+						return;
+					}
+
+					path.position = new paper.Point(landX, landY);
+					path.opacity = 1;
+					if (prevS !== 1) path.scale(1 / prevS, 1 / prevS, pivot());
+					paper.view.update();
+					done(true);
+				};
+
+				rafId = requestAnimationFrame(frame);
+				slamRafs.add(rafId);
+			};
+
+			if (delay <= 0) {
+				run();
+				return;
+			}
+			const tid = setTimeout(() => {
+				slamTimeouts.delete(tid);
+				run();
+			}, delay);
+			slamTimeouts.add(tid);
+		});
+	}
+
 	function clearPlaced() {
+		cancelSlamAnimations();
 		clearFills();
 		// Pins reference instances that are about to be removed.
 		attach.clear();
@@ -1350,6 +1603,13 @@
 	}
 
 	function resetOverlay() {
+		for (const id of ghostFadeRafs) cancelAnimationFrame(id);
+		ghostFadeRafs.clear();
+		if (ghostResumeTid !== null) {
+			clearTimeout(ghostResumeTid);
+			ghostResumeTid = null;
+		}
+		ghostSuppressedUntil = 0;
 		ghost?.remove();
 		for (const m of ghostMarkers) m.remove();
 		balanceLine?.remove();
@@ -1397,118 +1657,173 @@
 		);
 	}
 
+	/** Strip every interactive overlay so exports never bake in UI chrome. */
+	function clearUiOverlays() {
+		for (const id of ghostFadeRafs) cancelAnimationFrame(id);
+		ghostFadeRafs.clear();
+		if (ghostResumeTid !== null) {
+			clearTimeout(ghostResumeTid);
+			ghostResumeTid = null;
+		}
+		ghostSuppressedUntil = 0;
+		ghost?.remove();
+		for (const m of ghostMarkers) m.remove();
+		for (const m of contactMarkers) m.remove();
+		for (const outline of selectionOutlines) outline.remove();
+		balanceLine?.remove();
+		clearMarquee();
+		clearEditGhost();
+		ghost = null;
+		ghostMarkers = [];
+		contactMarkers = [];
+		selectionOutlines = [];
+		balanceLine = null;
+	}
+
+	function restoreUiOverlays() {
+		updateSelectionVisuals();
+		updateEditGhost();
+		updateGhost();
+	}
+
+	/**
+	 * Exports redraw from placed rocks + fills only — never the live Paper.js
+	 * view — so selection outlines, contact dots, placement ghosts, balance
+	 * guides, marquees, and edit previews cannot appear in the file.
+	 */
+	function withCleanExport(run: () => void) {
+		clearUiOverlays();
+		try {
+			run();
+		} finally {
+			restoreUiOverlays();
+		}
+	}
+
 	function exportSvg(transparent = false) {
-		const w = Math.max(Math.round(artboard.w), 1);
-		const h = Math.max(Math.round(artboard.h), 1);
-		const body: string[] = [];
-		const clips: string[] = [];
-		let clipIdx = 0;
+		withCleanExport(() => {
+			const w = Math.max(Math.round(artboard.w), 1);
+			const h = Math.max(Math.round(artboard.h), 1);
+			const body: string[] = [];
+			const clips: string[] = [];
+			let clipIdx = 0;
 
-		if (!transparent) {
-			body.push(`<rect width="${w}" height="${h}" fill="#FFFFFF"/>`);
-		}
-
-		for (const path of placed) {
-			const fill = fills.get(path);
-			const el = fill ? imageEls.get(fill.imageId) : undefined;
-			if (fill && el) {
-				const id = `clip-${clipIdx++}`;
-				clips.push(`<clipPath id="${id}"><path d="${escapeXml(fill.clip.pathData)}"/></clipPath>`);
-				body.push(`<g clip-path="url(#${id})">${rasterSvgImage(el, fill.raster)}</g>`);
-				continue;
+			if (!transparent) {
+				body.push(`<rect width="${w}" height="${h}" fill="#FFFFFF"/>`);
 			}
-			if (bgFill) continue;
-			const color = path.fillColor as paper.Color | null;
-			if (!color) continue;
-			body.push(`<path d="${escapeXml(path.pathData)}" fill="${color.toCSS(true)}"/>`);
-		}
 
-		const bgEl = app.backgroundImageId ? imageEls.get(app.backgroundImageId) : undefined;
-		if (bgFill && bgEl) {
-			for (const { clip, raster } of bgFill.groups) {
-				const id = `clip-${clipIdx++}`;
-				clips.push(`<clipPath id="${id}"><path d="${escapeXml(clip.pathData)}"/></clipPath>`);
-				body.push(`<g clip-path="url(#${id})">${rasterSvgImage(bgEl, raster)}</g>`);
+			// Content only: solid fills and clipped image fills. No strokes/UI.
+			for (const path of placed) {
+				const fill = fills.get(path);
+				const el = fill ? imageEls.get(fill.imageId) : undefined;
+				if (fill && el) {
+					const id = `clip-${clipIdx++}`;
+					clips.push(
+						`<clipPath id="${id}"><path d="${escapeXml(fill.clip.pathData)}"/></clipPath>`
+					);
+					body.push(`<g clip-path="url(#${id})">${rasterSvgImage(el, fill.raster)}</g>`);
+					continue;
+				}
+				if (bgFill) continue;
+				const color = path.fillColor as paper.Color | null;
+				if (!color) continue;
+				body.push(
+					`<path d="${escapeXml(path.pathData)}" fill="${color.toCSS(true)}"/>`
+				);
 			}
-		}
 
-		const defs = clips.length ? `<defs>${clips.join('')}</defs>` : '';
-		const svg =
-			`<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" ` +
-			`width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">${defs}${body.join('')}</svg>`;
+			const bgEl = app.backgroundImageId ? imageEls.get(app.backgroundImageId) : undefined;
+			if (bgFill && bgEl) {
+				for (const { clip, raster } of bgFill.groups) {
+					const id = `clip-${clipIdx++}`;
+					clips.push(
+						`<clipPath id="${id}"><path d="${escapeXml(clip.pathData)}"/></clipPath>`
+					);
+					body.push(`<g clip-path="url(#${id})">${rasterSvgImage(bgEl, raster)}</g>`);
+				}
+			}
 
-		const link = document.createElement('a');
-		link.href = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
-		link.download = `cairn-${app.aspect.replace(':', 'x')}.svg`;
-		link.click();
-		URL.revokeObjectURL(link.href);
+			const defs = clips.length ? `<defs>${clips.join('')}</defs>` : '';
+			const svg =
+				`<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" ` +
+				`width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">${defs}${body.join('')}</svg>`;
+
+			const link = document.createElement('a');
+			link.href = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
+			link.download = `cairn-${app.aspect.replace(':', 'x')}.svg`;
+			link.click();
+			URL.revokeObjectURL(link.href);
+		});
 	}
 
 	function exportPng(transparent = false) {
 		if (!canvasEl) return;
 
-		const w = Math.max(Math.round(artboard.w), 1);
-		const h = Math.max(Math.round(artboard.h), 1);
-		const MAX_EXPORT_EDGE = 4096;
-		const scale = Math.max(1, Math.floor(MAX_EXPORT_EDGE / Math.max(w, h)));
+		withCleanExport(() => {
+			const w = Math.max(Math.round(artboard.w), 1);
+			const h = Math.max(Math.round(artboard.h), 1);
+			const MAX_EXPORT_EDGE = 4096;
+			const scale = Math.max(1, Math.floor(MAX_EXPORT_EDGE / Math.max(w, h)));
 
-		const output = document.createElement('canvas');
-		output.width = w * scale;
-		output.height = h * scale;
-		const ctx = output.getContext('2d');
-		if (!ctx) return;
+			const output = document.createElement('canvas');
+			output.width = w * scale;
+			output.height = h * scale;
+			const ctx = output.getContext('2d');
+			if (!ctx) return;
 
-		// Leave the canvas empty for a transparent PNG; otherwise paint white.
-		if (!transparent) {
-			ctx.fillStyle = '#FFFFFF';
-			ctx.fillRect(0, 0, output.width, output.height);
-		}
-		// Work in view coordinates; the scale gives a crisp high-res render.
-		ctx.scale(scale, scale);
-
-		// A paper Raster draws its image centered at `position`, sized by its
-		// scaling times the natural pixels — replicate that with drawImage.
-		const drawRaster = (el: HTMLImageElement, r: paper.Raster) => {
-			const dw = el.naturalWidth * r.scaling.x;
-			const dh = el.naturalHeight * r.scaling.y;
-			ctx.drawImage(el, r.position.x - dw / 2, r.position.y - dh / 2, dw, dh);
-		};
-
-		for (const path of placed) {
-			const fill = fills.get(path);
-			const el = fill ? imageEls.get(fill.imageId) : undefined;
-			if (fill && el) {
-				ctx.save();
-				ctx.clip(new Path2D(fill.clip.pathData));
-				drawRaster(el, fill.raster);
-				ctx.restore();
-				continue;
+			// Leave the canvas empty for a transparent PNG; otherwise paint white.
+			if (!transparent) {
+				ctx.fillStyle = '#FFFFFF';
+				ctx.fillRect(0, 0, output.width, output.height);
 			}
-			// Un-pinned rocks are drawn by the unified background group below.
-			if (bgFill) continue;
-			const color = path.fillColor as paper.Color | null;
-			if (!color) continue;
-			ctx.save();
-			ctx.fillStyle = color.toCSS(true);
-			ctx.fill(new Path2D(path.pathData));
-			ctx.restore();
-		}
+			// Work in view coordinates; the scale gives a crisp high-res render.
+			ctx.scale(scale, scale);
 
-		// The unified background image, masked by each un-pinned rock silhouette.
-		const bgEl = app.backgroundImageId ? imageEls.get(app.backgroundImageId) : undefined;
-		if (bgFill && bgEl) {
-			for (const { clip, raster } of bgFill.groups) {
+			// A paper Raster draws its image centered at `position`, sized by its
+			// scaling times the natural pixels — replicate that with drawImage.
+			const drawRaster = (el: HTMLImageElement, r: paper.Raster) => {
+				const dw = el.naturalWidth * r.scaling.x;
+				const dh = el.naturalHeight * r.scaling.y;
+				ctx.drawImage(el, r.position.x - dw / 2, r.position.y - dh / 2, dw, dh);
+			};
+
+			// Content only: solid fills and clipped image fills. No strokes/UI.
+			for (const path of placed) {
+				const fill = fills.get(path);
+				const el = fill ? imageEls.get(fill.imageId) : undefined;
+				if (fill && el) {
+					ctx.save();
+					ctx.clip(new Path2D(fill.clip.pathData));
+					drawRaster(el, fill.raster);
+					ctx.restore();
+					continue;
+				}
+				// Un-pinned rocks are drawn by the unified background group below.
+				if (bgFill) continue;
+				const color = path.fillColor as paper.Color | null;
+				if (!color) continue;
 				ctx.save();
-				ctx.clip(new Path2D(clip.pathData));
-				drawRaster(bgEl, raster);
+				ctx.fillStyle = color.toCSS(true);
+				ctx.fill(new Path2D(path.pathData));
 				ctx.restore();
 			}
-		}
 
-		const link = document.createElement('a');
-		link.href = output.toDataURL('image/png');
-		link.download = `cairn-${app.aspect.replace(':', 'x')}.png`;
-		link.click();
+			// The unified background image, masked by each un-pinned rock silhouette.
+			const bgEl = app.backgroundImageId ? imageEls.get(app.backgroundImageId) : undefined;
+			if (bgFill && bgEl) {
+				for (const { clip, raster } of bgFill.groups) {
+					ctx.save();
+					ctx.clip(new Path2D(clip.pathData));
+					drawRaster(bgEl, raster);
+					ctx.restore();
+				}
+			}
+
+			const link = document.createElement('a');
+			link.href = output.toDataURL('image/png');
+			link.download = `cairn-${app.aspect.replace(':', 'x')}.png`;
+			link.click();
+		});
 	}
 
 	function runShuffle() {
@@ -1527,6 +1842,7 @@
 
 		for (const rock of rocks) {
 			paper.project.activeLayer.addChild(rock);
+			rock.opacity = 0;
 			placed.push(rock);
 			groupParent.push(placed.length - 1);
 			const data = rock.data as {
@@ -1547,6 +1863,12 @@
 		repositionPlaced(bounds.width, bounds.height);
 		app.placedCount = placed.length;
 		commitHistory();
+
+		// Ground-first staggered slam so the stack builds upward.
+		const ordered = [...placed].sort((a, b) => b.bounds.bottom - a.bounds.bottom);
+		for (let i = 0; i < ordered.length; i++) {
+			void slamRock(ordered[i], { delay: i * 40 });
+		}
 	}
 
 	function drawBalanceLine(balance: { x: number; top: number }) {
@@ -1570,8 +1892,13 @@
 			cand.remove();
 			return;
 		}
+
+		// Clear the preview so the settle-in reads clearly.
+		dismissGhost();
+
 		paper.project.activeLayer.addChild(cand);
 		cand.fillColor = new paper.Color(app.nextColor.hex);
+		cand.opacity = 0;
 		placed.push(cand);
 		rockMeta.set(cand, {
 			rockIndex: app.rockIndex,
@@ -1589,12 +1916,15 @@
 			}
 		}
 
-		// A background image should immediately show through the new rock; this
-		// leaves other rocks' fills (and their pan/zoom) untouched.
-		if (app.backgroundImageId) syncFills();
-
 		app.placedCount++;
 		commitHistory();
+
+		// Animate the solid path first so the slam is visible; sync fills after
+		// so a background image doesn't hide the rock mid-drop.
+		const needSync = !!app.backgroundImageId;
+		void slamRock(cand, {
+			onComplete: needSync ? () => syncFills() : undefined
+		});
 	}
 
 	function setupPaper() {
@@ -1616,6 +1946,9 @@
 			const group = paper.project.importSVG(svg, { insert: false });
 			const path = (group.getItem({ class: paper.Path }) as paper.Path).clone({ insert: false });
 			group.remove();
+			// Templates are fill-only; strokes would leak into placement/export.
+			path.strokeColor = null;
+			path.strokeWidth = 0;
 			return path;
 		});
 
@@ -1676,6 +2009,17 @@
 				if (canvasEl) canvasEl.style.cursor = 'grabbing';
 				return;
 			}
+			if (marqueeDrag) {
+				const dist = event.point.getDistance(marqueeDrag.start);
+				if (dist >= MARQUEE_THRESHOLD) {
+					didDragMarquee = true;
+					draggingMarquee = true;
+					updateMarqueeVisual(marqueeDrag.start, event.point);
+					const rect = new paper.Rectangle(marqueeDrag.start, event.point);
+					applyMarqueeSelection(rect, marqueeDrag.additive, marqueeDrag.baseline);
+				}
+				return;
+			}
 			if (canvasEl) {
 				if (app.imageEditId) {
 					const shape = shapeAt(event.point);
@@ -1692,11 +2036,19 @@
 		paper.view.onMouseLeave = () => {
 			if (canvasEl) canvasEl.style.cursor = '';
 			pointer = null;
+			if (marqueeDrag) {
+				// Live selection already applied past the threshold; just drop the rect.
+				clearMarquee();
+				marqueeDrag = null;
+				draggingMarquee = false;
+				didDragMarquee = false;
+			}
 			scheduleGhostUpdate();
 		};
 		paper.view.onMouseDown = (event: paper.MouseEvent) => {
 			didDragImage = false;
 			didDragShape = false;
+			didDragMarquee = false;
 			if (app.imageEditId) {
 				const hit = hitAt(event.point);
 				if (hit) imageDrag = { kind: hit.kind, fill: hit.fill, last: event.point };
@@ -1722,6 +2074,14 @@
 					grabOffset: shape.position.subtract(event.point),
 					lastValidPathData: paths.map((p) => p.pathData)
 				};
+			} else {
+				const additive =
+					!!(event as paper.MouseEvent & { event?: MouseEvent }).event?.shiftKey || shiftHeld;
+				marqueeDrag = {
+					start: event.point.clone(),
+					additive,
+					baseline: [...selectedPaths]
+				};
 			}
 		};
 		paper.view.onMouseUp = () => {
@@ -1731,15 +2091,26 @@
 				updateTipPos();
 				commitHistory();
 			}
+			if (marqueeDrag && didDragMarquee && marqueePath) {
+				applyMarqueeSelection(
+					marqueePath.bounds,
+					marqueeDrag.additive,
+					marqueeDrag.baseline
+				);
+			}
+			clearMarquee();
+			marqueeDrag = null;
+			draggingMarquee = false;
 			imageDrag = null;
 			shapeDrag = null;
 			draggingShape = false;
 			if (canvasEl) canvasEl.style.cursor = '';
 		};
 		paper.view.onClick = (event: paper.MouseEvent) => {
-			if (didDragImage || didDragShape) {
+			if (didDragImage || didDragShape || didDragMarquee) {
 				didDragImage = false;
 				didDragShape = false;
+				didDragMarquee = false;
 				return;
 			}
 			if (app.imageEditId) {
@@ -1768,6 +2139,13 @@
 		return () => {
 			ready = false;
 			canvasEl = null;
+			cancelSlamAnimations();
+			for (const id of ghostFadeRafs) cancelAnimationFrame(id);
+			ghostFadeRafs.clear();
+			if (ghostResumeTid !== null) {
+				clearTimeout(ghostResumeTid);
+				ghostResumeTid = null;
+			}
 			if (ghostRaf) cancelAnimationFrame(ghostRaf);
 			placed = [];
 			groupParent = [];
@@ -1775,6 +2153,10 @@
 			attach = new Map();
 			imageDrag = null;
 			shapeDrag = null;
+			clearMarquee();
+			marqueeDrag = null;
+			draggingMarquee = false;
+			didDragMarquee = false;
 			selectedPaths = [];
 			selectionOutlines = [];
 			bgCenter = null;
@@ -1839,9 +2221,10 @@
 		untrack(() => repositionPlaced(artboard.w, artboard.h));
 	});
 
-	// Entering shape tool clears selection so the placement ghost can appear.
+	// Shape tool and generate settings both clear selection (and its tip).
 	$effect(() => {
-		if (!ready || app.canvasTool !== 'shape') return;
+		if (!ready) return;
+		if (app.canvasTool !== 'shape' && app.toolPanel !== 'lucky') return;
 		untrack(() => {
 			if (selectedPaths.length) selectShape(null);
 		});
@@ -1997,13 +2380,25 @@
 			if (rotateSelectedShapes(event.deltaY * 0.25)) {
 				finalizeShapeTransform();
 				updateTipPos();
-				commitHistory();
+				commitRotateHistory();
 			}
 			return;
 		}
 		if (app.canvasTool !== 'shape') return;
 		event.preventDefault();
 		app.rotateBy(event.deltaY * 0.25);
+	}
+
+	/** Tip sits above the canvas, so wheel there wouldn't reach `onWheel` otherwise. */
+	function onTipWheel(event: WheelEvent) {
+		if (!selectedPaths.length || app.imageEditId) return;
+		event.preventDefault();
+		event.stopPropagation();
+		if (rotateSelectedShapes(event.deltaY * 0.25)) {
+			finalizeShapeTransform();
+			updateTipPos();
+			commitRotateHistory();
+		}
 	}
 
 	function onKeydown(event: KeyboardEvent) {
@@ -2116,7 +2511,7 @@
 	></canvas>
 </div>
 
-{#if tipAnchor && selectedPaths.length && !app.imageEditId && !draggingShape}
+{#if tipAnchor && selectedPaths.length && !app.imageEditId && !draggingShape && !draggingMarquee}
 	<div
 		class={['sel-tip', { shake: tipShake }]}
 		style:left={tipPos ? `${tipPos.left}px` : '-9999px'}
@@ -2127,6 +2522,7 @@
 		aria-label="Selected rock"
 		{@attach clampTip}
 		onpointerdown={(e) => e.stopPropagation()}
+		onwheel={onTipWheel}
 	>
 		{#if !multiSelected}
 			<button

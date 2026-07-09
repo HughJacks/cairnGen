@@ -10,6 +10,34 @@
 	/** Which panel content to render — kept mounted until the fade-out finishes. */
 	let displayPanel = $state<ToolPanel>('none');
 	let subOpen = $state(false);
+	let showClearDialog = $state(false);
+	let clearDialogEl = $state<HTMLDialogElement | null>(null);
+
+	function clearDialog(node: HTMLDialogElement) {
+		clearDialogEl = node;
+		return () => {
+			clearDialogEl = null;
+		};
+	}
+
+	$effect(() => {
+		if (!clearDialogEl) return;
+		if (showClearDialog && !clearDialogEl.open) clearDialogEl.showModal();
+		else if (!showClearDialog && clearDialogEl.open) clearDialogEl.close();
+	});
+
+	function requestClear() {
+		showClearDialog = true;
+	}
+
+	function cancelClear() {
+		showClearDialog = false;
+	}
+
+	function confirmClear() {
+		showClearDialog = false;
+		app.clear();
+	}
 
 	$effect(() => {
 		if (app.toolPanel !== 'none') {
@@ -32,11 +60,13 @@
 	let diceRolling = $state(false);
 
 	function rollLayout() {
-		app.generate();
+		// Restart the spin on the same click without waiting for generate.
 		diceRolling = false;
 		requestAnimationFrame(() => {
 			diceRolling = true;
 		});
+		// Yield so the first animation frame can paint before layout work runs.
+		setTimeout(() => app.generate(), 0);
 	}
 
 	function onDiceAnimEnd(event: AnimationEvent) {
@@ -340,7 +370,22 @@
 				/>
 			</svg>
 		</button>
-		<button class="tool clear" onclick={() => app.clear()} title="Clear the artboard">Clear</button>
+		<button
+			class="tool icon-tool clear"
+			onclick={requestClear}
+			title="Clear the artboard"
+			aria-label="Clear the artboard"
+		>
+			<svg viewBox="0 0 16 16" aria-hidden="true">
+				<path
+					d="M4 4l8 8M12 4l-8 8"
+					stroke="currentColor"
+					stroke-width="1.8"
+					fill="none"
+					stroke-linecap="round"
+				/>
+			</svg>
+		</button>
 		<button
 			class="tool icon-tool solid"
 			onclick={() => app.exportPng()}
@@ -360,6 +405,23 @@
 		</button>
 	</div>
 </aside>
+
+<dialog
+	class="modal"
+	aria-label="Clear artboard"
+	{@attach clearDialog}
+	onclose={cancelClear}
+	onclick={(e) => {
+		if (e.target === e.currentTarget) cancelClear();
+	}}
+>
+	<div class="modal-body">
+		<div class="modal-actions">
+			<button class="modal-btn ghost" onclick={cancelClear}>Cancel</button>
+			<button class="modal-btn danger" onclick={confirmClear}>Clear</button>
+		</div>
+	</div>
+</dialog>
 
 <style>
 	.dock {
@@ -633,7 +695,7 @@
 	}
 
 	.lucky-roll.rolling svg {
-		animation: dice-roll-click 560ms ease-in-out;
+		animation: dice-roll-click 320ms cubic-bezier(0.2, 0.7, 0.2, 1);
 	}
 
 	@keyframes dice-roll-click {
@@ -661,6 +723,68 @@
 
 	.tool.clear:hover {
 		background: color-mix(in srgb, #ed4e3d 8%, transparent);
+	}
+
+	.modal {
+		width: fit-content;
+		max-width: none;
+		box-sizing: border-box;
+		padding: 0;
+		border: none;
+		border-radius: 6px;
+		background: var(--paper);
+		color: var(--ink);
+		box-shadow: 0 12px 48px rgba(16, 26, 49, 0.28);
+	}
+
+	.modal::backdrop {
+		background: rgba(16, 26, 49, 0.42);
+		backdrop-filter: blur(2px);
+	}
+
+	.modal-body {
+		padding: 10px;
+	}
+
+	.modal-actions {
+		display: flex;
+		justify-content: center;
+		gap: 6px;
+	}
+
+	.modal-btn {
+		font: inherit;
+		height: 32px;
+		padding: 0 12px;
+		font-size: 12px;
+		font-weight: 600;
+		border-radius: 4px;
+		cursor: pointer;
+		transition:
+			transform 120ms ease,
+			opacity 120ms ease,
+			background-color 120ms ease;
+	}
+
+	.modal-btn.ghost {
+		color: var(--ink);
+		background: none;
+		border: 1px solid var(--border);
+	}
+
+	.modal-btn.ghost:hover {
+		border-color: var(--ink);
+	}
+
+	.modal-btn.danger {
+		color: var(--paper);
+		background: #ed4e3d;
+		border: 1px solid #ed4e3d;
+	}
+
+	.modal-btn.danger:hover {
+		transform: translateY(-1px);
+		opacity: 0.92;
 	}
 
 	.thumbs {
