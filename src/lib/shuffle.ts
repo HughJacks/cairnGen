@@ -1,6 +1,6 @@
 import paper from 'paper';
 import { ROCK_SIZES, type Mode } from './state.svelte';
-import { resolveSnap, outlineDistance, GROUP_EPS } from './snapping';
+import { maxFreeTranslation, pathOverlapsAny, removeBody, syncBody } from './physics';
 
 export interface ShuffleOptions {
 	mode: Mode;
@@ -11,6 +11,8 @@ export interface ShuffleOptions {
 	/** One size for every rock in the composition. */
 	sizeIndex: number;
 	seed: number;
+	/** Already-placed rocks (e.g. locked) that new rocks must not overlap. */
+	obstacles?: paper.Path[];
 }
 
 export interface PieceSpec {
@@ -21,6 +23,8 @@ export interface PieceSpec {
 }
 
 const ROCK_HEIGHT = 140;
+/** Binary-search steps when nestling / dropping (~0.05px resolution). */
+const SETTLE_ITERS = 10;
 
 function rng(seed: number) {
 	let s = seed;
@@ -64,61 +68,14 @@ function sizeScale(sizeIndex: number, w: number, h: number): number {
 	return (ROCK_SIZES[sizeIndex].fraction * Math.sqrt(w * h)) / ROCK_HEIGHT;
 }
 
-class PlacementContext {
-	parent: number[] = [];
-
-	constructor(public placed: paper.Path[] = []) {}
-
-	find(i: number): number {
-		while (this.parent[i] !== i) {
-			this.parent[i] = this.parent[this.parent[i]];
-			i = this.parent[i];
-		}
-		return i;
-	}
-
-	getComponent = (path: paper.Path): paper.Path[] => {
-		const idx = this.placed.indexOf(path);
-		if (idx === -1) return [path];
-		const root = this.find(idx);
-		return this.placed.filter((_, j) => this.find(j) === root);
-	};
-
-	link(cand: paper.Path) {
-		const idx = this.placed.length - 1;
-		this.parent.push(idx);
-		for (let j = 0; j < idx; j++) {
-			if (!this.placed[j].bounds.expand(GROUP_EPS * 4).intersects(cand.bounds)) continue;
-			if (outlineDistance(cand, this.placed[j]) <= GROUP_EPS) {
-				this.parent[this.find(j)] = this.find(idx);
-			}
-		}
-	}
-}
-
-/** Scale/rotate/position a fresh clone and snap it, WITHOUT committing it to the
- *  placement context. Returns the resolved (still uncommitted) path, or null when
- *  the piece can't rest anywhere valid from this point. */
-function snapCandidate(
+function makeCandidate(
 	sourcePaths: paper.Path[],
-	ctx: PlacementContext,
 	spec: PieceSpec,
-	point: paper.Point,
-	bounds: paper.Rectangle,
-	mode: Mode
-): paper.Path | null {
+	bounds: paper.Rectangle
+): paper.Path {
 	const cand = sourcePaths[spec.rockIndex].clone({ insert: false }) as paper.Path;
 	cand.scale(sizeScale(spec.sizeIndex, bounds.width, bounds.height));
 	cand.rotate(spec.rotation);
-	cand.position = point;
-	const snap = resolveSnap(cand, ctx.placed, bounds, {
-		mode,
-		getComponent: ctx.getComponent
-	});
-	if (!snap.valid) {
-		cand.remove();
-		return null;
-	}
 	cand.fillColor = new paper.Color(spec.colorHex);
 	cand.data = {
 		rockIndex: spec.rockIndex,
@@ -128,56 +85,118 @@ function snapCandidate(
 	return cand;
 }
 
-function commit(ctx: PlacementContext, cand: paper.Path) {
-	ctx.placed.push(cand);
-	ctx.link(cand);
+/** Collision set = newly placed + locked obstacles. */
+function allObstacles(placed: paper.Path[], locked: paper.Path[]) {
+	return locked.length ? placed.concat(locked) : placed;
 }
 
-function tryPlace(
+/** True when `cand` penetrates any already-committed rock (Matter SAT). */
+function blocked(cand: paper.Path, placed: paper.Path[], locked: paper.Path[]): boolean {
+	return pathOverlapsAny(cand, allObstacles(placed, locked));
+}
+
+/**
+ * Pull `cand` toward `target` as far as possible without overlapping obstacles.
+ * Settles flush against neighbors (no intentional clearance).
+ */
+function nestleToward(
+	cand: paper.Path,
+	target: paper.Point,
+	placed: paper.Path[],
+	locked: paper.Path[]
+) {
+	const delta = target.subtract(cand.position);
+	if (delta.length < 1e-3) return;
+	const t = maxFreeTranslation(cand, delta, allObstacles(placed, locked), SETTLE_ITERS);
+	if (t > 1e-4) cand.translate(delta.multiply(t));
+}
+
+/**
+ * Lower `cand` until it rests on the ground or another rock. Stack rocks may
+ * overhang left/right/top; they must not sink below `groundY`.
+ */
+function dropToRest(
+	cand: paper.Path,
+	groundY: number,
+	placed: paper.Path[],
+	locked: paper.Path[]
+): boolean {
+	const lift = groundY - cand.bounds.bottom;
+	const down = new paper.Point(0, lift);
+	const t = maxFreeTranslation(cand, down, allObstacles(placed, locked), SETTLE_ITERS);
+	if (t > 1e-4) cand.translate(down.multiply(t));
+	return !blocked(cand, placed, locked);
+}
+
+function commit(placed: paper.Path[], cand: paper.Path) {
+	placed.push(cand);
+	// Register immediately so later probes reuse the Matter body.
+	syncBody(cand);
+}
+
+/** Rough radius of the current mass from `anchor` (for spawn rings). */
+function clusterRadius(placed: paper.Path[], locked: paper.Path[], anchor: paper.Point): number {
+	let r = 0;
+	for (const p of allObstacles(placed, locked)) {
+		const b = p.bounds;
+		const corners = [
+			new paper.Point(b.left, b.top),
+			new paper.Point(b.right, b.top),
+			new paper.Point(b.left, b.bottom),
+			new paper.Point(b.right, b.bottom)
+		];
+		for (const c of corners) r = Math.max(r, c.getDistance(anchor));
+	}
+	return r;
+}
+
+function tryClusterPlace(
 	sourcePaths: paper.Path[],
-	ctx: PlacementContext,
+	placed: paper.Path[],
+	locked: paper.Path[],
 	spec: PieceSpec,
 	point: paper.Point,
 	bounds: paper.Rectangle,
-	mode: Mode
-): paper.Path | null {
-	const cand = snapCandidate(sourcePaths, ctx, spec, point, bounds, mode);
-	if (!cand) return null;
-	commit(ctx, cand);
-	return cand;
-}
-
-/** Add one rock to a cluster by probing from the canvas center outward and
- *  stopping at the first valid resting spot. This keeps the mass central
- *  without evaluating dozens of fully-snapped candidates per rock. */
-function placeTowardCenter(
-	sourcePaths: paper.Path[],
-	ctx: PlacementContext,
-	pools: Pools,
-	target: paper.Point,
-	bounds: paper.Rectangle,
-	rand: () => number,
-	attempts: number
-): paper.Path | null {
-	const piece = randomPiece(rand, pools);
-	for (let i = 0; i < attempts; i++) {
-		piece.rotation = rand() * 360;
-		const angle = rand() * Math.PI * 2;
-		const radius = i < 4 ? 0 : 16 + (i - 4) * 14 + rand() * 10;
-		const pt = target.add(new paper.Point(Math.cos(angle) * radius, Math.sin(angle) * radius));
-		const cand = snapCandidate(sourcePaths, ctx, piece, pt, bounds, 'cluster');
-		if (!cand) continue;
-		commit(ctx, cand);
-		return cand;
+	anchor: paper.Point
+): boolean {
+	const cand = makeCandidate(sourcePaths, spec, bounds);
+	cand.position = point;
+	if (blocked(cand, placed, locked)) {
+		// Nudge outward from the mass until free, then nestle back in.
+		const away = point.subtract(anchor);
+		const dir =
+			away.length > 1e-3 ? away.normalize() : new paper.Point(1, 0);
+		let freed = false;
+		for (let step = 1; step <= 8; step++) {
+			cand.position = point.add(dir.multiply(step * 14));
+			if (!blocked(cand, placed, locked)) {
+				freed = true;
+				break;
+			}
+		}
+		if (!freed) {
+			cand.remove();
+			return false;
+		}
 	}
-	return null;
+	// Pull toward the mass so rocks kiss instead of floating apart.
+	const nestleTarget =
+		placed.length || locked.length ? anchor : bounds.center;
+	nestleToward(cand, nestleTarget, placed, locked);
+	if (blocked(cand, placed, locked)) {
+		cand.remove();
+		return false;
+	}
+	commit(placed, cand);
+	return true;
 }
 
-/** Build a single cohesive cluster that grows outward from the canvas center,
- *  keeping every rock as close to the middle as the snap rules allow. */
+/** Grow one cohesive mass from the canvas center using Matter overlap only.
+ *  When locked rocks already occupy the center, seed just outside them. */
 function buildCenteredCluster(
 	sourcePaths: paper.Path[],
-	ctx: PlacementContext,
+	placed: paper.Path[],
+	locked: paper.Path[],
 	pools: Pools,
 	count: number,
 	bounds: paper.Rectangle,
@@ -185,45 +204,95 @@ function buildCenteredCluster(
 ): void {
 	const center = bounds.center;
 
-	// Seed rock: a fresh random piece dropped dead-center to anchor the mass.
-	let first: paper.Path | null = null;
-	for (let i = 0; i < 8 && !first; i++) {
-		const seed = randomPiece(rand, pools);
-		first = tryPlace(sourcePaths, ctx, seed, center, bounds, 'cluster');
+	let seeded = false;
+	if (locked.length) {
+		// Center is occupied — ring-seed around the locked mass.
+		for (let i = 0; i < 14 && !seeded; i++) {
+			const seed = randomPiece(rand, pools);
+			const baseR = clusterRadius(placed, locked, center);
+			const angle = rand() * Math.PI * 2;
+			const radius = baseR + 8 + i * 14 + rand() * 10;
+			const pt = center.add(new paper.Point(Math.cos(angle) * radius, Math.sin(angle) * radius));
+			seeded = tryClusterPlace(sourcePaths, placed, locked, seed, pt, bounds, center);
+		}
+	} else {
+		for (let i = 0; i < 6 && !seeded; i++) {
+			const seed = randomPiece(rand, pools);
+			seeded = tryClusterPlace(sourcePaths, placed, locked, seed, center, bounds, center);
+		}
 	}
-	if (!first) return;
+	if (!seeded) return;
 
-	for (let i = 1; i < count; i++) {
-		placeTowardCenter(sourcePaths, ctx, pools, center, bounds, rand, 10);
+	for (let n = 1; n < count; n++) {
+		const piece = randomPiece(rand, pools);
+		const baseR = clusterRadius(placed, locked, center);
+		let ok = false;
+		for (let i = 0; i < 10 && !ok; i++) {
+			piece.rotation = rand() * 360;
+			const angle = rand() * Math.PI * 2;
+			// Spawn just outside the current mass, then step further out.
+			const radius = baseR + 8 + i * 16 + rand() * 12;
+			const pt = center.add(new paper.Point(Math.cos(angle) * radius, Math.sin(angle) * radius));
+			ok = tryClusterPlace(sourcePaths, placed, locked, piece, pt, bounds, center);
+		}
 	}
 }
 
 function buildStack(
 	sourcePaths: paper.Path[],
-	ctx: PlacementContext,
+	placed: paper.Path[],
+	locked: paper.Path[],
 	pools: Pools,
 	depth: number,
 	baseX: number,
 	bounds: paper.Rectangle,
 	rand: () => number
-): paper.Path[] {
-	const added: paper.Path[] = [];
+): void {
+	let stackX = baseX;
 	for (let d = 0; d < depth; d++) {
 		const piece = randomPiece(rand, pools);
 		let ok = false;
-		for (let i = 0; i < 24; i++) {
+		for (let i = 0; i < 8 && !ok; i++) {
 			piece.rotation = rand() * 360;
-			const x = baseX + (rand() - 0.5) * 24;
-			const y = bounds.bottom - 60 - rand() * bounds.height * 0.5;
-			if (tryPlace(sourcePaths, ctx, piece, new paper.Point(x, y), bounds, 'stack')) {
-				added.push(ctx.placed[ctx.placed.length - 1]!);
-				ok = true;
-				break;
+			const cand = makeCandidate(sourcePaths, piece, bounds);
+			const x = stackX + (rand() - 0.5) * 20;
+			// Start above the artboard so drop always has room to search down.
+			cand.position = new paper.Point(x, bounds.top - cand.bounds.height);
+			if (!dropToRest(cand, bounds.bottom, placed, locked)) {
+				cand.remove();
+				continue;
 			}
+			// Keep the column roughly centered on itself.
+			const bias = (stackX - cand.position.x) * 0.35;
+			if (Math.abs(bias) > 0.5) {
+				const slide = new paper.Point(bias, 0);
+				const t = maxFreeTranslation(cand, slide, allObstacles(placed, locked), 6);
+				if (t > 1e-4) cand.translate(slide.multiply(t));
+			}
+			if (blocked(cand, placed, locked)) {
+				cand.remove();
+				continue;
+			}
+			commit(placed, cand);
+			stackX = stackX * 0.7 + cand.position.x * 0.3;
+			ok = true;
 		}
 		if (!ok) break;
 	}
-	return added;
+}
+
+/** Drop rocks whose bounds lie entirely outside the artboard. */
+function cullOffCanvas(placed: paper.Path[], bounds: paper.Rectangle): paper.Path[] {
+	const kept: paper.Path[] = [];
+	for (const path of placed) {
+		if (path.bounds.intersects(bounds)) {
+			kept.push(path);
+			continue;
+		}
+		removeBody(path);
+		path.remove();
+	}
+	return kept;
 }
 
 /** Generate a full composition; paths are not yet on the project layer. */
@@ -234,30 +303,26 @@ export function generateShuffle(
 ): paper.Path[] {
 	const rand = rng(opts.seed);
 	const pools = poolsFrom(opts);
-	const ctx = new PlacementContext();
+	const placed: paper.Path[] = [];
+	const locked = opts.obstacles ?? [];
 
 	if (opts.mode === 'cluster') {
-		// Total rock count scaled to the canvas, grown as one mass hugging the
-		// center rather than several clusters scattered across the artboard.
+		// One central mass; count scales gently with canvas width.
 		const clusters = Math.min(4, Math.max(2, Math.round(bounds.width / 240)));
 		let count = 0;
 		for (let c = 0; c < clusters; c++) count += 3 + Math.floor(rand() * 5);
-		buildCenteredCluster(sourcePaths, ctx, pools, count, bounds, rand);
+		buildCenteredCluster(sourcePaths, placed, locked, pools, count, bounds, rand);
 	} else {
 		const stacks = Math.min(4, Math.max(2, Math.round(bounds.width / 200)));
-		// Keep the stacks packed toward the horizontal center (within the middle
-		// half of the canvas) instead of spread across the full width.
 		const span = bounds.width * 0.5;
 		const gap = stacks > 1 ? span / (stacks - 1) : 0;
 		const startX = bounds.center.x - span / 2;
 
 		for (let s = 0; s < stacks; s++) {
-			// Independent random depth per stack — each is built from its own
-			// freshly drawn rocks rather than a shared template.
 			const depth = 4 + Math.floor(rand() * 4);
-			buildStack(sourcePaths, ctx, pools, depth, startX + s * gap, bounds, rand);
+			buildStack(sourcePaths, placed, locked, pools, depth, startX + s * gap, bounds, rand);
 		}
 	}
 
-	return ctx.placed;
+	return cullOffCanvas(placed, bounds);
 }

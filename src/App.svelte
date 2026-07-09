@@ -27,7 +27,7 @@
 	.stage {
 		height: 100%;
 		min-width: 0;
-		padding: 12px;
+		padding: 20px 12px 12px;
 		/* Reserve space for main + sub dock pills stacked — canvas never shifts when a sub opens. */
 		padding-bottom: max(
 			12px,

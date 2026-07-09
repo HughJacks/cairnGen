@@ -1,4 +1,5 @@
 import paper from 'paper';
+import { pathsOverlap } from './physics';
 
 export type Mode = 'cluster' | 'stack';
 
@@ -8,6 +9,19 @@ export interface BalanceInfo {
 	ok: boolean;
 	/** Top y of the supporting stack (for drawing the balance line). */
 	top: number;
+}
+
+/** A contact between a subject outline and another rock (or the ground). */
+export interface ContactPoint {
+	/** Midpoint between the two outlines (or ground point). Best for markers. */
+	point: paper.Point;
+	/** Point on the subject path outline. */
+	onSubject: paper.Point;
+	/** Point on the other rock (or ground). */
+	onOther: paper.Point;
+	/** The other rock, or null for ground. */
+	other: paper.Path | null;
+	dist: number;
 }
 
 export interface SnapResult {
@@ -58,8 +72,6 @@ function computeSamples(path: paper.Path, density: number, minN: number, maxN: n
 }
 
 const staticSampleCache = new WeakMap<paper.Path, paper.Point[]>();
-/** Fewer samples — enough to catch penetration without boolean geometry. */
-const overlapSampleCache = new WeakMap<paper.Path, paper.Point[]>();
 
 function getSamples(path: paper.Path): paper.Point[] {
 	let s = staticSampleCache.get(path);
@@ -70,19 +82,9 @@ function getSamples(path: paper.Path): paper.Point[] {
 	return s;
 }
 
-function getOverlapSamples(path: paper.Path): paper.Point[] {
-	let s = overlapSampleCache.get(path);
-	if (!s) {
-		s = computeSamples(path, 18, 16, 36);
-		overlapSampleCache.set(path, s);
-	}
-	return s;
-}
-
 /** Drop cached outline samples after a path's geometry changes (move/reshape). */
 export function invalidateSamples(path: paper.Path) {
 	staticSampleCache.delete(path);
-	overlapSampleCache.delete(path);
 }
 
 /** Translate a path and keep any cached outline samples in sync (no recompute). */
@@ -92,10 +94,6 @@ export function translatePath(path: paper.Path, offset: paper.Point) {
 	const snap = staticSampleCache.get(path);
 	if (snap) {
 		for (let i = 0; i < snap.length; i++) snap[i] = snap[i]!.add(offset);
-	}
-	const overlap = overlapSampleCache.get(path);
-	if (overlap) {
-		for (let i = 0; i < overlap.length; i++) overlap[i] = overlap[i]!.add(offset);
 	}
 }
 
@@ -118,85 +116,15 @@ class Candidate {
 // ---------------------------------------------------------------------------
 
 function overlaps(a: paper.Path, b: paper.Path): boolean {
-	if (!a.bounds.intersects(b.bounds)) return false;
-	return a.intersects(b) || a.contains(b.interiorPoint) || b.contains(a.interiorPoint);
-}
-
-/** Depth (px) past the boundary that counts as real penetration, not tangency. */
-const PENETRATION_EPS = 1.15;
-/** Shallower hits need a few agreeing samples before we call it an overlap. */
-const SHALLOW_PENETRATION_EPS = 0.4;
-const SHALLOW_HIT_COUNT = 2;
-
-/**
- * True when samples of `inner` sit clearly inside `outer` (not just on the rim).
- * Avoids Paper boolean ops so this stays cheap enough for per-frame drag checks.
- */
-function hasSamplePenetration(inner: paper.Path, outer: paper.Path): boolean {
-	const samples = getOverlapSamples(inner);
-	const ob = outer.bounds;
-	let shallow = 0;
-	for (const pt of samples) {
-		if (pt.x < ob.left || pt.x > ob.right || pt.y < ob.top || pt.y > ob.bottom) continue;
-		if (!outer.contains(pt)) continue;
-		const depth = pt.getDistance(outer.getNearestPoint(pt));
-		if (depth > PENETRATION_EPS) return true;
-		if (depth > SHALLOW_PENETRATION_EPS) {
-			shallow++;
-			if (shallow >= SHALLOW_HIT_COUNT) return true;
-		}
-	}
-	return false;
+	return rocksOverlap(a, b);
 }
 
 /**
  * Authoritative overlap test: filled regions penetrate, not merely touch.
- * Uses curve intersection / containment as a cheap filter, then sample depth
- * instead of boolean `intersect` (which was too slow for frame-by-frame use).
+ * Backed by Matter.js hard-body SAT collision.
  */
 export function rocksOverlap(a: paper.Path, b: paper.Path): boolean {
-	if (!a.bounds.intersects(b.bounds)) return false;
-	if (a.contains(b.interiorPoint) || b.contains(a.interiorPoint)) return true;
-	if (!a.intersects(b)) return false;
-	return hasSamplePenetration(a, b) || hasSamplePenetration(b, a);
-}
-
-/**
- * Largest fraction of `delta` a set of paths can travel together without
- * penetrating `obstacles`. Used by free-drag so rocks nestle flush instead of
- * rejecting the whole step and stopping short of contact.
- */
-export function maxFreeDelta(
-	paths: paper.Path[],
-	delta: paper.Point,
-	obstacles: paper.Path[],
-	iters = 10
-): number {
-	if (delta.length < 1e-6) return 0;
-	const pad = Math.abs(delta.x) + Math.abs(delta.y) + 8;
-	const nearby = obstacles.filter((o) =>
-		paths.some((p) => o.bounds.expand(pad).intersects(p.bounds))
-	);
-	if (!nearby.length) return 1;
-
-	const hits = () => paths.some((p) => nearby.some((o) => rocksOverlap(p, o)));
-
-	for (const p of paths) translatePath(p, delta);
-	const freeFull = !hits();
-	for (const p of paths) translatePath(p, delta.multiply(-1));
-	if (freeFull) return 1;
-
-	let lo = 0;
-	let hi = 1;
-	for (let i = 0; i < iters; i++) {
-		const mid = (lo + hi) / 2;
-		const step = delta.multiply(mid);
-		for (const p of paths) translatePath(p, step);
-		if (hits()) hi = mid;
-		else lo = mid;
-		for (const p of paths) translatePath(p, step.multiply(-1));
-	}
-	return lo;
+	return pathsOverlap(a, b);
 }
 
 interface Pair {
@@ -314,6 +242,10 @@ interface Contact {
 	rock: paper.Path | null;
 }
 
+function contactMidpoint(onSubject: paper.Point, onOther: paper.Point): paper.Point {
+	return onSubject.add(onOther).multiply(0.5);
+}
+
 function findContact(cand: Candidate, nearby: paper.Path[], bounds: paper.Rectangle, mode: Mode): Contact | null {
 	let best: Pair | null = null;
 	let bestRock: paper.Path | null = null;
@@ -325,14 +257,54 @@ function findContact(cand: Candidate, nearby: paper.Path[], bounds: paper.Rectan
 			bestRock = p;
 		}
 	}
-	if (best && best.dist <= TOUCH_EPS) return { point: best.onTarget, rock: bestRock };
+	if (best && best.dist <= TOUCH_EPS) {
+		return { point: contactMidpoint(best.onCandidate, best.onTarget), rock: bestRock };
+	}
 	if (mode === 'stack' && groundDistance(cand.path, bounds) <= TOUCH_EPS) {
-		return { point: groundContactPoint(cand), rock: null };
+		const onSubject = groundContactPoint(cand);
+		const onOther = new paper.Point(onSubject.x, bounds.bottom);
+		return { point: contactMidpoint(onSubject, onOther), rock: null };
 	}
 	return null;
 }
 
-/** Every point where the candidate currently touches a rock or the ground. */
+/** Every contact where the candidate currently touches a rock or the ground. */
+function allContactDetails(
+	cand: Candidate,
+	nearby: paper.Path[],
+	bounds: paper.Rectangle,
+	mode: Mode,
+	touchEps = TOUCH_EPS
+): ContactPoint[] {
+	const pts: ContactPoint[] = [];
+	for (const p of nearby) {
+		if (!p.bounds.expand(touchEps * 8).intersects(cand.path.bounds)) continue;
+		const pair = nearestPairFrom(cand.samples, cand.path, p);
+		if (pair.dist <= touchEps) {
+			pts.push({
+				point: contactMidpoint(pair.onCandidate, pair.onTarget),
+				onSubject: pair.onCandidate,
+				onOther: pair.onTarget,
+				other: p,
+				dist: pair.dist
+			});
+		}
+	}
+	if (mode === 'stack' && groundDistance(cand.path, bounds) <= touchEps) {
+		const onSubject = groundContactPoint(cand);
+		const onOther = new paper.Point(onSubject.x, bounds.bottom);
+		pts.push({
+			point: contactMidpoint(onSubject, onOther),
+			onSubject,
+			onOther,
+			other: null,
+			dist: Math.abs(groundDistance(cand.path, bounds))
+		});
+	}
+	return pts;
+}
+
+/** Midpoints of every contact (for snap results / markers). */
 function allContacts(
 	cand: Candidate,
 	nearby: paper.Path[],
@@ -340,16 +312,7 @@ function allContacts(
 	mode: Mode,
 	touchEps = TOUCH_EPS
 ): paper.Point[] {
-	const pts: paper.Point[] = [];
-	for (const p of nearby) {
-		if (!p.bounds.expand(touchEps * 8).intersects(cand.path.bounds)) continue;
-		const pair = nearestPairFrom(cand.samples, cand.path, p);
-		if (pair.dist <= touchEps) pts.push(pair.onTarget);
-	}
-	if (mode === 'stack' && groundDistance(cand.path, bounds) <= touchEps) {
-		pts.push(groundContactPoint(cand));
-	}
-	return pts;
+	return allContactDetails(cand, nearby, bounds, mode, touchEps).map((c) => c.point);
 }
 
 function centerOfMass(paths: paper.Path[]): paper.Point {
@@ -365,17 +328,271 @@ function centerOfMass(paths: paper.Path[]): paper.Point {
 	return new paper.Point(sx / mass, sy / mass);
 }
 
-/** Every point where a placed rock touches another rock or the ground. */
+/**
+ * Contacts for a placed (or ghost) path against `others`, using the same
+ * outline threshold as grouping by default.
+ */
+export function collectContacts(
+	path: paper.Path,
+	others: paper.Path[],
+	bounds: paper.Rectangle,
+	mode: Mode,
+	touchEps = GROUP_EPS
+): ContactPoint[] {
+	const cand = new Candidate(path);
+	return allContactDetails(cand, others, bounds, mode, touchEps);
+}
+
+/** Rich contacts for a placed rock (GROUP_EPS, matching stack/cluster grouping). */
+export function getShapeContactDetails(
+	path: paper.Path,
+	placed: paper.Path[],
+	bounds: paper.Rectangle,
+	mode: Mode
+): ContactPoint[] {
+	return collectContacts(
+		path,
+		placed.filter((p) => p !== path),
+		bounds,
+		mode,
+		GROUP_EPS
+	);
+}
+
+/** Midpoints where a placed rock touches another rock or the ground. */
 export function getShapeContacts(
 	path: paper.Path,
 	placed: paper.Path[],
 	bounds: paper.Rectangle,
 	mode: Mode
 ): paper.Point[] {
-	const others = placed.filter((p) => p !== path);
-	const cand = new Candidate(path);
-	// Use GROUP_EPS so selection dots match the same touch threshold as grouping.
-	return allContacts(cand, others, bounds, mode, GROUP_EPS);
+	return getShapeContactDetails(path, placed, bounds, mode).map((c) => c.point);
+}
+
+/** Target outline gap after export settle (px). */
+const SETTLE_GAP = 0.15;
+const SETTLE_OUTER_ITERS = 10;
+const SETTLE_SEARCH_ITERS = 14;
+
+function nearestPairBetween(a: paper.Path, b: paper.Path): Pair {
+	return nearestPairFrom(getSamples(a), a, b);
+}
+
+/** Separation unit for mover away from other (centers when penetrating). */
+function separationDir(mover: paper.Path, other: paper.Path, pair: Pair): paper.Point {
+	// When penetrating, nearest-outline points can sit on the wrong side of the
+	// seam — prefer centers so the push actually separates the fills.
+	if (rocksOverlap(mover, other)) {
+		let dir = mover.position.subtract(other.position);
+		if (dir.length < 1e-6) dir = new paper.Point(0, -1);
+		return dir.normalize();
+	}
+	let dir = pair.onCandidate.subtract(pair.onTarget);
+	if (dir.length < 1e-6) {
+		dir = mover.position.subtract(other.position);
+		if (dir.length < 1e-6) dir = new paper.Point(0, -1);
+	}
+	return dir.normalize();
+}
+
+function freeOfOthers(path: paper.Path, others: paper.Path[]): boolean {
+	return !others.some((o) => rocksOverlap(path, o));
+}
+
+/**
+ * Push `mover` away from `other` along the separation axis until they no
+ * longer penetrate (rocksOverlap). Leaves a tiny clearance.
+ */
+function settlePushApart(mover: paper.Path, other: paper.Path) {
+	if (!rocksOverlap(mover, other)) return;
+	const pair = nearestPairBetween(mover, other);
+	const dir = separationDir(mover, other, pair);
+	const reach =
+		(mover.bounds.size.width +
+			mover.bounds.size.height +
+			other.bounds.size.width +
+			other.bounds.size.height) /
+			2 +
+		8;
+
+	translatePath(mover, dir.multiply(reach));
+	const clearedFar = !rocksOverlap(mover, other);
+	translatePath(mover, dir.multiply(-reach));
+	if (!clearedFar) return;
+
+	let lo = 0;
+	let hi = reach;
+	for (let i = 0; i < SETTLE_SEARCH_ITERS; i++) {
+		const mid = (lo + hi) / 2;
+		translatePath(mover, dir.multiply(mid));
+		if (rocksOverlap(mover, other)) lo = mid;
+		else hi = mid;
+		translatePath(mover, dir.multiply(-mid));
+	}
+	translatePath(mover, dir.multiply(hi));
+}
+
+/**
+ * Pull `mover` toward `other` until outlineDistance ≈ 0, without penetrating
+ * any path in `others` (which should include `other`).
+ */
+function settlePullTogether(mover: paper.Path, other: paper.Path, others: paper.Path[]) {
+	const pair = nearestPairBetween(mover, other);
+	if (pair.dist <= SETTLE_GAP) return;
+	const delta = pair.onTarget.subtract(pair.onCandidate);
+	if (delta.length < 1e-6) return;
+
+	translatePath(mover, delta);
+	const okFull = freeOfOthers(mover, others);
+	translatePath(mover, delta.multiply(-1));
+	if (okFull) {
+		translatePath(mover, delta);
+		return;
+	}
+
+	let lo = 0;
+	let hi = 1;
+	for (let i = 0; i < SETTLE_SEARCH_ITERS; i++) {
+		const mid = (lo + hi) / 2;
+		const step = delta.multiply(mid);
+		translatePath(mover, step);
+		if (freeOfOthers(mover, others)) lo = mid;
+		else hi = mid;
+		translatePath(mover, step.multiply(-1));
+	}
+	if (lo > 0) translatePath(mover, delta.multiply(lo));
+}
+
+function settleGround(path: paper.Path, bounds: paper.Rectangle, others: paper.Path[]) {
+	const gap = groundDistance(path, bounds);
+	if (Math.abs(gap) <= SETTLE_GAP) return;
+
+	if (gap > 0) {
+		// Above ground — pull down.
+		const delta = new paper.Point(0, gap);
+		translatePath(path, delta);
+		const ok = freeOfOthers(path, others);
+		translatePath(path, delta.multiply(-1));
+		if (ok) {
+			translatePath(path, delta);
+			return;
+		}
+		let lo = 0;
+		let hi = 1;
+		for (let i = 0; i < SETTLE_SEARCH_ITERS; i++) {
+			const mid = (lo + hi) / 2;
+			const step = delta.multiply(mid);
+			translatePath(path, step);
+			if (freeOfOthers(path, others)) lo = mid;
+			else hi = mid;
+			translatePath(path, step.multiply(-1));
+		}
+		if (lo > 0) translatePath(path, delta.multiply(lo));
+		return;
+	}
+
+	// Below ground — push up.
+	const delta = new paper.Point(0, gap); // negative y
+	translatePath(path, delta);
+	const ok = freeOfOthers(path, others) && groundDistance(path, bounds) >= -SETTLE_GAP;
+	translatePath(path, delta.multiply(-1));
+	if (ok) {
+		translatePath(path, delta);
+		return;
+	}
+	let lo = 0;
+	let hi = 1;
+	for (let i = 0; i < SETTLE_SEARCH_ITERS; i++) {
+		const mid = (lo + hi) / 2;
+		const step = delta.multiply(mid);
+		translatePath(path, step);
+		if (freeOfOthers(path, others) && groundDistance(path, bounds) >= -SETTLE_GAP) lo = mid;
+		else hi = mid;
+		translatePath(path, step.multiply(-1));
+	}
+	if (lo > 0) translatePath(path, delta.multiply(lo));
+}
+
+/**
+ * Expensive offline fixup for export: push apart any Matter overlaps, then
+ * pull near-touching pairs to a tiny tangent gap. Mutates `paths` in place —
+ * callers should snapshot/restore for live canvas use.
+ */
+export function settleContactsForExport(
+	paths: paper.Path[],
+	bounds: paper.Rectangle,
+	mode: Mode
+): void {
+	if (paths.length === 0) return;
+
+	type PairRef = { a: paper.Path; b: paper.Path; bottom: number };
+	const pairs: PairRef[] = [];
+	for (let i = 0; i < paths.length; i++) {
+		for (let j = i + 1; j < paths.length; j++) {
+			const a = paths[i]!;
+			const b = paths[j]!;
+			if (!a.bounds.expand(GROUP_EPS * 4).intersects(b.bounds)) continue;
+			if (outlineDistance(a, b) <= GROUP_EPS || rocksOverlap(a, b)) {
+				pairs.push({ a, b, bottom: Math.max(a.bounds.bottom, b.bounds.bottom) });
+			}
+		}
+	}
+	// Bottom-to-top so lower supports settle before upper rocks.
+	pairs.sort((p, q) => q.bottom - p.bottom);
+
+	const groundPaths =
+		mode === 'stack'
+			? paths
+					.filter((p) => Math.abs(groundDistance(p, bounds)) <= GROUP_EPS)
+					.sort((a, b) => b.bounds.bottom - a.bounds.bottom)
+			: [];
+
+	for (let iter = 0; iter < SETTLE_OUTER_ITERS; iter++) {
+		let moved = false;
+		const before = paths.map((p) => p.position.clone());
+
+		for (const { a, b } of pairs) {
+			// Prefer moving the higher rock so stacks settle onto supports.
+			const mover = a.bounds.bottom < b.bounds.bottom ? a : b;
+			const other = mover === a ? b : a;
+			const others = paths.filter((p) => p !== mover);
+
+			if (rocksOverlap(mover, other)) {
+				settlePushApart(mover, other);
+			}
+			settlePullTogether(mover, other, others);
+		}
+
+		for (const p of groundPaths) {
+			settleGround(
+				p,
+				bounds,
+				paths.filter((o) => o !== p)
+			);
+		}
+
+		for (let i = 0; i < paths.length; i++) {
+			if (paths[i]!.position.getDistance(before[i]!) > 1e-4) {
+				moved = true;
+				break;
+			}
+		}
+		if (!moved) break;
+	}
+
+	// Final pass: only separate remaining overlaps (pull-together can leave a
+	// hair of penetration after Matter SAT vs outline-distance disagree).
+	for (let iter = 0; iter < SETTLE_OUTER_ITERS; iter++) {
+		let cleared = true;
+		for (const { a, b } of pairs) {
+			if (!rocksOverlap(a, b)) continue;
+			cleared = false;
+			const mover = a.bounds.bottom < b.bounds.bottom ? a : b;
+			const other = mover === a ? b : a;
+			settlePushApart(mover, other);
+		}
+		if (cleared) break;
+	}
 }
 
 // ---------------------------------------------------------------------------

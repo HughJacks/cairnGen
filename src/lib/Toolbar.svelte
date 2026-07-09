@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { app, ROCK_COLORS, ROCK_SIZES, type ToolPanel } from './state.svelte';
+	import { app, rockColorIndex, ROCK_SIZES, type ToolPanel } from './state.svelte';
 	import { ROCK_SVGS } from './rocks';
 
 	const ROCK_IMAGE_URLS = ROCK_SVGS.map(
@@ -58,16 +58,11 @@
 	}
 
 	let diceSvg: SVGSVGElement | undefined = $state();
-	/** Bumps on each click so a superseded spin does not trigger generate. */
-	let rollToken = 0;
 
 	function rollLayout() {
-		const token = ++rollToken;
-		// Web Animations API restarts on every click. Defer generate until the
-		// spin finishes — runShuffle is sync and would otherwise block paints
-		// for most of the 320ms, so the spin never shows.
+		// Spin and fill on the same click — no wait for the animation to finish.
 		diceSvg?.getAnimations().forEach((a) => a.cancel());
-		const anim = diceSvg?.animate(
+		diceSvg?.animate(
 			[
 				{ transform: 'rotate(0deg) scale(1)' },
 				{ transform: 'rotate(180deg) scale(1.25)' },
@@ -75,14 +70,7 @@
 			],
 			{ duration: 320, easing: 'cubic-bezier(0.2, 0.7, 0.2, 1)' }
 		);
-		void (anim?.finished ?? Promise.resolve())
-			.then(() => {
-				if (token !== rollToken) return;
-				app.generate();
-			})
-			.catch(() => {
-				/* cancelled by a newer click */
-			});
+		app.generate();
 	}
 
 	function readAsDataURL(file: File): Promise<string> {
@@ -131,7 +119,8 @@
 					{ROCK_SIZES[app.sizeIndex].label}
 				</button>
 				<div class="cluster colors">
-					{#each ROCK_COLORS as color, i (color.hex)}
+					{#each app.availableRockColors as color (color.hex)}
+						{@const i = rockColorIndex(color.hex)}
 						<button
 							class={['dot', { on: app.colorIndex === i }]}
 							style:background={color.hex}
@@ -189,7 +178,8 @@
 					{/each}
 				</div>
 				<div class="cluster colors">
-					{#each ROCK_COLORS as color, i (color.hex)}
+					{#each app.availableRockColors as color (color.hex)}
+						{@const i = rockColorIndex(color.hex)}
 						<button
 							class={['dot', { on: app.colorEnabled[i] }]}
 							style:background={color.hex}

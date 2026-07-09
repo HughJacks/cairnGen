@@ -1,0 +1,746 @@
+import Matter from 'matter-js';
+import decomp from 'poly-decomp';
+import paper from 'paper';
+
+const { Engine, World, Bodies, Body, Common, Collision, Vertices } = Matter;
+
+Common.setDecomp(decomp);
+
+const BODY_OPTS: Matter.IChamferableBodyDefinition = {
+	isStatic: true,
+	restitution: 0,
+	friction: 0.9,
+	frictionStatic: 1,
+	frictionAir: 0.08,
+	slop: 0.05
+};
+
+const SAMPLE_COUNT = 64;
+const MAX_FRAME_TRAVEL = 64;
+const SEARCH_ITERS = 12;
+/** Tangential slide after a blocked push — less than full cursor follow. */
+const SLIDE_GAIN = 0.72;
+/** How far past the nestle point to probe for a contact normal. */
+const NORMAL_PROBE = 2.5;
+/** Outline sample must sit at least this far inside another fill to count as
+ *  overlap — keeps flush edge contact free while catching real bites. */
+const PAPER_PENETRATE = 1.25;
+
+interface BodyLink {
+	body: Matter.Body;
+	lastX: number;
+	lastY: number;
+}
+
+let engine: Matter.Engine | null = null;
+const links = new Map<paper.Path, BodyLink>();
+let warnedHull = false;
+
+/** Called after Paper geometry is translated by physics so snap sample caches stay valid. */
+let onPathTranslated: ((path: paper.Path) => void) | null = null;
+
+export function setPathTranslateHook(fn: ((path: paper.Path) => void) | null) {
+	onPathTranslated = fn;
+}
+
+function sampleOutline(path: paper.Path, count = SAMPLE_COUNT): Matter.Vector[] {
+	const len = path.length;
+	if (len <= 0) return [];
+	const n = Math.max(16, Math.min(count, Math.round(len / 4)));
+	const pts: Matter.Vector[] = [];
+	for (let i = 0; i < n; i++) {
+		const pt = path.getPointAt((len * i) / n);
+		if (pt) pts.push({ x: pt.x, y: pt.y });
+	}
+	return pts;
+}
+
+function buildBodyFromPath(path: paper.Path, isStatic: boolean): Matter.Body | null {
+	const verts = sampleOutline(path);
+	if (verts.length < 3) return null;
+
+	const centre = Vertices.centre(verts);
+	let body: Matter.Body | undefined;
+	try {
+		body = Bodies.fromVertices(centre.x, centre.y, [verts], { ...BODY_OPTS, isStatic }, true);
+	} catch {
+		body = undefined;
+	}
+
+	if (!body || body.parts.length === 0) {
+		if (!warnedHull) {
+			console.warn('[physics] fromVertices failed; using convex hull fallback');
+			warnedHull = true;
+		}
+		const hull = Vertices.hull(verts as Matter.Vertex[]);
+		if (hull.length < 3) return null;
+		const hc = Vertices.centre(hull);
+		body = Bodies.fromVertices(hc.x, hc.y, [hull], { ...BODY_OPTS, isStatic }, true);
+	}
+
+	if (!body) return null;
+	Body.setAngle(body, 0);
+	Body.setVelocity(body, { x: 0, y: 0 });
+	Body.setAngularVelocity(body, 0);
+	return body;
+}
+
+function applyBodyToPath(path: paper.Path, link: BodyLink) {
+	const dx = link.body.position.x - link.lastX;
+	const dy = link.body.position.y - link.lastY;
+	if (Math.abs(dx) > 1e-8 || Math.abs(dy) > 1e-8) {
+		path.translate(new paper.Point(dx, dy));
+		onPathTranslated?.(path);
+	}
+	link.lastX = link.body.position.x;
+	link.lastY = link.body.position.y;
+}
+
+/** Create the Matter engine (no renderer, no gravity). */
+export function createWorld() {
+	destroyWorld();
+	engine = Engine.create({ gravity: { x: 0, y: 0, scale: 0 } });
+	engine.enableSleeping = false;
+}
+
+/** Tear down the engine and all body links. */
+export function destroyWorld() {
+	if (engine) {
+		World.clear(engine.world, false);
+		Engine.clear(engine);
+	}
+	engine = null;
+	links.clear();
+}
+
+/** Register or rebuild a static body from the current Paper path outline. */
+export function syncBody(path: paper.Path) {
+	if (!engine) return;
+	removeBody(path);
+	const body = buildBodyFromPath(path, true);
+	if (!body) return;
+	World.add(engine.world, body);
+	links.set(path, { body, lastX: body.position.x, lastY: body.position.y });
+}
+
+/** Remove a path's body from the world. */
+export function removeBody(path: paper.Path) {
+	const link = links.get(path);
+	if (!link || !engine) {
+		links.delete(path);
+		return;
+	}
+	World.remove(engine.world, link.body);
+	links.delete(path);
+}
+
+/** Drop every body (paths themselves are left alone). */
+export function clearBodies() {
+	if (!engine) {
+		links.clear();
+		return;
+	}
+	for (const link of links.values()) {
+		World.remove(engine.world, link.body);
+	}
+	links.clear();
+}
+
+/**
+ * After Paper mutates geometry (reshape / pathData restore / rotate), rebuild
+ * the Matter body so the outline matches.
+ */
+export function rebuildFromPath(path: paper.Path) {
+	const wasStatic = links.get(path)?.body.isStatic ?? true;
+	syncBody(path);
+	const link = links.get(path);
+	if (link && !wasStatic) {
+		Body.setStatic(link.body, false);
+		Body.setInertia(link.body, Infinity);
+	}
+}
+
+/** Move the Matter body by the same delta just applied to the Paper path. */
+export function translateBody(path: paper.Path, dx: number, dy: number) {
+	const link = links.get(path);
+	if (!link || (dx === 0 && dy === 0)) return;
+	Body.setPosition(link.body, {
+		x: link.body.position.x + dx,
+		y: link.body.position.y + dy
+	});
+	link.lastX = link.body.position.x;
+	link.lastY = link.body.position.y;
+}
+
+/**
+ * Sample current Paper geometry. Registered bodies can lag behind Paper during
+ * rotate/reshape probes, so pairwise overlap always rebuilds from the path.
+ */
+function bodyForOverlap(path: paper.Path): Matter.Body | null {
+	return buildBodyFromPath(path, true);
+}
+
+/** Registered body when present and in sync; otherwise sample Paper. */
+function bodyForObstacle(path: paper.Path): Matter.Body | null {
+	return links.get(path)?.body ?? buildBodyFromPath(path, true);
+}
+
+function bodiesCollide(a: Matter.Body, b: Matter.Body): boolean {
+	return !!Collision.collides(a, b)?.collided;
+}
+
+/** True when a sample of `subject`'s outline sits clearly inside `other`'s fill. */
+function outlinePenetrates(subject: paper.Path, other: paper.Path): boolean {
+	const len = subject.length;
+	if (len <= 0) return false;
+	const n = Math.max(12, Math.min(48, Math.round(len / 10)));
+	for (let i = 0; i < n; i++) {
+		const pt = subject.getPointAt((len * i) / n);
+		if (!pt || !other.contains(pt)) continue;
+		if (other.getNearestPoint(pt).getDistance(pt) > PAPER_PENETRATE) return true;
+	}
+	return false;
+}
+
+/** Paper fill-penetration check. Ignores mere outline kissing. */
+function paperPathsOverlap(a: paper.Path, b: paper.Path): boolean {
+	if (!a.bounds.intersects(b.bounds)) return false;
+	if (a.contains(b.interiorPoint) || b.contains(a.interiorPoint)) return true;
+	return outlinePenetrates(a, b) || outlinePenetrates(b, a);
+}
+
+/** True when two path fills penetrate (Matter SAT). Paper is a safety net for
+ *  chord-approximation misses — not used to invent clearance gaps. */
+export function pathsOverlap(a: paper.Path, b: paper.Path): boolean {
+	if (!a.bounds.intersects(b.bounds)) return false;
+	const ba = bodyForOverlap(a);
+	const bb = bodyForOverlap(b);
+	if (!ba || !bb) return paperPathsOverlap(a, b);
+	if (bodiesCollide(ba, bb)) return true;
+	return paperPathsOverlap(a, b);
+}
+
+/**
+ * Overlap test that builds the candidate body once and reuses registered
+ * obstacle bodies. Paper fill check only rejects real penetration.
+ */
+export function pathOverlapsAny(path: paper.Path, others: paper.Path[]): boolean {
+	if (others.length === 0) return false;
+	const cand = bodyForOverlap(path);
+	if (!cand) return others.some((o) => paperPathsOverlap(path, o));
+
+	const cb = path.bounds;
+	for (const o of others) {
+		if (o === path || !cb.intersects(o.bounds)) continue;
+		const ob = bodyForObstacle(o);
+		if (!ob) {
+			if (paperPathsOverlap(path, o)) return true;
+			continue;
+		}
+		if (bodiesCollide(cand, ob) || paperPathsOverlap(path, o)) return true;
+	}
+	return false;
+}
+
+/**
+ * Build the candidate body once, then binary-search the largest free fraction
+ * of `delta` against Matter bodies (flush contact). A final Paper check only
+ * backs off when the true fill would visibly penetrate.
+ */
+export function maxFreeTranslation(
+	path: paper.Path,
+	delta: paper.Point,
+	obstacles: paper.Path[],
+	iters = 10
+): number {
+	if (obstacles.length === 0 || delta.length < 1e-8) return 1;
+
+	const cand = buildBodyFromPath(path, true);
+	if (!cand) {
+		path.translate(delta);
+		const free = !pathOverlapsAny(path, obstacles);
+		path.translate(delta.multiply(-1));
+		if (free) return 1;
+		let lo = 0;
+		let hi = 1;
+		for (let i = 0; i < iters; i++) {
+			const mid = (lo + hi) / 2;
+			path.translate(delta.multiply(mid));
+			if (pathOverlapsAny(path, obstacles)) hi = mid;
+			else lo = mid;
+			path.translate(delta.multiply(-mid));
+		}
+		return lo;
+	}
+
+	const ox = cand.position.x;
+	const oy = cand.position.y;
+	const obsBodies: Matter.Body[] = [];
+	for (const o of obstacles) {
+		const b = bodyForObstacle(o);
+		if (b) obsBodies.push(b);
+	}
+
+	const hitsMatter = (fx: number, fy: number) => {
+		Body.setPosition(cand, { x: ox + fx, y: oy + fy });
+		for (const o of obsBodies) {
+			if (bodiesCollide(cand, o)) return true;
+		}
+		return false;
+	};
+
+	let lo = 0;
+	let hi = 1;
+	if (!hitsMatter(delta.x, delta.y)) {
+		Body.setPosition(cand, { x: ox, y: oy });
+		lo = 1;
+	} else {
+		Body.setPosition(cand, { x: ox, y: oy });
+		for (let i = 0; i < iters; i++) {
+			const mid = (lo + hi) / 2;
+			if (hitsMatter(delta.x * mid, delta.y * mid)) hi = mid;
+			else lo = mid;
+		}
+		Body.setPosition(cand, { x: ox, y: oy });
+	}
+
+	// Matter bodies can sit slightly inside curved Paper fills (chord error).
+	// Only then ease back — never invent a standing gap.
+	if (lo > 1e-5) {
+		path.translate(delta.multiply(lo));
+		const bites = obstacles.some((o) => paperPathsOverlap(path, o));
+		path.translate(delta.multiply(-lo));
+		if (bites) {
+			let plo = 0;
+			let phi = lo;
+			for (let i = 0; i < 8; i++) {
+				const mid = (plo + phi) / 2;
+				path.translate(delta.multiply(mid));
+				const hit = obstacles.some((o) => paperPathsOverlap(path, o));
+				path.translate(delta.multiply(-mid));
+				if (hit) phi = mid;
+				else plo = mid;
+			}
+			lo = plo;
+		}
+	}
+	return lo;
+}
+
+export function anyOverlap(paths: paper.Path[], obstacles: paper.Path[]): boolean {
+	return paths.some((p) => pathOverlapsAny(p, obstacles));
+}
+
+const ROTATE_ANGLE_ITERS = 10;
+const MIN_ROTATE_DEG = 0.15;
+const CONTACT_PIVOT_PAD = 8;
+
+function selectionCenter(paths: paper.Path[]): paper.Point {
+	let left = Infinity;
+	let top = Infinity;
+	let right = -Infinity;
+	let bottom = -Infinity;
+	for (const p of paths) {
+		const b = p.bounds;
+		if (b.left < left) left = b.left;
+		if (b.top < top) top = b.top;
+		if (b.right > right) right = b.right;
+		if (b.bottom > bottom) bottom = b.bottom;
+	}
+	return new paper.Point((left + right) / 2, (top + bottom) / 2);
+}
+
+function restorePaths(
+	befores: { path: paper.Path; pathData: string }[]
+) {
+	for (const b of befores) {
+		b.path.pathData = b.pathData;
+	}
+}
+
+function applyRotateAbout(paths: paper.Path[], degrees: number, pivot: paper.Point) {
+	for (const p of paths) p.rotate(degrees, pivot);
+}
+
+/** Candidate pivots: center, contact points with nearby rocks, outline offsets. */
+function gatherRotatePivots(paths: paper.Path[], obstacles: paper.Path[]): paper.Point[] {
+	const pivots: paper.Point[] = [];
+	const seen = new Set<string>();
+	const add = (pt: paper.Point) => {
+		const key = `${pt.x.toFixed(1)},${pt.y.toFixed(1)}`;
+		if (seen.has(key)) return;
+		seen.add(key);
+		pivots.push(pt);
+	};
+
+	const center = paths.length === 1 ? paths[0]!.bounds.center : selectionCenter(paths);
+	add(center.clone());
+
+	for (const path of paths) {
+		const b = path.bounds;
+		const rx = b.width * 0.45;
+		const ry = b.height * 0.45;
+		for (const [ox, oy] of [
+			[1, 0],
+			[-1, 0],
+			[0, 1],
+			[0, -1],
+			[0.7, 0.7],
+			[-0.7, 0.7],
+			[0.7, -0.7],
+			[-0.7, -0.7]
+		] as const) {
+			add(center.add(new paper.Point(ox * rx, oy * ry)));
+		}
+
+		// Prefer pivots on the subject near contacts with obstacles.
+		for (const other of obstacles) {
+			if (!path.bounds.expand(CONTACT_PIVOT_PAD * 4).intersects(other.bounds)) continue;
+			const onSubject = path.getNearestPoint(other.bounds.center);
+			const onOther = other.getNearestPoint(onSubject);
+			const dist = onSubject.getDistance(onOther);
+			if (dist > CONTACT_PIVOT_PAD * 3) continue;
+			add(onSubject);
+			add(onOther);
+			// Slightly outside the contact so the rock can roll around the blocker.
+			const away = onSubject.subtract(onOther);
+			if (away.length > 1e-4) {
+				add(onOther.add(away.normalize().multiply(-2)));
+				add(onSubject.add(away.normalize().multiply(2)));
+			}
+		}
+	}
+
+	return pivots;
+}
+
+/**
+ * Largest |fraction| of `degrees` the group can rotate about `pivot` without
+ * overlapping obstacles. Restores geometry afterward.
+ */
+function maxFreeRotateFrac(
+	paths: paper.Path[],
+	obstacles: paper.Path[],
+	degrees: number,
+	pivot: paper.Point,
+	befores: { path: paper.Path; pathData: string }[]
+): number {
+	applyRotateAbout(paths, degrees, pivot);
+	const freeFull = !anyOverlap(paths, obstacles);
+	restorePaths(befores);
+	if (freeFull) return 1;
+
+	let lo = 0;
+	let hi = 1;
+	for (let i = 0; i < ROTATE_ANGLE_ITERS; i++) {
+		const mid = (lo + hi) / 2;
+		applyRotateAbout(paths, degrees * mid, pivot);
+		if (anyOverlap(paths, obstacles)) hi = mid;
+		else lo = mid;
+		restorePaths(befores);
+	}
+	return lo;
+}
+
+/**
+ * Rotate paths without ever leaving them overlapping obstacles.
+ * Tries the natural pivot first (own center / group center), then contact and
+ * off-center pivots, taking the largest free angle that still moves.
+ * Returns the applied degrees (0 if nothing free).
+ */
+export function rotateKinematic(
+	paths: paper.Path[],
+	degrees: number,
+	obstacles: paper.Path[],
+	preferredPivot?: paper.Point
+): number {
+	if (paths.length === 0 || Math.abs(degrees) < MIN_ROTATE_DEG) return 0;
+
+	const befores = paths.map((p) => ({ path: p, pathData: p.pathData }));
+	const pivots = gatherRotatePivots(paths, obstacles);
+	if (preferredPivot) {
+		pivots.unshift(preferredPivot.clone());
+	}
+
+	let bestFrac = 0;
+	let bestPivot = pivots[0] ?? selectionCenter(paths);
+
+	for (const pivot of pivots) {
+		const frac = maxFreeRotateFrac(paths, obstacles, degrees, pivot, befores);
+		if (frac > bestFrac + 1e-4) {
+			bestFrac = frac;
+			bestPivot = pivot;
+			if (bestFrac >= 0.999) break;
+		}
+	}
+
+	const applied = degrees * bestFrac;
+	if (Math.abs(applied) < MIN_ROTATE_DEG) {
+		restorePaths(befores);
+		return 0;
+	}
+
+	applyRotateAbout(paths, applied, bestPivot);
+	if (anyOverlap(paths, obstacles)) {
+		// Safety: never commit an overlapping pose.
+		restorePaths(befores);
+		return 0;
+	}
+
+	for (const p of paths) {
+		onPathTranslated?.(p);
+		rebuildFromPath(p);
+	}
+	return applied;
+}
+
+/** Unlock selected bodies for kinematic dragging. */
+export function beginDrag(paths: paper.Path[]) {
+	for (const p of paths) {
+		let link = links.get(p);
+		if (!link) {
+			syncBody(p);
+			link = links.get(p);
+		}
+		if (!link) continue;
+		// Stay static — we move bodies by setPosition and test with Collision.
+		// Non-static + Engine.update tunnels through other static rocks.
+		Body.setStatic(link.body, true);
+		Body.setVelocity(link.body, { x: 0, y: 0 });
+		Body.setAngularVelocity(link.body, 0);
+		link.lastX = link.body.position.x;
+		link.lastY = link.body.position.y;
+	}
+}
+
+/** Lock bodies again after drag ends (already static; sync Paper once). */
+export function endDrag(paths: paper.Path[]) {
+	for (const p of paths) {
+		const link = links.get(p);
+		if (!link) continue;
+		Body.setVelocity(link.body, { x: 0, y: 0 });
+		Body.setAngularVelocity(link.body, 0);
+		applyBodyToPath(p, link);
+		Body.setStatic(link.body, true);
+	}
+}
+
+type Mover = { path: paper.Path; link: BodyLink; x: number; y: number };
+
+function moversHitObstacles(movers: Mover[], obstacles: Matter.Body[]): boolean {
+	for (const m of movers) {
+		for (const o of obstacles) {
+			if (bodiesCollide(m.link.body, o)) return true;
+		}
+	}
+	return false;
+}
+
+function placeMovers(movers: Mover[], ox: number, oy: number) {
+	for (const m of movers) {
+		Body.setPosition(m.link.body, { x: m.x + ox, y: m.y + oy });
+	}
+}
+
+/** Largest fraction of (dx,dy) the group can travel without penetrating obstacles. */
+function maxFreeFrac(movers: Mover[], obstacles: Matter.Body[], dx: number, dy: number): number {
+	if (Math.abs(dx) < 1e-8 && Math.abs(dy) < 1e-8) return 0;
+
+	placeMovers(movers, dx, dy);
+	const freeFull = !moversHitObstacles(movers, obstacles);
+	placeMovers(movers, 0, 0);
+	if (freeFull) return 1;
+
+	let lo = 0;
+	let hi = 1;
+	for (let i = 0; i < SEARCH_ITERS; i++) {
+		const mid = (lo + hi) / 2;
+		placeMovers(movers, dx * mid, dy * mid);
+		if (moversHitObstacles(movers, obstacles)) hi = mid;
+		else lo = mid;
+	}
+	placeMovers(movers, 0, 0);
+	return lo;
+}
+
+/**
+ * Probe slightly into the blocked push to read a Matter contact normal, then
+ * return a unit tangent aligned with the remaining drag (for edge sliding).
+ */
+function slideTangentFromContact(
+	movers: Mover[],
+	obstacles: Matter.Body[],
+	baseX: number,
+	baseY: number,
+	remainX: number,
+	remainY: number
+): { tx: number; ty: number } | null {
+	const remainLen = Math.hypot(remainX, remainY);
+	if (remainLen < 1e-6 || obstacles.length === 0) return null;
+
+	const ux = remainX / remainLen;
+	const uy = remainY / remainLen;
+	placeMovers(movers, baseX + ux * NORMAL_PROBE, baseY + uy * NORMAL_PROBE);
+
+	let bestDepth = -1;
+	let nx = 0;
+	let ny = 0;
+	for (const m of movers) {
+		for (const o of obstacles) {
+			const col = Collision.collides(m.link.body, o);
+			if (!col?.collided) continue;
+			const depth = col.depth ?? 0;
+			if (depth < bestDepth) continue;
+			bestDepth = depth;
+			// Normal is from bodyA → bodyB. Flip so it faces the mover.
+			let nnx = col.normal.x;
+			let nny = col.normal.y;
+			if (col.bodyA === m.link.body) {
+				nnx = -nnx;
+				nny = -nny;
+			}
+			nx = nnx;
+			ny = nny;
+		}
+	}
+	placeMovers(movers, 0, 0);
+	if (bestDepth < 0) return null;
+
+	const nLen = Math.hypot(nx, ny);
+	if (nLen < 1e-6) return null;
+	nx /= nLen;
+	ny /= nLen;
+
+	// Unit tangent; pick the orientation that matches the remaining drag.
+	let tx = -ny;
+	let ty = nx;
+	if (tx * remainX + ty * remainY < 0) {
+		tx = -tx;
+		ty = -ty;
+	}
+	return { tx, ty };
+}
+
+/**
+ * Move unlocked paths toward `delta` (desired Paper translation of the group).
+ * Nestles flush along the free portion of the push; when blocked, still slides
+ * along the contact tangent (damped) so a clear axis path is not required.
+ * Multi-select stays rigid (shared translation).
+ */
+export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean {
+	if (!engine || paths.length === 0) return false;
+	if (delta.length < 1e-6) return true;
+
+	let dx = delta.x;
+	let dy = delta.y;
+	const travel = Math.hypot(dx, dy);
+	if (travel > MAX_FRAME_TRAVEL) {
+		const s = MAX_FRAME_TRAVEL / travel;
+		dx *= s;
+		dy *= s;
+	}
+
+	const movers: Mover[] = [];
+	const moving = new Set(paths);
+	for (const p of paths) {
+		const link = links.get(p);
+		if (!link) return false;
+		movers.push({ path: p, link, x: link.body.position.x, y: link.body.position.y });
+	}
+
+	const obstacles: Matter.Body[] = [];
+	for (const [path, link] of links) {
+		if (!moving.has(path)) obstacles.push(link.body);
+	}
+
+	const candidates: { x: number; y: number }[] = [];
+	const fNestle = maxFreeFrac(movers, obstacles, dx, dy);
+	const nestX = dx * fNestle;
+	const nestY = dy * fNestle;
+	candidates.push({ x: nestX, y: nestY });
+
+	if (fNestle < 0.999) {
+		const remainX = dx - nestX;
+		const remainY = dy - nestY;
+
+		// Primary: project the blocked remainder onto the contact tangent and
+		// apply a damped slide from the nestled pose — works even when the
+		// raw delta would dig into the other rock.
+		const tangent = slideTangentFromContact(movers, obstacles, nestX, nestY, remainX, remainY);
+		if (tangent) {
+			const along = remainX * tangent.tx + remainY * tangent.ty;
+			const slideX = tangent.tx * along * SLIDE_GAIN;
+			const slideY = tangent.ty * along * SLIDE_GAIN;
+			if (Math.abs(slideX) > 1e-4 || Math.abs(slideY) > 1e-4) {
+				placeMovers(movers, nestX, nestY);
+				const fromNest = movers.map((m) => ({
+					...m,
+					x: m.link.body.position.x,
+					y: m.link.body.position.y
+				}));
+				const fSlide = maxFreeFrac(fromNest, obstacles, slideX, slideY);
+				candidates.push({
+					x: nestX + slideX * fSlide,
+					y: nestY + slideY * fSlide
+				});
+				placeMovers(movers, 0, 0);
+			}
+		}
+
+		// Fallback: axis / sequential slides when no contact normal is found.
+		const fX = maxFreeFrac(movers, obstacles, dx, 0);
+		candidates.push({ x: dx * fX, y: 0 });
+		const fY = maxFreeFrac(movers, obstacles, 0, dy);
+		candidates.push({ x: 0, y: dy * fY });
+
+		placeMovers(movers, dx * fX, 0);
+		const startsAfterX = movers.map((m) => ({
+			...m,
+			x: m.link.body.position.x,
+			y: m.link.body.position.y
+		}));
+		const fY2 = maxFreeFrac(startsAfterX, obstacles, 0, dy);
+		candidates.push({ x: dx * fX, y: dy * fY2 });
+		placeMovers(movers, 0, 0);
+
+		placeMovers(movers, 0, dy * fY);
+		const startsAfterY = movers.map((m) => ({
+			...m,
+			x: m.link.body.position.x,
+			y: m.link.body.position.y
+		}));
+		const fX2 = maxFreeFrac(startsAfterY, obstacles, dx, 0);
+		candidates.push({ x: dx * fX2, y: dy * fY });
+		placeMovers(movers, 0, 0);
+	}
+
+	let best = candidates[0]!;
+	let bestScore = -1;
+	const targetLen2 = dx * dx + dy * dy;
+	for (const c of candidates) {
+		// Prefer progress toward the cursor (dot product), then total travel.
+		const score = (c.x * dx + c.y * dy) / Math.max(targetLen2, 1e-8);
+		if (
+			score > bestScore + 1e-6 ||
+			(Math.abs(score - bestScore) < 1e-6 &&
+				c.x * c.x + c.y * c.y > best.x * best.x + best.y * best.y)
+		) {
+			best = c;
+			bestScore = score;
+		}
+	}
+
+	if (Math.abs(best.x) < 1e-4 && Math.abs(best.y) < 1e-4) {
+		placeMovers(movers, 0, 0);
+		return false;
+	}
+
+	for (const m of movers) {
+		Body.setPosition(m.link.body, { x: m.x + best.x, y: m.y + best.y });
+		// lastX/Y still at pre-move so applyBodyToPath writes the delta to Paper.
+		m.link.lastX = m.x;
+		m.link.lastY = m.y;
+		applyBodyToPath(m.path, m.link);
+	}
+	return true;
+}

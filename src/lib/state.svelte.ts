@@ -32,8 +32,42 @@ export const PALETTE: Swatch[] = [
 	{ name: 'Paper', hex: '#FFFFFF' }
 ];
 
-/** Colors that cycle as fills for placed rocks. */
-export const ROCK_COLORS: Swatch[] = PALETTE.filter((c) => c.name !== 'Paper');
+/** Colors that cycle as fills for placed rocks (full palette, including Paper). */
+export const ROCK_COLORS: Swatch[] = PALETTE;
+
+const PAPER_HEX = '#FFFFFF';
+const INK_HEX = '#101A31';
+
+export function hexEq(a: string, b: string): boolean {
+	return a.toLowerCase() === b.toLowerCase();
+}
+
+/** True when a rock fill/swatch must be hidden for the current canvas background. */
+export function isRockColorExcluded(hex: string, canvasBg: string | null): boolean {
+	if (canvasBg === null) return hexEq(hex, PAPER_HEX);
+	return hexEq(hex, canvasBg);
+}
+
+/** Rock palette entries available in UI / shuffle for the given background. */
+export function rockColorsForUi(canvasBg: string | null): Swatch[] {
+	return ROCK_COLORS.filter((c) => !isRockColorExcluded(c.hex, canvasBg));
+}
+
+export function rockColorIndex(hex: string): number {
+	return ROCK_COLORS.findIndex((c) => hexEq(c.hex, hex));
+}
+
+/** Canvas artboard backgrounds: full palette (incl. white) plus transparent. */
+export interface CanvasBgSwatch {
+	name: string;
+	/** `null` = transparent artboard / export backdrop. */
+	hex: string | null;
+}
+
+export const CANVAS_BG_COLORS: CanvasBgSwatch[] = [
+	...PALETTE,
+	{ name: 'Transparent', hex: null }
+];
 
 import { ROCK_COUNT } from './rocks';
 
@@ -94,7 +128,80 @@ class AppState {
 	/** The single image that sits behind (fills) every shape, or null. Only one
 	 *  image may fill all shapes at a time. */
 	backgroundImageId: string | null = $state(null);
+	/** Artboard backdrop color (`null` = transparent). Defaults to Paper/white. */
+	canvasBg: string | null = $state('#FFFFFF');
+	/** Bumped when canvas bg changes so Canvas can recolor rocks that matched the new bg. */
+	canvasBgVersion = $state(0);
+	/** Fill swap for the latest bg change: rocks with `from` become `to`. */
+	bgRecolor: { from: string; to: string } | null = $state(null);
+	/** Set while coercing colorIndex on bg change so Canvas won't recolor the selection. */
+	skipSelectionColorApply = false;
 	private imageSeq = 0;
+
+	/** Rock colors shown in pickers / used by shuffle for the current background. */
+	get availableRockColors(): Swatch[] {
+		return rockColorsForUi(this.canvasBg);
+	}
+
+	/** True when this ROCK_COLORS index is usable with the current background. */
+	isRockColorAvailable(i: number): boolean {
+		const swatch = ROCK_COLORS[i];
+		return !!swatch && !isRockColorExcluded(swatch.hex, this.canvasBg);
+	}
+
+	/** If colorIndex points at an excluded swatch, move it to the first available. */
+	private coerceColorIndex() {
+		const available = this.availableRockColors;
+		if (!available.length) return;
+		const current = ROCK_COLORS[this.colorIndex];
+		if (current && !isRockColorExcluded(current.hex, this.canvasBg)) return;
+		const next = rockColorIndex(available[0].hex);
+		if (next >= 0) this.colorIndex = next;
+	}
+
+	/** Keep at least one available lucky-color toggle on after a bg change. */
+	private coerceColorEnabled() {
+		const availableIdx = ROCK_COLORS.flatMap((c, i) =>
+			isRockColorExcluded(c.hex, this.canvasBg) ? [] : [i]
+		);
+		if (!availableIdx.length) return;
+		if (availableIdx.some((i) => this.colorEnabled[i])) return;
+		const next = this.colorEnabled.slice();
+		next[availableIdx[0]] = true;
+		this.colorEnabled = next;
+	}
+
+	selectCanvasBg(hex: string | null) {
+		if (hex === this.canvasBg || (hex !== null && this.canvasBg !== null && hexEq(hex, this.canvasBg))) {
+			return;
+		}
+		const prev = this.canvasBg;
+		const next = hex;
+		this.canvasBg = next;
+
+		let recolor: { from: string; to: string } | null = null;
+		if (typeof next === 'string') {
+			if (typeof prev === 'string') {
+				recolor = { from: next, to: prev };
+			} else {
+				// Leaving transparent: replace rocks that had the new bg with white,
+				// or Ink when the new bg is already white.
+				recolor = {
+					from: next,
+					to: hexEq(next, PAPER_HEX) ? INK_HEX : PAPER_HEX
+				};
+			}
+		}
+		this.bgRecolor = recolor;
+		this.canvasBgVersion++;
+		this.skipSelectionColorApply = true;
+		this.coerceColorIndex();
+		this.coerceColorEnabled();
+		// Effects flush before this microtask, so selection recolor can see the flag.
+		queueMicrotask(() => {
+			this.skipSelectionColorApply = false;
+		});
+	}
 
 	imageById(id: string | null): UploadedImage | undefined {
 		return id ? this.images.find((im) => im.id === id) : undefined;
@@ -127,9 +234,13 @@ class AppState {
 		return this.imageEditId !== null;
 	}
 
-	/** Hex fills currently allowed in the shuffle. */
+	/** Hex fills currently allowed in the shuffle (never the active bg / banned white). */
 	get enabledColors(): string[] {
-		return ROCK_COLORS.filter((_, i) => this.colorEnabled[i]).map((c) => c.hex);
+		const colors = ROCK_COLORS.filter(
+			(c, i) => this.colorEnabled[i] && !isRockColorExcluded(c.hex, this.canvasBg)
+		).map((c) => c.hex);
+		if (colors.length) return colors;
+		return this.availableRockColors.map((c) => c.hex);
 	}
 
 	/** Rock indices currently allowed in the shuffle. */
@@ -141,7 +252,9 @@ class AppState {
 	}
 
 	get nextColor(): Swatch {
-		return ROCK_COLORS[this.colorIndex];
+		const current = ROCK_COLORS[this.colorIndex];
+		if (current && !isRockColorExcluded(current.hex, this.canvasBg)) return current;
+		return this.availableRockColors[0] ?? ROCK_COLORS[0];
 	}
 
 	get rockSize(): RockSize {
@@ -221,7 +334,16 @@ class AppState {
 	}
 
 	toggleColor(i: number) {
-		this.colorEnabled = this.toggleAt(this.colorEnabled, i);
+		if (!this.isRockColorAvailable(i)) return;
+		// Only count available colors when preventing a fully-empty pool.
+		const availableOn = ROCK_COLORS.reduce((n, c, j) => {
+			if (!this.colorEnabled[j] || isRockColorExcluded(c.hex, this.canvasBg)) return n;
+			return n + 1;
+		}, 0);
+		if (this.colorEnabled[i] && availableOn === 1) return;
+		const next = this.colorEnabled.slice();
+		next[i] = !next[i];
+		this.colorEnabled = next;
 	}
 
 	toggleShape(i: number) {
@@ -234,11 +356,18 @@ class AppState {
 	}
 
 	advanceColor(direction: 1 | -1 = 1) {
-		this.colorIndex =
-			(this.colorIndex + direction + ROCK_COLORS.length) % ROCK_COLORS.length;
+		const available = this.availableRockColors;
+		if (!available.length) return;
+		const currentHex = ROCK_COLORS[this.colorIndex]?.hex;
+		let pos = available.findIndex((c) => currentHex && hexEq(c.hex, currentHex));
+		if (pos < 0) pos = direction > 0 ? -1 : 0;
+		const next = available[(pos + direction + available.length) % available.length];
+		const idx = rockColorIndex(next.hex);
+		if (idx >= 0) this.colorIndex = idx;
 	}
 
 	selectColor(i: number) {
+		if (!this.isRockColorAvailable(i)) return;
 		this.colorIndex = i;
 	}
 
