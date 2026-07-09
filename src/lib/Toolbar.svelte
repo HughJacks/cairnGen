@@ -57,20 +57,32 @@
 		return subOpen && displayPanel === panel ? 0 : -1;
 	}
 
-	let diceRolling = $state(false);
+	let diceSvg: SVGSVGElement | undefined = $state();
+	/** Bumps on each click so a superseded spin does not trigger generate. */
+	let rollToken = 0;
 
 	function rollLayout() {
-		// Restart the spin on the same click without waiting for generate.
-		diceRolling = false;
-		requestAnimationFrame(() => {
-			diceRolling = true;
-		});
-		// Yield so the first animation frame can paint before layout work runs.
-		setTimeout(() => app.generate(), 0);
-	}
-
-	function onDiceAnimEnd(event: AnimationEvent) {
-		if (event.animationName === 'dice-roll-click') diceRolling = false;
+		const token = ++rollToken;
+		// Web Animations API restarts on every click. Defer generate until the
+		// spin finishes — runShuffle is sync and would otherwise block paints
+		// for most of the 320ms, so the spin never shows.
+		diceSvg?.getAnimations().forEach((a) => a.cancel());
+		const anim = diceSvg?.animate(
+			[
+				{ transform: 'rotate(0deg) scale(1)' },
+				{ transform: 'rotate(180deg) scale(1.25)' },
+				{ transform: 'rotate(360deg) scale(1)' }
+			],
+			{ duration: 320, easing: 'cubic-bezier(0.2, 0.7, 0.2, 1)' }
+		);
+		void (anim?.finished ?? Promise.resolve())
+			.then(() => {
+				if (token !== rollToken) return;
+				app.generate();
+			})
+			.catch(() => {
+				/* cancelled by a newer click */
+			});
 	}
 
 	function readAsDataURL(file: File): Promise<string> {
@@ -224,13 +236,12 @@
 
 		<div class="lucky-pill">
 			<button
-				class={['tool icon-tool lucky-roll', { rolling: diceRolling }]}
+				class="tool icon-tool lucky-roll"
 				onclick={rollLayout}
-				onanimationend={onDiceAnimEnd}
 				title="Roll layout"
 				aria-label="Roll layout"
 			>
-				<svg viewBox="0 0 16 16" aria-hidden="true">
+				<svg bind:this={diceSvg} viewBox="0 0 16 16" aria-hidden="true">
 					<rect
 						x="2.5"
 						y="2.5"
@@ -692,19 +703,6 @@
 	.lucky-pill .tool svg {
 		width: 14px;
 		height: 14px;
-	}
-
-	.lucky-roll.rolling svg {
-		animation: dice-roll-click 320ms cubic-bezier(0.2, 0.7, 0.2, 1);
-	}
-
-	@keyframes dice-roll-click {
-		from {
-			transform: rotate(0deg);
-		}
-		to {
-			transform: rotate(360deg);
-		}
 	}
 
 	.tool.solid {

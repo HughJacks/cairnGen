@@ -67,6 +67,7 @@
 		group: paper.Group;
 		clip: paper.Path;
 		raster: paper.Raster;
+		path: paper.Path;
 	}
 	interface BgFill {
 		groups: BgFillGroup[];
@@ -332,11 +333,14 @@
 	}
 
 	function endRotateHistoryGesture() {
+		const wasRotating = rotateHistoryGesture;
 		rotateHistoryGesture = false;
 		if (rotateHistoryIdleTimer) {
 			clearTimeout(rotateHistoryIdleTimer);
 			rotateHistoryIdleTimer = null;
 		}
+		// Wheel rotation defers full fill rebuild until the gesture ends.
+		if (wasRotating) finalizeShapeTransform();
 	}
 
 	function commitRotateHistory() {
@@ -560,6 +564,29 @@
 		return c;
 	}
 
+	/** Cheap live update: sync existing fill clip geometry to match rotated
+	 *  rocks without tearing down rasters / buildBgFill. */
+	function syncFillClipsForPaths(paths: paper.Path[]) {
+		let bgDirty = false;
+		for (const path of paths) {
+			const pin = fills.get(path);
+			if (pin) {
+				pin.clip.pathData = path.pathData;
+				pin.clip.matrix = path.matrix.clone();
+				coverClamp(pin.raster, pin.clip.bounds);
+				const el = imageEls.get(pin.imageId);
+				if (el) clampPinRaster(pin.raster, pin.clip, el);
+			}
+			const bg = bgFill?.groups.find((g) => g.path === path);
+			if (bg) {
+				bg.clip.pathData = path.pathData;
+				bg.clip.matrix = path.matrix.clone();
+				bgDirty = true;
+			}
+		}
+		if (bgDirty) reapplyBg();
+	}
+
 	/** Clip the same background image to each un-pinned rock. CompoundPath and
 	 *  boolean-unite masks fail to paint in Paper.js clipped groups, but one
 	 *  group per rock (sharing the same pan/zoom) works reliably. */
@@ -580,7 +607,7 @@
 			const group = new paper.Group([clip, raster]);
 			group.clipped = true;
 			paper.project.activeLayer.addChild(group);
-			groups.push({ group, clip, raster });
+			groups.push({ group, clip, raster, path });
 			whenRasterReady(raster, () => {
 				coverClamp(raster, clip.bounds);
 				reapplyBg();
@@ -591,6 +618,15 @@
 			});
 		}
 		bgFill = { groups };
+	}
+
+	/** The item that should play the settle-in: mask fill when present, else the solid path. */
+	function placementVisual(path: paper.Path): paper.Item {
+		const pin = fills.get(path);
+		if (pin) return pin.group;
+		const bg = bgFill?.groups.find((g) => g.path === path);
+		if (bg) return bg.group;
+		return path;
 	}
 
 	/** Bring every rock's fill in line with the current pins/background,
@@ -688,6 +724,35 @@
 		for (let i = placed.length - 1; i >= 0; i--) {
 			if (placed[i].contains(point)) return placed[i];
 		}
+		return null;
+	}
+
+	/** The fill currently being edited (bg or pin for imageEditId), if any. */
+	function activeEditHit(): Hit | null {
+		const id = app.imageEditId;
+		if (!id) return null;
+		if (id === app.backgroundImageId && bgFill) return { kind: 'bg', fill: bgFill };
+		const pin = [...fills.values()].find((f) => f.imageId === id);
+		if (pin) return { kind: 'pin', fill: pin };
+		return null;
+	}
+
+	/** Hit-test the editable image by ghost bounds (full unclipped image), with fallback to masked shapes that show this image. */
+	function editImageAt(point: paper.Point): Hit | null {
+		const hit = activeEditHit();
+		if (!hit) return null;
+		if (editGhost?.bounds.contains(point)) return hit;
+		// Fallback: still allow interaction inside shapes showing this edit image
+		// (e.g. if ghost briefly missing). Reuse hitAt but only accept matching image.
+		const shapeHit = hitAt(point);
+		if (!shapeHit) return null;
+		if (hit.kind === 'bg' && shapeHit.kind === 'bg') return hit;
+		if (
+			hit.kind === 'pin' &&
+			shapeHit.kind === 'pin' &&
+			shapeHit.fill.imageId === hit.fill.imageId
+		)
+			return hit;
 		return null;
 	}
 
@@ -1500,16 +1565,19 @@
 		return 1 - Math.pow(1 - t, 3);
 	}
 
-	/** Soft settle-in for a newly placed rock — fade, light drop, no bounce. */
+	/** Soft settle-in for a newly placed rock — fade, light drop, no bounce.
+	 *  Animates the visible item (mask fill group when masked, else the solid path). */
 	function slamRock(
 		path: paper.Path,
 		opts?: { delay?: number; onComplete?: () => void }
 	): Promise<void> {
 		const delay = opts?.delay ?? 0;
 		const gen = slamGeneration;
+		const visual = placementVisual(path);
 
-		// Hide immediately so the rock never flashes at its final pose.
-		path.opacity = 0;
+		// Hide immediately so nothing flashes at the final pose before the settle.
+		visual.opacity = 0;
+		if (visual !== path) path.opacity = 0;
 
 		return new Promise((resolve) => {
 			const done = (completed: boolean) => {
@@ -1518,24 +1586,23 @@
 			};
 
 			const run = () => {
-				if (gen !== slamGeneration || !path.project) {
+				if (gen !== slamGeneration || !path.project || !visual.project) {
 					done(false);
 					return;
 				}
 
-				const landX = path.position.x;
-				const landY = path.position.y;
+				const land = visual.position.clone();
 				const drop = Math.min(22, Math.max(14, path.bounds.height * 0.12));
 				const startScale = 0.9;
 				const duration = 260;
 
 				let prevS = 1;
-				const pivot = () => path.bounds.center.clone();
+				const pivot = () => visual.bounds.center.clone();
 
-				path.position = new paper.Point(landX, landY - drop);
-				path.scale(startScale, startScale, pivot());
+				visual.position = new paper.Point(land.x, land.y - drop);
+				visual.scale(startScale, startScale, pivot());
 				prevS = startScale;
-				path.opacity = 0;
+				visual.opacity = 0;
 				paper.view.update();
 
 				const t0 = performance.now();
@@ -1543,7 +1610,7 @@
 
 				const frame = (now: number) => {
 					slamRafs.delete(rafId);
-					if (gen !== slamGeneration || !path.project) {
+					if (gen !== slamGeneration || !path.project || !visual.project) {
 						done(false);
 						return;
 					}
@@ -1552,10 +1619,10 @@
 					const u = easeOutCubic(t);
 					const s = startScale + (1 - startScale) * u;
 
-					path.scale(s / prevS, s / prevS, pivot());
+					visual.scale(s / prevS, s / prevS, pivot());
 					prevS = s;
-					path.position = new paper.Point(landX, landY - drop * (1 - u));
-					path.opacity = u;
+					visual.position = new paper.Point(land.x, land.y - drop * (1 - u));
+					visual.opacity = u;
 					paper.view.update();
 
 					if (t < 1) {
@@ -1564,9 +1631,11 @@
 						return;
 					}
 
-					path.position = new paper.Point(landX, landY);
-					path.opacity = 1;
-					if (prevS !== 1) path.scale(1 / prevS, 1 / prevS, pivot());
+					visual.position = land;
+					visual.opacity = 1;
+					if (prevS !== 1) visual.scale(1 / prevS, 1 / prevS, pivot());
+					// Solid path stayed at the final pose; only restore opacity.
+					if (visual !== path) path.opacity = 1;
 					paper.view.update();
 					done(true);
 				};
@@ -1842,7 +1911,6 @@
 
 		for (const rock of rocks) {
 			paper.project.activeLayer.addChild(rock);
-			rock.opacity = 0;
 			placed.push(rock);
 			groupParent.push(placed.length - 1);
 			const data = rock.data as {
@@ -1863,12 +1931,6 @@
 		repositionPlaced(bounds.width, bounds.height);
 		app.placedCount = placed.length;
 		commitHistory();
-
-		// Ground-first staggered slam so the stack builds upward.
-		const ordered = [...placed].sort((a, b) => b.bounds.bottom - a.bounds.bottom);
-		for (let i = 0; i < ordered.length; i++) {
-			void slamRock(ordered[i], { delay: i * 40 });
-		}
 	}
 
 	function drawBalanceLine(balance: { x: number; top: number }) {
@@ -1893,12 +1955,11 @@
 			return;
 		}
 
-		// Clear the preview so the settle-in reads clearly.
-		dismissGhost();
+		// Placement animation disabled for shape tool — clear preview and land instantly.
+		resetOverlay();
 
 		paper.project.activeLayer.addChild(cand);
 		cand.fillColor = new paper.Color(app.nextColor.hex);
-		cand.opacity = 0;
 		placed.push(cand);
 		rockMeta.set(cand, {
 			rockIndex: app.rockIndex,
@@ -1916,15 +1977,10 @@
 			}
 		}
 
+		if (app.backgroundImageId) syncFills();
+
 		app.placedCount++;
 		commitHistory();
-
-		// Animate the solid path first so the slam is visible; sync fills after
-		// so a background image doesn't hide the rock mid-drop.
-		const needSync = !!app.backgroundImageId;
-		void slamRock(cand, {
-			onComplete: needSync ? () => syncFills() : undefined
-		});
 	}
 
 	function setupPaper() {
@@ -2023,7 +2079,7 @@
 			if (canvasEl) {
 				if (app.imageEditId) {
 					const shape = shapeAt(event.point);
-					const hit = hitAt(event.point);
+					const hit = editImageAt(event.point);
 					canvasEl.style.cursor = hit ? 'grab' : shape ? 'copy' : '';
 				} else {
 					canvasEl.style.cursor = '';
@@ -2050,7 +2106,7 @@
 			didDragShape = false;
 			didDragMarquee = false;
 			if (app.imageEditId) {
-				const hit = hitAt(event.point);
+				const hit = editImageAt(event.point);
 				if (hit) imageDrag = { kind: hit.kind, fill: hit.fill, last: event.point };
 				return;
 			}
@@ -2358,7 +2414,7 @@
 	function onWheel(event: WheelEvent) {
 		const point = new paper.Point(event.offsetX, event.offsetY);
 		if (app.imageEditId) {
-			const hit = hitAt(point);
+			const hit = editImageAt(point);
 			if (!hit) return;
 			event.preventDefault();
 			const factor = event.deltaY < 0 ? 1.08 : 1 / 1.08;
@@ -2378,7 +2434,8 @@
 		if (selectedPaths.length) {
 			event.preventDefault();
 			if (rotateSelectedShapes(event.deltaY * 0.25)) {
-				finalizeShapeTransform();
+				syncFillClipsForPaths(selectedPaths);
+				updateSelectionVisuals();
 				updateTipPos();
 				commitRotateHistory();
 			}
@@ -2395,7 +2452,8 @@
 		event.preventDefault();
 		event.stopPropagation();
 		if (rotateSelectedShapes(event.deltaY * 0.25)) {
-			finalizeShapeTransform();
+			syncFillClipsForPaths(selectedPaths);
+			updateSelectionVisuals();
 			updateTipPos();
 			commitRotateHistory();
 		}
