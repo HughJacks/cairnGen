@@ -15,7 +15,7 @@ const BODY_OPTS: Matter.IChamferableBodyDefinition = {
 	slop: 0.05
 };
 
-const SAMPLE_COUNT = 64;
+const SAMPLE_COUNT = 96;
 const MAX_FRAME_TRAVEL = 64;
 const SEARCH_ITERS = 12;
 /** Tangential slide after a blocked push — less than full cursor follow. */
@@ -55,8 +55,11 @@ function sampleOutline(path: paper.Path, count = SAMPLE_COUNT): Matter.Vector[] 
 	return pts;
 }
 
-function buildBodyFromPath(path: paper.Path, isStatic: boolean): Matter.Body | null {
-	const verts = sampleOutline(path);
+function bodyFromVerts(
+	verts: Matter.Vector[],
+	isStatic: boolean,
+	allowHull: boolean
+): Matter.Body | null {
 	if (verts.length < 3) return null;
 
 	const centre = Vertices.centre(verts);
@@ -67,7 +70,7 @@ function buildBodyFromPath(path: paper.Path, isStatic: boolean): Matter.Body | n
 		body = undefined;
 	}
 
-	if (!body || body.parts.length === 0) {
+	if ((!body || body.parts.length === 0) && allowHull) {
 		if (!warnedHull) {
 			console.warn('[physics] fromVertices failed; using convex hull fallback');
 			warnedHull = true;
@@ -78,11 +81,23 @@ function buildBodyFromPath(path: paper.Path, isStatic: boolean): Matter.Body | n
 		body = Bodies.fromVertices(hc.x, hc.y, [hull], { ...BODY_OPTS, isStatic }, true);
 	}
 
-	if (!body) return null;
+	if (!body || body.parts.length === 0) return null;
 	Body.setAngle(body, 0);
 	Body.setVelocity(body, { x: 0, y: 0 });
 	Body.setAngularVelocity(body, 0);
 	return body;
+}
+
+function buildBodyFromPath(path: paper.Path, isStatic: boolean): Matter.Body | null {
+	// Prefer a true decomp of the outline. Hull fallback inflates concave rocks
+	// and is especially wrong after rotation (world-space samples change).
+	const primary = bodyFromVerts(sampleOutline(path), isStatic, false);
+	if (primary) return primary;
+
+	const dense = bodyFromVerts(sampleOutline(path, SAMPLE_COUNT * 2), isStatic, false);
+	if (dense) return dense;
+
+	return bodyFromVerts(sampleOutline(path, SAMPLE_COUNT * 2), isStatic, true);
 }
 
 function applyBodyToPath(path: paper.Path, link: BodyLink) {
@@ -173,20 +188,30 @@ export function translateBody(path: paper.Path, dx: number, dy: number) {
 }
 
 /**
- * Sample current Paper geometry. Registered bodies can lag behind Paper during
- * rotate/reshape probes, so pairwise overlap always rebuilds from the path.
+ * Sample current Paper geometry. Overlap probes always rebuild from the path so
+ * rotate/place/move agree — registered bodies can lag or differ after rotation
+ * (chord samples are orientation-dependent).
  */
 function bodyForOverlap(path: paper.Path): Matter.Body | null {
 	return buildBodyFromPath(path, true);
 }
 
-/** Registered body when present and in sync; otherwise sample Paper. */
-function bodyForObstacle(path: paper.Path): Matter.Body | null {
-	return links.get(path)?.body ?? buildBodyFromPath(path, true);
-}
-
 function bodiesCollide(a: Matter.Body, b: Matter.Body): boolean {
 	return !!Collision.collides(a, b)?.collided;
+}
+
+/** True when any pair among `paths` penetrates (multi-select rigid rotate). */
+function selectionSelfOverlaps(paths: paper.Path[]): boolean {
+	for (let i = 0; i < paths.length; i++) {
+		for (let j = i + 1; j < paths.length; j++) {
+			if (pathsOverlap(paths[i]!, paths[j]!)) return true;
+		}
+	}
+	return false;
+}
+
+function groupOverlaps(paths: paper.Path[], obstacles: paper.Path[]): boolean {
+	return anyOverlap(paths, obstacles) || (paths.length > 1 && selectionSelfOverlaps(paths));
 }
 
 /** True when a sample of `subject`'s outline sits clearly inside `other`'s fill. */
@@ -221,8 +246,9 @@ export function pathsOverlap(a: paper.Path, b: paper.Path): boolean {
 }
 
 /**
- * Overlap test that builds the candidate body once and reuses registered
- * obstacle bodies. Paper fill check only rejects real penetration.
+ * Overlap test that samples both sides from current Paper geometry so
+ * placement, drag validation, and rotation share one oracle. Paper fill
+ * check only rejects real penetration.
  */
 export function pathOverlapsAny(path: paper.Path, others: paper.Path[]): boolean {
 	if (others.length === 0) return false;
@@ -232,7 +258,7 @@ export function pathOverlapsAny(path: paper.Path, others: paper.Path[]): boolean
 	const cb = path.bounds;
 	for (const o of others) {
 		if (o === path || !cb.intersects(o.bounds)) continue;
-		const ob = bodyForObstacle(o);
+		const ob = bodyForOverlap(o);
 		if (!ob) {
 			if (paperPathsOverlap(path, o)) return true;
 			continue;
@@ -277,7 +303,8 @@ export function maxFreeTranslation(
 	const oy = cand.position.y;
 	const obsBodies: Matter.Body[] = [];
 	for (const o of obstacles) {
-		const b = bodyForObstacle(o);
+		// Fresh samples — same oracle as pathOverlapsAny / rotate.
+		const b = bodyForOverlap(o);
 		if (b) obsBodies.push(b);
 	}
 
@@ -416,7 +443,8 @@ function gatherRotatePivots(paths: paper.Path[], obstacles: paper.Path[]): paper
 
 /**
  * Largest |fraction| of `degrees` the group can rotate about `pivot` without
- * overlapping obstacles. Restores geometry afterward.
+ * overlapping obstacles. Restores geometry afterward. Mirrors translation:
+ * Matter binary-search first, then ease back only when Paper still penetrates.
  */
 function maxFreeRotateFrac(
 	paths: paper.Path[],
@@ -426,7 +454,7 @@ function maxFreeRotateFrac(
 	befores: { path: paper.Path; pathData: string }[]
 ): number {
 	applyRotateAbout(paths, degrees, pivot);
-	const freeFull = !anyOverlap(paths, obstacles);
+	const freeFull = !groupOverlaps(paths, obstacles);
 	restorePaths(befores);
 	if (freeFull) return 1;
 
@@ -435,9 +463,30 @@ function maxFreeRotateFrac(
 	for (let i = 0; i < ROTATE_ANGLE_ITERS; i++) {
 		const mid = (lo + hi) / 2;
 		applyRotateAbout(paths, degrees * mid, pivot);
-		if (anyOverlap(paths, obstacles)) hi = mid;
+		if (groupOverlaps(paths, obstacles)) hi = mid;
 		else lo = mid;
 		restorePaths(befores);
+	}
+
+	// Matter chords can sit slightly inside curved fills after rotation.
+	// Only then ease the angle back — never invent a standing gap.
+	if (lo > 1e-5) {
+		applyRotateAbout(paths, degrees * lo, pivot);
+		const bites = groupOverlaps(paths, obstacles);
+		restorePaths(befores);
+		if (bites) {
+			let plo = 0;
+			let phi = lo;
+			for (let i = 0; i < 8; i++) {
+				const mid = (plo + phi) / 2;
+				applyRotateAbout(paths, degrees * mid, pivot);
+				const hit = groupOverlaps(paths, obstacles);
+				restorePaths(befores);
+				if (hit) phi = mid;
+				else plo = mid;
+			}
+			lo = plo;
+		}
 	}
 	return lo;
 }
@@ -481,7 +530,7 @@ export function rotateKinematic(
 	}
 
 	applyRotateAbout(paths, applied, bestPivot);
-	if (anyOverlap(paths, obstacles)) {
+	if (groupOverlaps(paths, obstacles)) {
 		// Safety: never commit an overlapping pose.
 		restorePaths(befores);
 		return 0;
@@ -513,7 +562,8 @@ export function beginDrag(paths: paper.Path[]) {
 	}
 }
 
-/** Lock bodies again after drag ends (already static; sync Paper once). */
+/** Lock bodies again after drag ends; rebuild from Paper so rest pose matches
+ *  the same samples rotate/placement use (avoids angle-dependent drift). */
 export function endDrag(paths: paper.Path[]) {
 	for (const p of paths) {
 		const link = links.get(p);
@@ -522,6 +572,7 @@ export function endDrag(paths: paper.Path[]) {
 		Body.setAngularVelocity(link.body, 0);
 		applyBodyToPath(p, link);
 		Body.setStatic(link.body, true);
+		rebuildFromPath(p);
 	}
 }
 
@@ -735,12 +786,64 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 		return false;
 	}
 
-	for (const m of movers) {
-		Body.setPosition(m.link.body, { x: m.x + best.x, y: m.y + best.y });
-		// lastX/Y still at pre-move so applyBodyToPath writes the delta to Paper.
-		m.link.lastX = m.x;
-		m.link.lastY = m.y;
-		applyBodyToPath(m.path, m.link);
+	const obstaclePaths: paper.Path[] = [];
+	for (const [path] of links) {
+		if (!moving.has(path)) obstaclePaths.push(path);
 	}
+	const paperOrigins = movers.map((m) => m.path.position.clone());
+	const moverPaths = movers.map((m) => m.path);
+
+	const resetPose = () => {
+		placeMovers(movers, 0, 0);
+		for (const m of movers) {
+			m.link.lastX = m.x;
+			m.link.lastY = m.y;
+		}
+		for (let i = 0; i < movers.length; i++) {
+			movers[i]!.path.position = paperOrigins[i]!;
+			onPathTranslated?.(movers[i]!.path);
+		}
+	};
+
+	const applyFrac = (frac: number) => {
+		const fx = best.x * frac;
+		const fy = best.y * frac;
+		for (const m of movers) {
+			Body.setPosition(m.link.body, { x: m.x + fx, y: m.y + fy });
+			m.link.lastX = m.x;
+			m.link.lastY = m.y;
+			applyBodyToPath(m.path, m.link);
+		}
+	};
+
+	const poseOverlaps = () =>
+		movers.some((m) => pathOverlapsAny(m.path, obstaclePaths)) ||
+		(movers.length > 1 && selectionSelfOverlaps(moverPaths));
+
+	// Registered-body nestling can leave a pose that fresh samples / Paper
+	// reject (especially after prior rotations). Ease back to a free pose.
+	applyFrac(1);
+	let frac = 1;
+	if (poseOverlaps()) {
+		let lo = 0;
+		let hi = 1;
+		for (let i = 0; i < SEARCH_ITERS; i++) {
+			const mid = (lo + hi) / 2;
+			resetPose();
+			applyFrac(mid);
+			if (poseOverlaps()) hi = mid;
+			else lo = mid;
+		}
+		frac = lo;
+		resetPose();
+		if (frac < 1e-4) return false;
+		applyFrac(frac);
+		if (poseOverlaps()) {
+			resetPose();
+			return false;
+		}
+	}
+
+	// Keep registered bodies translated with Paper; full resample happens in endDrag.
 	return true;
 }
