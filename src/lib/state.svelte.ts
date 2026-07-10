@@ -79,15 +79,56 @@ export interface BgSwatch {
 	enabled: boolean;
 }
 
-function defaultBgSwatches(): BgSwatch[] {
-	return [
-		{ key: PAPER_HEX, hex: PAPER_HEX, enabled: true },
-		...PALETTE.filter((p) => !hexEq(p.hex, PAPER_HEX)).map((p) => ({
-			key: p.hex,
-			hex: p.hex,
-			enabled: true
-		}))
-	];
+export type ColorPaletteId = 'warm' | 'cool';
+
+export interface ColorPalette {
+	id: ColorPaletteId;
+	name: string;
+	colors: Swatch[];
+}
+
+function paletteSwatch(hex: string): Swatch {
+	const found = PALETTE.find((p) => hexEq(p.hex, hex));
+	if (!found) throw new Error(`Unknown palette hex ${hex}`);
+	return found;
+}
+
+/** Warm / Cool top-bar palettes. Paper is first in each (matches expanded bg order). */
+export const COLOR_PALETTES: ColorPalette[] = [
+	{
+		id: 'warm',
+		name: 'Warm',
+		colors: [
+			paletteSwatch(PAPER_HEX),
+			paletteSwatch('#FFF788'),
+			paletteSwatch('#ED4E3D'),
+			paletteSwatch('#FF9673'),
+			paletteSwatch('#F5DEFF'),
+			paletteSwatch('#DF6BFF')
+		]
+	},
+	{
+		id: 'cool',
+		name: 'Cool',
+		colors: [
+			paletteSwatch(PAPER_HEX),
+			paletteSwatch('#C8FBFF'),
+			paletteSwatch('#95FF9F'),
+			paletteSwatch('#4371DB'),
+			paletteSwatch('#1A4654'),
+			paletteSwatch(INK_HEX)
+		]
+	}
+];
+
+function defaultBgSwatchesFor(paletteId: ColorPaletteId): BgSwatch[] {
+	const palette = COLOR_PALETTES.find((p) => p.id === paletteId);
+	const colors = palette?.colors ?? COLOR_PALETTES[0]!.colors;
+	return colors.map((p) => ({
+		key: p.hex,
+		hex: p.hex,
+		enabled: true
+	}));
 }
 
 function bgHexEq(a: string | null, b: string | null): boolean {
@@ -171,10 +212,14 @@ class AppState {
 	bgRecolor: { from: string; to: string } | null = $state(null);
 	/** Set while coercing colorIndex on bg change so Canvas won't recolor the selection. */
 	skipSelectionColorApply = false;
-	/** Top-bar bg swatches (leftmost = canvas background). */
-	bgSwatches: BgSwatch[] = $state(defaultBgSwatches());
-	/** Bumped by the top-bar dice to shuffle unlocked rock fill colors. */
+	/** Active top-bar color palette (Warm or Cool). */
+	activePaletteId: ColorPaletteId = $state('warm');
+	/** Top-bar bg swatches for the active palette (leftmost = canvas background). */
+	bgSwatches: BgSwatch[] = $state(defaultBgSwatchesFor('warm'));
+	/** Bumped by the top-bar dice to shuffle palette order (rocks sync via colorSlot). */
 	colorShuffleVersion = $state(0);
+	/** Bumped when switching Warm/Cool so Canvas recolors unlocked rocks into the new pool. */
+	paletteSwitchVersion = $state(0);
 	private imageSeq = 0;
 
 	/** Enabled top-bar colors that are not the current canvas bg (shape/tip pickers). */
@@ -282,16 +327,16 @@ class AppState {
 	 * On → partition so it joins the end of the enabled group. Never empties the rock-color pool.
 	 * Always keeps shape-tool `colorIndex` on an enabled non-bg color when the pool changes.
 	 */
-	toggleBgSwatch(index: number) {
+	toggleBgSwatch(index: number): boolean {
 		const swatch = this.bgSwatches[index];
-		if (!swatch) return;
+		if (!swatch) return false;
 
 		if (!swatch.enabled) {
 			const next = this.bgSwatches.slice();
 			next[index] = { ...swatch, enabled: true };
 			this.bgSwatches = partitionBgSwatches(next);
 			this.coerceColorIndex();
-			return;
+			return true;
 		}
 
 		const wasLeft = index === 0;
@@ -309,7 +354,7 @@ class AppState {
 		const poolAfter = partitioned.flatMap((s) =>
 			s.enabled && s.hex !== null && !isRockColorExcluded(s.hex, newCanvasBg) ? [s.hex] : []
 		);
-		if (poolAfter.length === 0) return;
+		if (poolAfter.length === 0) return false;
 
 		this.bgSwatches = partitioned;
 		if (wasLeft) {
@@ -318,6 +363,7 @@ class AppState {
 		} else {
 			this.coerceColorIndex();
 		}
+		return true;
 	}
 
 	/** Move a swatch to index 0 and select it as the canvas background. */
@@ -326,9 +372,67 @@ class AppState {
 		this.reorderBgSwatch(index, 0);
 	}
 
-	/** Shuffle unlocked rock fill colors (Canvas watches `colorShuffleVersion`). */
+	/**
+	 * Dice: shuffle enabled swatch order (incl. bg / index 0). Disabled stay on the right.
+	 * Rocks keep a colorSlot index and Canvas syncs fills from the new order.
+	 */
 	shuffleRockColors() {
+		const enabled = this.bgSwatches.filter((s) => s.enabled);
+		const disabled = this.bgSwatches.filter((s) => !s.enabled);
+		if (enabled.length < 2) return;
+
+		const prevKeys = enabled.map((s) => s.key);
+		let nextEnabled = enabled.slice();
+		for (let attempt = 0; attempt < 10; attempt++) {
+			for (let i = nextEnabled.length - 1; i > 0; i--) {
+				const j = Math.floor(Math.random() * (i + 1));
+				const a = nextEnabled[i]!;
+				nextEnabled[i] = nextEnabled[j]!;
+				nextEnabled[j] = a;
+			}
+			if (nextEnabled.some((s, i) => s.key !== prevKeys[i])) break;
+		}
+		if (nextEnabled.every((s, i) => s.key === prevKeys[i])) return;
+
+		this.bgSwatches = [...nextEnabled, ...disabled];
+		this.ensureLeftmostEnabled();
+
+		const newLeft = this.bgSwatches[0]?.hex ?? null;
+		if (!bgHexEq(this.canvasBg, newLeft)) {
+			// Slot sync owns rock recolor — skip selectCanvasBg's swap.
+			this.canvasBg = newLeft;
+			this.bgRecolor = null;
+			this.canvasBgVersion++;
+		}
+
+		this.skipSelectionColorApply = true;
+		this.coerceColorIndex();
+		queueMicrotask(() => {
+			this.skipSelectionColorApply = false;
+		});
 		this.colorShuffleVersion++;
+	}
+
+	/**
+	 * Switch Warm/Cool palette: reset swatches (Paper leftmost, all on),
+	 * force canvas bg to Paper, then bump paletteSwitchVersion so Canvas
+	 * recolors unlocked rocks into the new pool.
+	 */
+	selectPalette(id: ColorPaletteId) {
+		if (id === this.activePaletteId) return;
+		this.activePaletteId = id;
+		this.bgSwatches = defaultBgSwatchesFor(id);
+		if (!bgHexEq(this.canvasBg, PAPER_HEX)) {
+			this.canvasBg = PAPER_HEX;
+			this.bgRecolor = null;
+			this.canvasBgVersion++;
+		}
+		this.skipSelectionColorApply = true;
+		this.coerceColorIndex();
+		queueMicrotask(() => {
+			this.skipSelectionColorApply = false;
+		});
+		this.paletteSwitchVersion++;
 	}
 
 	imageById(id: string | null): UploadedImage | undefined {

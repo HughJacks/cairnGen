@@ -134,6 +134,23 @@ function commit(placed: paper.Path[], cand: paper.Path) {
 	syncBody(cand);
 }
 
+/** Centroid of locked (+ already placed) rocks; falls back to canvas center. */
+function massAnchor(
+	placed: paper.Path[],
+	locked: paper.Path[],
+	fallback: paper.Point
+): paper.Point {
+	const mass = allObstacles(placed, locked);
+	if (!mass.length) return fallback;
+	let x = 0;
+	let y = 0;
+	for (const p of mass) {
+		x += p.position.x;
+		y += p.position.y;
+	}
+	return new paper.Point(x / mass.length, y / mass.length);
+}
+
 /** Rough radius of the current mass from `anchor` (for spawn rings). */
 function clusterRadius(placed: paper.Path[], locked: paper.Path[], anchor: paper.Point): number {
 	let r = 0;
@@ -150,6 +167,21 @@ function clusterRadius(placed: paper.Path[], locked: paper.Path[], anchor: paper
 	return r;
 }
 
+/** Unit directions to probe when a spawn lands inside the mass. */
+function freeDirs(away: paper.Point): paper.Point[] {
+	const primary =
+		away.length > 1e-3 ? away.normalize() : new paper.Point(1, 0);
+	const ortho = new paper.Point(-primary.y, primary.x);
+	return [
+		primary,
+		primary.add(ortho).normalize(),
+		primary.subtract(ortho).normalize(),
+		ortho,
+		ortho.multiply(-1),
+		primary.multiply(-1)
+	];
+}
+
 function tryClusterPlace(
 	sourcePaths: paper.Path[],
 	placed: paper.Path[],
@@ -162,16 +194,17 @@ function tryClusterPlace(
 	const cand = makeCandidate(sourcePaths, spec, bounds);
 	cand.position = point;
 	if (blocked(cand, placed, locked)) {
-		// Nudge outward from the mass until free, then nestle back in.
-		const away = point.subtract(anchor);
-		const dir =
-			away.length > 1e-3 ? away.normalize() : new paper.Point(1, 0);
+		// Nudge out of the mass along several rays, then nestle back in.
+		const dirs = freeDirs(point.subtract(anchor));
+		const maxSteps = locked.length ? 14 : 8;
 		let freed = false;
-		for (let step = 1; step <= 8; step++) {
-			cand.position = point.add(dir.multiply(step * 14));
-			if (!blocked(cand, placed, locked)) {
-				freed = true;
-				break;
+		outer: for (const dir of dirs) {
+			for (let step = 1; step <= maxSteps; step++) {
+				cand.position = point.add(dir.multiply(step * 14));
+				if (!blocked(cand, placed, locked)) {
+					freed = true;
+					break outer;
+				}
 			}
 		}
 		if (!freed) {
@@ -191,8 +224,10 @@ function tryClusterPlace(
 	return true;
 }
 
-/** Grow one cohesive mass from the canvas center using Matter overlap only.
- *  When locked rocks already occupy the center, seed just outside them. */
+/**
+ * Grow one cohesive mass. With locked rocks, grow around their centroid and
+ * keep retrying until we hit the quota (or exhaust a larger attempt budget).
+ */
 function buildCenteredCluster(
 	sourcePaths: paper.Path[],
 	placed: paper.Path[],
@@ -202,38 +237,54 @@ function buildCenteredCluster(
 	bounds: paper.Rectangle,
 	rand: () => number
 ): void {
-	const center = bounds.center;
+	const fallback = bounds.center;
+	const hasLocked = locked.length > 0;
+	let anchor = massAnchor(placed, locked, fallback);
 
 	let seeded = false;
-	if (locked.length) {
-		// Center is occupied — ring-seed around the locked mass.
-		for (let i = 0; i < 14 && !seeded; i++) {
-			const seed = randomPiece(rand, pools);
-			const baseR = clusterRadius(placed, locked, center);
+	const seedTries = hasLocked ? 28 : 6;
+	for (let i = 0; i < seedTries && !seeded; i++) {
+		const seed = randomPiece(rand, pools);
+		if (hasLocked) {
+			const baseR = clusterRadius(placed, locked, anchor);
 			const angle = rand() * Math.PI * 2;
-			const radius = baseR + 8 + i * 14 + rand() * 10;
-			const pt = center.add(new paper.Point(Math.cos(angle) * radius, Math.sin(angle) * radius));
-			seeded = tryClusterPlace(sourcePaths, placed, locked, seed, pt, bounds, center);
-		}
-	} else {
-		for (let i = 0; i < 6 && !seeded; i++) {
-			const seed = randomPiece(rand, pools);
-			seeded = tryClusterPlace(sourcePaths, placed, locked, seed, center, bounds, center);
+			const radius = baseR + 8 + i * 12 + rand() * 14;
+			const pt = anchor.add(
+				new paper.Point(Math.cos(angle) * radius, Math.sin(angle) * radius)
+			);
+			seeded = tryClusterPlace(sourcePaths, placed, locked, seed, pt, bounds, anchor);
+		} else {
+			seeded = tryClusterPlace(
+				sourcePaths,
+				placed,
+				locked,
+				seed,
+				fallback,
+				bounds,
+				fallback
+			);
 		}
 	}
 	if (!seeded) return;
 
-	for (let n = 1; n < count; n++) {
+	// Quota fill: failed slots don't permanently underfill the composition.
+	const ringTries = hasLocked ? 16 : 10;
+	const maxAttempts = hasLocked ? count * 8 : count * 3;
+	let attempts = 0;
+	while (placed.length < count && attempts < maxAttempts) {
+		attempts++;
+		anchor = massAnchor(placed, locked, fallback);
 		const piece = randomPiece(rand, pools);
-		const baseR = clusterRadius(placed, locked, center);
+		const baseR = clusterRadius(placed, locked, anchor);
 		let ok = false;
-		for (let i = 0; i < 10 && !ok; i++) {
+		for (let i = 0; i < ringTries && !ok; i++) {
 			piece.rotation = rand() * 360;
 			const angle = rand() * Math.PI * 2;
-			// Spawn just outside the current mass, then step further out.
-			const radius = baseR + 8 + i * 16 + rand() * 12;
-			const pt = center.add(new paper.Point(Math.cos(angle) * radius, Math.sin(angle) * radius));
-			ok = tryClusterPlace(sourcePaths, placed, locked, piece, pt, bounds, center);
+			const radius = baseR + 8 + i * 14 + rand() * 14;
+			const pt = anchor.add(
+				new paper.Point(Math.cos(angle) * radius, Math.sin(angle) * radius)
+			);
+			ok = tryClusterPlace(sourcePaths, placed, locked, piece, pt, bounds, anchor);
 		}
 	}
 }
@@ -248,14 +299,20 @@ function buildStack(
 	bounds: paper.Rectangle,
 	rand: () => number
 ): void {
+	const hasLocked = locked.length > 0;
 	let stackX = baseX;
+	let misses = 0;
+	const missLimit = hasLocked ? 3 : 1;
+	const dropTries = hasLocked ? 14 : 8;
+	const xJitter = hasLocked ? 48 : 20;
+
 	for (let d = 0; d < depth; d++) {
 		const piece = randomPiece(rand, pools);
 		let ok = false;
-		for (let i = 0; i < 8 && !ok; i++) {
+		for (let i = 0; i < dropTries && !ok; i++) {
 			piece.rotation = rand() * 360;
 			const cand = makeCandidate(sourcePaths, piece, bounds);
-			const x = stackX + (rand() - 0.5) * 20;
+			const x = stackX + (rand() - 0.5) * xJitter;
 			// Start above the artboard so drop always has room to search down.
 			cand.position = new paper.Point(x, bounds.top - cand.bounds.height);
 			if (!dropToRest(cand, bounds.bottom, placed, locked)) {
@@ -276,8 +333,14 @@ function buildStack(
 			commit(placed, cand);
 			stackX = stackX * 0.7 + cand.position.x * 0.3;
 			ok = true;
+			misses = 0;
 		}
-		if (!ok) break;
+		if (!ok) {
+			misses++;
+			if (misses >= missLimit) break;
+			// Locked obstacles often block one layer — nudge sideways and keep going.
+			if (hasLocked) stackX += (rand() - 0.5) * 60;
+		}
 	}
 }
 
@@ -305,21 +368,26 @@ export function generateShuffle(
 	const pools = poolsFrom(opts);
 	const placed: paper.Path[] = [];
 	const locked = opts.obstacles ?? [];
+	const hasLocked = locked.length > 0;
 
 	if (opts.mode === 'cluster') {
 		// One central mass; count scales gently with canvas width.
 		const clusters = Math.min(4, Math.max(2, Math.round(bounds.width / 240)));
 		let count = 0;
 		for (let c = 0; c < clusters; c++) count += 3 + Math.floor(rand() * 5);
+		// Locked rocks already occupy space — aim a bit higher so the new
+		// ring around them still feels as full as a fresh generate.
+		if (hasLocked) count += Math.min(6, 2 + locked.length);
 		buildCenteredCluster(sourcePaths, placed, locked, pools, count, bounds, rand);
 	} else {
-		const stacks = Math.min(4, Math.max(2, Math.round(bounds.width / 200)));
-		const span = bounds.width * 0.5;
+		let stacks = Math.min(4, Math.max(2, Math.round(bounds.width / 200)));
+		if (hasLocked) stacks = Math.min(5, stacks + 1);
+		const span = bounds.width * (hasLocked ? 0.62 : 0.5);
 		const gap = stacks > 1 ? span / (stacks - 1) : 0;
 		const startX = bounds.center.x - span / 2;
 
 		for (let s = 0; s < stacks; s++) {
-			const depth = 4 + Math.floor(rand() * 4);
+			const depth = (hasLocked ? 5 : 4) + Math.floor(rand() * 4);
 			buildStack(sourcePaths, placed, locked, pools, depth, startX + s * gap, bounds, rand);
 		}
 	}

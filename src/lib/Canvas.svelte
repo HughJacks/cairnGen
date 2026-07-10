@@ -1,14 +1,20 @@
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
 	import { flip } from 'svelte/animate';
+	import { cubicOut } from 'svelte/easing';
 	import paper from 'paper';
 	import {
 		app,
 		ASPECTS,
+		COLOR_PALETTES,
 		hexEq,
+		isRockColorExcluded,
 		PALETTE,
 		rockColorIndex,
-		ROCK_SIZES
+		ROCK_SIZES,
+		type BgSwatch,
+		type ColorPalette,
+		type ColorPaletteId
 	} from './state.svelte';
 	import { ROCK_SVGS } from './rocks';
 	import {
@@ -54,6 +60,7 @@
 	let seenShuffleSeed = app.shuffleSeed;
 	let seenCanvasBgVersion = app.canvasBgVersion;
 	let seenColorShuffleVersion = app.colorShuffleVersion;
+	let seenPaletteSwitchVersion = app.paletteSwitchVersion;
 	let imageEditBaseline: CanvasSnapshot | null = null;
 	let bgDiceSvg: SVGSVGElement | undefined = $state();
 	let bgColorsEl: HTMLDivElement | null = $state(null);
@@ -84,6 +91,158 @@
 			{ duration: 320, easing: 'cubic-bezier(0.2, 0.7, 0.2, 1)' }
 		);
 		app.shuffleRockColors();
+	}
+
+	/** Palette slot index for a fill hex (falls back to first usable non-bg slot). */
+	function colorSlotForHex(hex: string): number {
+		const exact = app.bgSwatches.findIndex((s) => s.hex !== null && hexEq(s.hex, hex));
+		if (exact >= 0) return exact;
+		for (let i = 0; i < app.bgSwatches.length; i++) {
+			const s = app.bgSwatches[i];
+			if (s?.enabled && s.hex && !isRockColorExcluded(s.hex, app.canvasBg)) return i;
+		}
+		return Math.min(1, Math.max(0, app.bgSwatches.length - 1));
+	}
+
+	function resolveFillSlot(slot: number): { slot: number; hex: string } | null {
+		const trySlot = (i: number) => {
+			const s = app.bgSwatches[i];
+			if (!s?.enabled || s.hex === null) return null;
+			if (isRockColorExcluded(s.hex, app.canvasBg)) return null;
+			return { slot: i, hex: s.hex };
+		};
+		const direct = trySlot(slot);
+		if (direct) return direct;
+		for (let i = 0; i < app.bgSwatches.length; i++) {
+			const resolved = trySlot(i);
+			if (resolved) return resolved;
+		}
+		return null;
+	}
+
+	function writeRockMeta(
+		path: paper.Path,
+		patch: Partial<RockMeta> & Pick<RockMeta, 'rockIndex' | 'sizeIndex' | 'rotation'>
+	) {
+		const prev = rockMeta.get(path);
+		rockMeta.set(path, {
+			rockIndex: patch.rockIndex,
+			sizeIndex: patch.sizeIndex,
+			rotation: patch.rotation,
+			colorSlot: patch.colorSlot ?? prev?.colorSlot ?? colorSlotForHex(app.nextColor.hex),
+			locked: patch.locked ?? prev?.locked
+		});
+	}
+
+	/** Apply each rock's colorSlot → current palette swatch (skips locked / masked). */
+	function syncRocksFromColorSlots(): boolean {
+		let changed = false;
+		for (const path of placed) {
+			if (isLocked(path)) continue;
+			if (attach.has(path)) continue;
+			if (app.backgroundImageId && !solidOnly.has(path)) continue;
+			const meta = rockMeta.get(path);
+			let slot = meta?.colorSlot;
+			if (slot === undefined || slot < 0) {
+				const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
+				slot = cur ? colorSlotForHex(cur) : colorSlotForHex(app.nextColor.hex);
+			}
+			const resolved = resolveFillSlot(slot);
+			if (!resolved) continue;
+			if (!meta || meta.colorSlot !== resolved.slot) {
+				writeRockMeta(path, {
+					rockIndex: meta?.rockIndex ?? 0,
+					sizeIndex: meta?.sizeIndex ?? app.sizeIndex,
+					rotation: meta?.rotation ?? path.rotation,
+					colorSlot: resolved.slot,
+					locked: meta?.locked
+				});
+			}
+			const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
+			if (!cur || !hexEq(cur, resolved.hex)) {
+				path.fillColor = new paper.Color(resolved.hex);
+				changed = true;
+			}
+		}
+		if (changed) {
+			if (selectedPaths.length) syncSelectionUi(selectedPaths.at(-1) ?? null);
+			updateGhost();
+		}
+		return changed;
+	}
+
+	/**
+	 * After enable/disable (+ partition): remap unlocked rocks onto the enabled
+	 * fill pool. When `disabledHex` is set and `forceRemap` is false, rocks whose
+	 * color is still valid keep it (slot index refreshed); only rocks on the
+	 * disabled color are reassigned. When `forceRemap` is true (activate), every
+	 * unlocked rock is redistributed across the pool so the new color is used.
+	 */
+	function syncRockSlotsAfterPaletteMutation(opts?: {
+		disabledHex?: string | null;
+		forceRemap?: boolean;
+	}): boolean {
+		const pool = app.enabledBgRockColors;
+		if (!pool.length) return false;
+		const disabledHex = opts?.disabledHex ?? null;
+		const forceRemap = opts?.forceRemap ?? false;
+		let changed = false;
+		let poolCursor = 0;
+		for (const path of placed) {
+			if (isLocked(path)) continue;
+			if (attach.has(path)) continue;
+			if (app.backgroundImageId && !solidOnly.has(path)) continue;
+
+			const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
+			const meta = rockMeta.get(path);
+			const curStillValid =
+				!forceRemap &&
+				!!cur &&
+				!(disabledHex && hexEq(cur, disabledHex)) &&
+				pool.some((h) => hexEq(h, cur));
+
+			let hex: string;
+			if (curStillValid) {
+				hex = cur!;
+			} else {
+				hex = pool[poolCursor % pool.length]!;
+				poolCursor++;
+			}
+
+			const slot = colorSlotForHex(hex);
+			if (!meta || meta.colorSlot !== slot) {
+				writeRockMeta(path, {
+					rockIndex: meta?.rockIndex ?? 0,
+					sizeIndex: meta?.sizeIndex ?? app.sizeIndex,
+					rotation: meta?.rotation ?? path.rotation,
+					colorSlot: slot,
+					locked: meta?.locked
+				});
+			}
+			if (!cur || !hexEq(cur, hex)) {
+				path.fillColor = new paper.Color(hex);
+				changed = true;
+			}
+		}
+		if (changed) {
+			if (selectedPaths.length) syncSelectionUi(selectedPaths.at(-1) ?? null);
+			updateGhost();
+		}
+		return changed;
+	}
+
+	function toggleBgSwatchAndRemap(index: number) {
+		const swatch = app.bgSwatches[index];
+		const activating = swatch ? !swatch.enabled : false;
+		const disabledHex = swatch?.enabled ? swatch.hex : null;
+		if (!app.toggleBgSwatch(index)) return;
+		if (
+			syncRockSlotsAfterPaletteMutation({
+				disabledHex,
+				forceRemap: activating
+			})
+		)
+			commitHistory();
 	}
 
 	function cacheBgSlotMids() {
@@ -118,6 +277,7 @@
 		const from = bgDragIndex;
 		bgDragIndex = target;
 		app.reorderBgSwatch(from, target, { deferBg: true });
+		syncRocksFromColorSlots();
 	}
 
 	function onBgSlotPointerDown(e: PointerEvent, index: number) {
@@ -174,8 +334,11 @@
 		bgDragMoved = false;
 		bgDragPointerId = null;
 		bgSlotMids = [];
-		if (wasDrag) app.finalizeBgSwatchOrder();
-		else app.toggleBgSwatch(index);
+		if (wasDrag) {
+			app.finalizeBgSwatchOrder();
+			syncRocksFromColorSlots();
+			commitHistory();
+		} else toggleBgSwatchAndRemap(index);
 	}
 
 	// Download dialog: pick format; optional transparent export when bg is white.
@@ -187,6 +350,71 @@
 	const canExportTransparent = $derived(
 		typeof app.canvasBg === 'string' && hexEq(app.canvasBg, PAPER_HEX)
 	);
+	let leadingPaletteId = $state<ColorPaletteId>(app.activePaletteId);
+	let expandedPaletteId = $state<ColorPaletteId>(app.activePaletteId);
+	let paletteSwitching = false;
+	const paletteStripEls: Partial<Record<ColorPaletteId, HTMLDivElement>> = {};
+	/** Frozen swatch order for inactive palettes so condensed strips don't reshuffle. */
+	let frozenSwatches: Partial<Record<ColorPaletteId, BgSwatch[]>> = {};
+
+	const orderedPalettes = $derived([
+		COLOR_PALETTES.find((p) => p.id === leadingPaletteId)!,
+		...COLOR_PALETTES.filter((p) => p.id !== leadingPaletteId)
+	]);
+
+	const PALETTE_FLIP_MS = 420;
+	const PALETTE_MORPH_MS = 380;
+	const PALETTE_EASE = 'cubic-bezier(0.22, 1, 0.36, 1)';
+
+	function sleep(ms: number) {
+		return new Promise<void>((resolve) => setTimeout(resolve, ms));
+	}
+
+	/** Swatches shown in a palette strip — live bgSwatches when that palette is active. */
+	function paletteDisplaySwatches(palette: ColorPalette): BgSwatch[] {
+		if (app.activePaletteId === palette.id) return app.bgSwatches;
+		return (
+			frozenSwatches[palette.id] ??
+			palette.colors.map((c) => ({ key: c.hex, hex: c.hex, enabled: true }))
+		);
+	}
+
+	function trackPaletteStrip(id: ColorPaletteId) {
+		return (node: HTMLDivElement) => {
+			paletteStripEls[id] = node;
+			if (expandedPaletteId === id) bgColorsEl = node;
+			return () => {
+				if (paletteStripEls[id] === node) delete paletteStripEls[id];
+				if (bgColorsEl === node) bgColorsEl = null;
+			};
+		};
+	}
+
+	$effect(() => {
+		const id = expandedPaletteId;
+		bgColorsEl = paletteStripEls[id] ?? null;
+	});
+
+	async function onSelectPalette(id: ColorPaletteId) {
+		if (paletteSwitching) return;
+		if (id === app.activePaletteId && id === leadingPaletteId && expandedPaletteId === id) return;
+		paletteSwitching = true;
+		try {
+			// 1. Reorder first — DOM order + flip (heights stay fixed)
+			leadingPaletteId = id;
+			await sleep(PALETTE_FLIP_MS);
+			// 2. Contract old + expand new at the same time
+			const prev = app.activePaletteId;
+			frozenSwatches[prev] = app.bgSwatches.map((s) => ({ ...s }));
+			app.selectPalette(id);
+			expandedPaletteId = id;
+			await sleep(PALETTE_MORPH_MS);
+		} finally {
+			leadingPaletteId = app.activePaletteId;
+			expandedPaletteId = app.activePaletteId;
+			paletteSwitching = false;
+		}
+	}
 
 	function exportDialog(node: HTMLDialogElement) {
 		dialogEl = node;
@@ -281,6 +509,8 @@
 		rockIndex: number;
 		sizeIndex: number;
 		rotation: number;
+		/** Index into `app.bgSwatches` — fill follows whatever color is in this slot. */
+		colorSlot: number;
 		locked?: boolean;
 	}
 	let rockMeta = new WeakMap<paper.Path, RockMeta>();
@@ -352,6 +582,7 @@
 			rockIndex: number;
 			sizeIndex: number;
 			rotation: number;
+			colorSlot?: number;
 			locked?: boolean;
 		}[];
 		attach: [number, string][];
@@ -381,6 +612,7 @@
 					rockIndex: meta?.rockIndex ?? 0,
 					sizeIndex: meta?.sizeIndex ?? app.sizeIndex,
 					rotation: meta?.rotation ?? p.rotation,
+					colorSlot: meta?.colorSlot,
 					locked: meta?.locked
 				};
 			}),
@@ -446,6 +678,9 @@
 				rockIndex: rock.rockIndex ?? 0,
 				sizeIndex: rock.sizeIndex ?? app.sizeIndex,
 				rotation: rock.rotation ?? 0,
+				colorSlot:
+					rock.colorSlot ??
+					colorSlotForHex(rock.fillColor ?? app.nextColor.hex),
 				locked: rock.locked
 			});
 		}
@@ -969,6 +1204,18 @@
 		if (app.backgroundImageId && !solidOnly.has(path)) return false;
 		const hex = app.nextColor.hex;
 		const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
+		const slot = colorSlotForHex(hex);
+		const meta = rockMeta.get(path);
+		if (meta) {
+			rockMeta.set(path, { ...meta, colorSlot: slot });
+		} else {
+			writeRockMeta(path, {
+				rockIndex: app.rockIndex,
+				sizeIndex: app.sizeIndex,
+				rotation: path.rotation,
+				colorSlot: slot
+			});
+		}
 		if (cur === hex) return false;
 		path.fillColor = new paper.Color(hex);
 		return true;
@@ -1075,6 +1322,9 @@
 					rockIndex: 0,
 					sizeIndex: app.sizeIndex,
 					rotation: p.rotation,
+					colorSlot: colorSlotForHex(
+						(p.fillColor as paper.Color | null)?.toCSS(true) ?? app.nextColor.hex
+					),
 					locked: next
 				});
 		}
@@ -1206,7 +1456,14 @@
 		const beforePathData = path.pathData;
 		const beforeMeta = meta
 			? { ...meta }
-			: { rockIndex: 0, sizeIndex: app.sizeIndex, rotation };
+			: {
+					rockIndex: 0,
+					sizeIndex: app.sizeIndex,
+					rotation,
+					colorSlot: colorSlotForHex(
+						(path.fillColor as paper.Color | null)?.toCSS(true) ?? app.nextColor.hex
+					)
+				};
 		const savedAnchor = tipAnchor ? { ...tipAnchor } : null;
 		const savedTip = tipPos ? { ...tipPos } : null;
 		tipLocked = true;
@@ -1238,7 +1495,15 @@
 			return false;
 		}
 
-		rockMeta.set(path, { rockIndex: nextRock, sizeIndex: nextSize, rotation });
+		rockMeta.set(path, {
+			rockIndex: nextRock,
+			sizeIndex: nextSize,
+			rotation,
+			colorSlot:
+				meta?.colorSlot ??
+				colorSlotForHex((path.fillColor as paper.Color | null)?.toCSS(true) ?? app.nextColor.hex),
+			locked: meta?.locked
+		});
 		selectedRockIndex = nextRock;
 		selectedSizeIndex = nextSize;
 
@@ -2063,7 +2328,10 @@
 			rockMeta.set(rock, {
 				rockIndex: data?.rockIndex ?? 0,
 				sizeIndex: data?.sizeIndex ?? app.sizeIndex,
-				rotation: data?.rotation ?? rock.rotation
+				rotation: data?.rotation ?? rock.rotation,
+				colorSlot: colorSlotForHex(
+					(rock.fillColor as paper.Color | null)?.toCSS(true) ?? app.nextColor.hex
+				)
 			});
 		}
 
@@ -2118,7 +2386,8 @@
 		rockMeta.set(cand, {
 			rockIndex: app.rockIndex,
 			sizeIndex: app.sizeIndex,
-			rotation: app.rotation
+			rotation: app.rotation,
+			colorSlot: colorSlotForHex(app.nextColor.hex)
 		});
 
 		// Union the new rock with every placed rock it touches.
@@ -2523,6 +2792,9 @@
 				const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
 				if (!cur || !hexEq(cur, swap.from)) continue;
 				path.fillColor = new paper.Color(swap.to);
+				const meta = rockMeta.get(path);
+				const slot = colorSlotForHex(swap.to);
+				if (meta) rockMeta.set(path, { ...meta, colorSlot: slot });
 				changed = true;
 			}
 			if (selectedPaths.length) syncSelectionUi(selectedPaths.at(-1) ?? null);
@@ -2531,28 +2803,48 @@
 		});
 	});
 
-	// Top-bar dice: shuffle solid fills on unlocked, non-image-masked rocks.
+	// Top-bar dice: sync rock fills from palette slots. Palette switch: randomize into new pool.
 	$effect(() => {
 		if (!ready) return;
-		const version = app.colorShuffleVersion;
-		if (version === seenColorShuffleVersion) return;
-		seenColorShuffleVersion = version;
+		const shuffleVersion = app.colorShuffleVersion;
+		const paletteVersion = app.paletteSwitchVersion;
+		const shuffled = shuffleVersion !== seenColorShuffleVersion;
+		const switched = paletteVersion !== seenPaletteSwitchVersion;
+		if (!shuffled && !switched) return;
+		seenColorShuffleVersion = shuffleVersion;
+		seenPaletteSwitchVersion = paletteVersion;
 		untrack(() => {
-			const pool = app.enabledBgRockColors;
-			if (!pool.length) return;
 			let changed = false;
-			for (const path of placed) {
-				if (isLocked(path)) continue;
-				if (attach.has(path)) continue;
-				if (app.backgroundImageId && !solidOnly.has(path)) continue;
-				const hex = pool[Math.floor(Math.random() * pool.length)]!;
-				const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
-				if (cur && hexEq(cur, hex)) continue;
-				path.fillColor = new paper.Color(hex);
-				changed = true;
+
+			if (shuffled) {
+				changed = syncRocksFromColorSlots();
+			} else if (switched) {
+				const pool = app.enabledBgRockColors;
+				if (!pool.length) return;
+				for (const path of placed) {
+					if (isLocked(path)) continue;
+					if (attach.has(path)) continue;
+					if (app.backgroundImageId && !solidOnly.has(path)) continue;
+					const hex = pool[Math.floor(Math.random() * pool.length)]!;
+					const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
+					const slot = colorSlotForHex(hex);
+					const meta = rockMeta.get(path);
+					if (meta) rockMeta.set(path, { ...meta, colorSlot: slot });
+					else
+						writeRockMeta(path, {
+							rockIndex: 0,
+							sizeIndex: app.sizeIndex,
+							rotation: path.rotation,
+							colorSlot: slot
+						});
+					if (cur && hexEq(cur, hex)) continue;
+					path.fillColor = new paper.Color(hex);
+					changed = true;
+				}
+				if (selectedPaths.length) syncSelectionUi(selectedPaths.at(-1) ?? null);
+				updateGhost();
 			}
-			if (selectedPaths.length) syncSelectionUi(selectedPaths.at(-1) ?? null);
-			updateGhost();
+
 			if (changed) commitHistory();
 		});
 	});
@@ -2822,8 +3114,8 @@
 					class="bg-dice"
 					type="button"
 					onclick={rollBgColors}
-					title="Shuffle rock colors"
-					aria-label="Shuffle rock colors"
+					title="Shuffle palette order"
+					aria-label="Shuffle palette order"
 				>
 					<svg bind:this={bgDiceSvg} viewBox="0 0 16 16" aria-hidden="true">
 						<rect
@@ -2841,34 +3133,79 @@
 						<circle cx="10.5" cy="10.5" r="1.1" fill="currentColor" />
 					</svg>
 				</button>
-				<div class="bg-colors" bind:this={bgColorsEl}>
-					{#each app.bgSwatches as swatch, i (swatch.key)}
+				{#each orderedPalettes as palette (palette.id)}
+					{@const expanded = expandedPaletteId === palette.id}
+					{@const interactive = expanded && app.activePaletteId === palette.id}
+					<div
+						class="palette-item"
+						animate:flip={{ duration: PALETTE_FLIP_MS, easing: cubicOut }}
+					>
+						<!-- tabindex is only set when role=button (condensed) -->
+						<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 						<div
-							class={['bg-slot', { active: i === 0, dragging: bgDragIndex === i }]}
-							role="button"
-							tabindex="0"
-							animate:flip={{ duration: 90 }}
-							title={bgSwatchTitle(swatch.hex)}
-							aria-label={bgSwatchTitle(swatch.hex)}
-							aria-pressed={swatch.enabled}
-							style:background={i === 0 && swatch.hex
-								? `color-mix(in srgb, ${swatch.hex} 80%, transparent)`
-								: undefined}
-							onpointerdown={(e) => onBgSlotPointerDown(e, i)}
+							class={['palette-strip', { expanded, condensed: !expanded }]}
+							style:--palette-morph={PALETTE_EASE}
+							style:--palette-morph-ms="{PALETTE_MORPH_MS}ms"
+							role={expanded ? 'group' : 'button'}
+							tabindex={expanded ? undefined : 0}
+							title={expanded ? undefined : `${palette.name} palette`}
+							aria-label={expanded ? `${palette.name} palette` : `Select ${palette.name} palette`}
+							{@attach trackPaletteStrip(palette.id)}
+							onclick={() => {
+								if (!expanded) onSelectPalette(palette.id);
+							}}
 							onkeydown={(e) => {
+								if (expanded) return;
 								if (e.key === 'Enter' || e.key === ' ') {
 									e.preventDefault();
-									app.toggleBgSwatch(i);
+									onSelectPalette(palette.id);
 								}
 							}}
 						>
-							<span
-								class={['bg-dot', { on: swatch.enabled }]}
-								style:background={swatch.hex ?? undefined}
-							></span>
+							{#each paletteDisplaySwatches(palette) as swatch, i (swatch.key)}
+								<!-- tabindex is only set when role=button (expanded interactive) -->
+								<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+								<div
+									class={[
+										'bg-slot',
+										{
+											active: interactive && i === 0,
+											dragging: interactive && bgDragIndex === i
+										}
+									]}
+									role={interactive ? 'button' : undefined}
+									tabindex={interactive ? 0 : undefined}
+									animate:flip={{ duration: interactive ? 320 : 0, easing: cubicOut }}
+									title={interactive ? bgSwatchTitle(swatch.hex) : undefined}
+									aria-label={interactive ? bgSwatchTitle(swatch.hex) : undefined}
+									aria-pressed={interactive ? swatch.enabled : undefined}
+									style:z-index={!expanded ? palette.colors.length - i : undefined}
+									style:background={interactive && i === 0 && swatch.hex
+										? `color-mix(in srgb, ${swatch.hex} 80%, transparent)`
+										: undefined}
+									onpointerdown={(e) => {
+										if (!interactive) return;
+										onBgSlotPointerDown(e, i);
+									}}
+									onkeydown={(e) => {
+										if (!interactive) return;
+										if (e.key === 'Enter' || e.key === ' ') {
+											e.preventDefault();
+											toggleBgSwatchAndRemap(i);
+										}
+									}}
+								>
+									<span
+										class={['bg-dot', { on: interactive ? swatch.enabled : false, pale: !expanded }]}
+										style:background={expanded
+											? (swatch.hex ?? undefined)
+											: `color-mix(in srgb, ${swatch.hex ?? '#fff'} 42%, white)`}
+									></span>
+								</div>
+							{/each}
 						</div>
-					{/each}
-				</div>
+					</div>
+				{/each}
 			</div>
 		{/if}
 		<canvas
@@ -3153,10 +3490,11 @@
 		bottom: calc(100% + 12px);
 		transform: translateX(-50%);
 		display: flex;
-		align-items: stretch;
+		align-items: center;
 		justify-content: center;
 		gap: 6px;
 		padding: 0;
+		height: 36px;
 		border-radius: 999px;
 		color: #fff;
 		background-color: #fff;
@@ -3171,7 +3509,8 @@
 		display: flex;
 		align-items: center;
 		justify-content: center;
-		width: 34px;
+		width: 36px;
+		height: 36px;
 		padding: 0;
 		border: none;
 		border-radius: 999px;
@@ -3181,6 +3520,7 @@
 		color: var(--ink);
 		cursor: pointer;
 		flex: 0 0 auto;
+		box-sizing: border-box;
 	}
 
 	.bg-dice:hover {
@@ -3193,29 +3533,81 @@
 		display: block;
 	}
 
-	.bg-colors {
+	.palette-item {
 		display: flex;
-		align-items: stretch;
+		flex: 0 0 auto;
+		align-items: center;
+		height: 36px;
+	}
+
+	.palette-strip {
+		display: flex;
+		align-items: center;
 		justify-content: center;
 		flex: 0 0 auto;
-		padding: 0;
+		height: 36px;
+		padding: 5px;
 		border: 1px solid var(--border);
 		border-radius: 999px;
 		background: color-mix(in srgb, var(--paper) 92%, transparent);
 		box-shadow: none;
-		backdrop-filter: none;
 		overflow: hidden;
+		box-sizing: border-box;
+		transition: padding var(--palette-morph-ms, 380ms) var(--palette-morph, ease);
+	}
+
+	.palette-strip.condensed {
+		align-items: center;
+		cursor: pointer;
+	}
+
+	.palette-strip.condensed:hover {
+		background: color-mix(in srgb, var(--ink) 6%, var(--paper));
+	}
+
+	.palette-strip.expanded {
+		padding: 0;
+		align-items: stretch;
+		cursor: default;
+	}
+
+	.palette-strip .bg-slot {
+		transition:
+			margin-left var(--palette-morph-ms, 380ms) var(--palette-morph, ease),
+			padding var(--palette-morph-ms, 380ms) var(--palette-morph, ease),
+			background-color 200ms ease;
+	}
+
+	.palette-strip.condensed .bg-slot {
+		margin-left: -19px;
+		padding: 0;
+		height: 24px;
+		pointer-events: none;
+		cursor: inherit;
+	}
+
+	.palette-strip.condensed .bg-slot:first-child {
+		margin-left: 0;
+	}
+
+	.palette-strip.expanded .bg-slot {
+		margin-left: 0;
+		padding: 5px 4px;
+		height: auto;
+		align-self: stretch;
+		pointer-events: auto;
 	}
 
 	.bg-slot {
 		display: flex;
 		align-items: center;
 		justify-content: center;
-		padding: 5px 4px;
+		position: relative;
 		touch-action: none;
 		cursor: grab;
 		user-select: none;
 		background: transparent;
+		box-sizing: border-box;
 	}
 
 	.bg-slot.active {
@@ -3231,6 +3623,8 @@
 		display: block;
 		width: 24px;
 		height: 24px;
+		min-width: 24px;
+		min-height: 24px;
 		border: 1.5px dashed rgba(16, 26, 49, 0.28);
 		border-radius: 50%;
 		opacity: 0.4;
@@ -3238,23 +3632,30 @@
 		pointer-events: none;
 		box-sizing: border-box;
 		transition:
-			opacity 100ms ease,
-			border-color 100ms ease,
-			border-style 100ms ease;
+			opacity 200ms ease,
+			border-color 200ms ease,
+			border-style 200ms ease,
+			background-color 380ms var(--palette-morph, ease);
 	}
 
-	.bg-slot:hover .bg-dot {
+	.bg-dot.pale {
+		opacity: 1;
+		border-style: solid;
+		border: .1px solid rgba(16, 26, 49, 0.28);
+	}
+
+	.bg-slot:hover .bg-dot:not(.pale) {
 		opacity: 0.65;
 	}
 
 	.bg-dot.on {
 		opacity: 1;
-		border: 2px solid var(--ink);
+		border: 1px solid rgba(16, 26, 49, 0.28);
 	}
 
 	.bg-slot.active .bg-dot {
 		opacity: 1;
-		border: 2px solid #c5cad3;
+		border: 1px solid rgba(16, 26, 49, 0.28);
 	}
 
 	.bg-slot:hover .bg-dot.on {
