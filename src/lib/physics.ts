@@ -234,6 +234,11 @@ function paperPathsOverlap(a: paper.Path, b: paper.Path): boolean {
 	return outlinePenetrates(a, b) || outlinePenetrates(b, a);
 }
 
+/** True when Paper fills visibly penetrate (not Matter chord contact). */
+export function fillsPenetrate(a: paper.Path, b: paper.Path): boolean {
+	return paperPathsOverlap(a, b);
+}
+
 /** True when two path fills penetrate (Matter SAT). Paper is a safety net for
  *  chord-approximation misses — not used to invent clearance gaps. */
 export function pathsOverlap(a: paper.Path, b: paper.Path): boolean {

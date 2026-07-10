@@ -1,5 +1,5 @@
 import paper from 'paper';
-import { pathsOverlap } from './physics';
+import { fillsPenetrate, pathsOverlap } from './physics';
 
 export type Mode = 'cluster' | 'stack';
 
@@ -369,7 +369,7 @@ export function getShapeContacts(
 	return getShapeContactDetails(path, placed, bounds, mode).map((c) => c.point);
 }
 
-/** Target outline gap after export settle (px). */
+/** Target outline gap after separating a true fill penetration (px). */
 const SETTLE_GAP = 0.15;
 const SETTLE_OUTER_ITERS = 10;
 const SETTLE_SEARCH_ITERS = 14;
@@ -382,7 +382,7 @@ function nearestPairBetween(a: paper.Path, b: paper.Path): Pair {
 function separationDir(mover: paper.Path, other: paper.Path, pair: Pair): paper.Point {
 	// When penetrating, nearest-outline points can sit on the wrong side of the
 	// seam — prefer centers so the push actually separates the fills.
-	if (rocksOverlap(mover, other)) {
+	if (fillsPenetrate(mover, other)) {
 		let dir = mover.position.subtract(other.position);
 		if (dir.length < 1e-6) dir = new paper.Point(0, -1);
 		return dir.normalize();
@@ -395,16 +395,16 @@ function separationDir(mover: paper.Path, other: paper.Path, pair: Pair): paper.
 	return dir.normalize();
 }
 
-function freeOfOthers(path: paper.Path, others: paper.Path[]): boolean {
-	return !others.some((o) => rocksOverlap(path, o));
+function freeOfPaperPenetration(path: paper.Path, others: paper.Path[]): boolean {
+	return !others.some((o) => fillsPenetrate(path, o));
 }
 
 /**
- * Push `mover` away from `other` along the separation axis until they no
- * longer penetrate (rocksOverlap). Leaves a tiny clearance.
+ * Push `mover` away from `other` until Paper fills no longer penetrate.
+ * Uses visual penetration only — Matter chords must not invent gaps.
  */
 function settlePushApart(mover: paper.Path, other: paper.Path) {
-	if (!rocksOverlap(mover, other)) return;
+	if (!fillsPenetrate(mover, other)) return;
 	const pair = nearestPairBetween(mover, other);
 	const dir = separationDir(mover, other, pair);
 	const reach =
@@ -416,7 +416,7 @@ function settlePushApart(mover: paper.Path, other: paper.Path) {
 		8;
 
 	translatePath(mover, dir.multiply(reach));
-	const clearedFar = !rocksOverlap(mover, other);
+	const clearedFar = !fillsPenetrate(mover, other);
 	translatePath(mover, dir.multiply(-reach));
 	if (!clearedFar) return;
 
@@ -425,7 +425,7 @@ function settlePushApart(mover: paper.Path, other: paper.Path) {
 	for (let i = 0; i < SETTLE_SEARCH_ITERS; i++) {
 		const mid = (lo + hi) / 2;
 		translatePath(mover, dir.multiply(mid));
-		if (rocksOverlap(mover, other)) lo = mid;
+		if (fillsPenetrate(mover, other)) lo = mid;
 		else hi = mid;
 		translatePath(mover, dir.multiply(-mid));
 	}
@@ -433,8 +433,8 @@ function settlePushApart(mover: paper.Path, other: paper.Path) {
 }
 
 /**
- * Pull `mover` toward `other` until outlineDistance ≈ 0, without penetrating
- * any path in `others` (which should include `other`).
+ * After separating a real penetration, nestle back to a hairline tangent gap
+ * without creating new Paper penetrations.
  */
 function settlePullTogether(mover: paper.Path, other: paper.Path, others: paper.Path[]) {
 	const pair = nearestPairBetween(mover, other);
@@ -443,7 +443,7 @@ function settlePullTogether(mover: paper.Path, other: paper.Path, others: paper.
 	if (delta.length < 1e-6) return;
 
 	translatePath(mover, delta);
-	const okFull = freeOfOthers(mover, others);
+	const okFull = freeOfPaperPenetration(mover, others);
 	translatePath(mover, delta.multiply(-1));
 	if (okFull) {
 		translatePath(mover, delta);
@@ -456,72 +456,23 @@ function settlePullTogether(mover: paper.Path, other: paper.Path, others: paper.
 		const mid = (lo + hi) / 2;
 		const step = delta.multiply(mid);
 		translatePath(mover, step);
-		if (freeOfOthers(mover, others)) lo = mid;
+		if (freeOfPaperPenetration(mover, others)) lo = mid;
 		else hi = mid;
 		translatePath(mover, step.multiply(-1));
 	}
 	if (lo > 0) translatePath(mover, delta.multiply(lo));
 }
 
-function settleGround(path: paper.Path, bounds: paper.Rectangle, others: paper.Path[]) {
-	const gap = groundDistance(path, bounds);
-	if (Math.abs(gap) <= SETTLE_GAP) return;
-
-	if (gap > 0) {
-		// Above ground — pull down.
-		const delta = new paper.Point(0, gap);
-		translatePath(path, delta);
-		const ok = freeOfOthers(path, others);
-		translatePath(path, delta.multiply(-1));
-		if (ok) {
-			translatePath(path, delta);
-			return;
-		}
-		let lo = 0;
-		let hi = 1;
-		for (let i = 0; i < SETTLE_SEARCH_ITERS; i++) {
-			const mid = (lo + hi) / 2;
-			const step = delta.multiply(mid);
-			translatePath(path, step);
-			if (freeOfOthers(path, others)) lo = mid;
-			else hi = mid;
-			translatePath(path, step.multiply(-1));
-		}
-		if (lo > 0) translatePath(path, delta.multiply(lo));
-		return;
-	}
-
-	// Below ground — push up.
-	const delta = new paper.Point(0, gap); // negative y
-	translatePath(path, delta);
-	const ok = freeOfOthers(path, others) && groundDistance(path, bounds) >= -SETTLE_GAP;
-	translatePath(path, delta.multiply(-1));
-	if (ok) {
-		translatePath(path, delta);
-		return;
-	}
-	let lo = 0;
-	let hi = 1;
-	for (let i = 0; i < SETTLE_SEARCH_ITERS; i++) {
-		const mid = (lo + hi) / 2;
-		const step = delta.multiply(mid);
-		translatePath(path, step);
-		if (freeOfOthers(path, others) && groundDistance(path, bounds) >= -SETTLE_GAP) lo = mid;
-		else hi = mid;
-		translatePath(path, step.multiply(-1));
-	}
-	if (lo > 0) translatePath(path, delta.multiply(lo));
-}
-
 /**
- * Expensive offline fixup for export: push apart any Matter overlaps, then
- * pull near-touching pairs to a tiny tangent gap. Mutates `paths` in place —
- * callers should snapshot/restore for live canvas use.
+ * Export-only fixup: separate pairs whose Paper fills truly penetrate, then
+ * nestle those pairs back to a tiny tangent gap. Does not move flush contacts
+ * that Matter chords mis-read as overlaps, and does not pull near-but-gapped
+ * rocks together. Mutates `paths` in place — callers snapshot/restore.
  */
 export function settleContactsForExport(
 	paths: paper.Path[],
-	bounds: paper.Rectangle,
-	mode: Mode
+	_bounds: paper.Rectangle,
+	_mode: Mode
 ): void {
 	if (paths.length === 0) return;
 
@@ -531,44 +482,29 @@ export function settleContactsForExport(
 		for (let j = i + 1; j < paths.length; j++) {
 			const a = paths[i]!;
 			const b = paths[j]!;
-			if (!a.bounds.expand(GROUP_EPS * 4).intersects(b.bounds)) continue;
-			if (outlineDistance(a, b) <= GROUP_EPS || rocksOverlap(a, b)) {
-				pairs.push({ a, b, bottom: Math.max(a.bounds.bottom, b.bounds.bottom) });
-			}
+			if (!a.bounds.intersects(b.bounds)) continue;
+			if (!fillsPenetrate(a, b)) continue;
+			pairs.push({ a, b, bottom: Math.max(a.bounds.bottom, b.bounds.bottom) });
 		}
 	}
+	if (pairs.length === 0) return;
+
 	// Bottom-to-top so lower supports settle before upper rocks.
 	pairs.sort((p, q) => q.bottom - p.bottom);
-
-	const groundPaths =
-		mode === 'stack'
-			? paths
-					.filter((p) => Math.abs(groundDistance(p, bounds)) <= GROUP_EPS)
-					.sort((a, b) => b.bounds.bottom - a.bounds.bottom)
-			: [];
 
 	for (let iter = 0; iter < SETTLE_OUTER_ITERS; iter++) {
 		let moved = false;
 		const before = paths.map((p) => p.position.clone());
 
 		for (const { a, b } of pairs) {
+			if (!fillsPenetrate(a, b)) continue;
 			// Prefer moving the higher rock so stacks settle onto supports.
 			const mover = a.bounds.bottom < b.bounds.bottom ? a : b;
 			const other = mover === a ? b : a;
 			const others = paths.filter((p) => p !== mover);
 
-			if (rocksOverlap(mover, other)) {
-				settlePushApart(mover, other);
-			}
+			settlePushApart(mover, other);
 			settlePullTogether(mover, other, others);
-		}
-
-		for (const p of groundPaths) {
-			settleGround(
-				p,
-				bounds,
-				paths.filter((o) => o !== p)
-			);
 		}
 
 		for (let i = 0; i < paths.length; i++) {
@@ -578,20 +514,6 @@ export function settleContactsForExport(
 			}
 		}
 		if (!moved) break;
-	}
-
-	// Final pass: only separate remaining overlaps (pull-together can leave a
-	// hair of penetration after Matter SAT vs outline-distance disagree).
-	for (let iter = 0; iter < SETTLE_OUTER_ITERS; iter++) {
-		let cleared = true;
-		for (const { a, b } of pairs) {
-			if (!rocksOverlap(a, b)) continue;
-			cleared = false;
-			const mover = a.bounds.bottom < b.bounds.bottom ? a : b;
-			const other = mover === a ? b : a;
-			settlePushApart(mover, other);
-		}
-		if (cleared) break;
 	}
 }
 

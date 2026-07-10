@@ -2189,8 +2189,9 @@
 	 * view — so selection outlines, placement ghosts, marquees, and edit
 	 * previews cannot appear in the file.
 	 *
-	 * Before writing, temporarily push apart any tiny overlaps / settle
-	 * near-contacts; live geometry is always restored afterward.
+	 * Before writing, only separate pairs whose Paper fills truly penetrate
+	 * (Matter chord false-positives must not invent gaps). Live geometry is
+	 * always restored afterward.
 	 */
 	function withCleanExport(run: () => void) {
 		clearUiOverlays();
