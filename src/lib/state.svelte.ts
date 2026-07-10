@@ -34,7 +34,7 @@ export const PALETTE: Swatch[] = [
 	{ name: 'Paper', hex: '#FFFFFF' }
 ];
 
-/** Colors that cycle as fills for placed rocks (full palette, including Paper). */
+/** Full palette for indexing; rock fills exclude Paper/Ink via isRockColorExcluded. */
 export const ROCK_COLORS: Swatch[] = PALETTE;
 
 const PAPER_HEX = '#FFFFFF';
@@ -44,10 +44,24 @@ export function hexEq(a: string, b: string): boolean {
 	return a.toLowerCase() === b.toLowerCase();
 }
 
-/** True when a rock fill/swatch must be hidden for the current canvas background. */
+/** True when a hex must never be used as a rock/shape fill (Paper, Ink, or current bg). */
 export function isRockColorExcluded(hex: string, canvasBg: string | null): boolean {
-	if (canvasBg === null) return hexEq(hex, PAPER_HEX);
+	if (hexEq(hex, PAPER_HEX) || hexEq(hex, INK_HEX)) return true;
+	if (canvasBg === null) return false;
 	return hexEq(hex, canvasBg);
+}
+
+export function isPaperHex(hex: string | null): boolean {
+	return hex !== null && hexEq(hex, PAPER_HEX);
+}
+
+/** Safe chromatic fill when remapping rocks off a bg color (never Paper/Ink). */
+function safeRockFillHex(preferred: string | null, canvasBg: string | null): string {
+	if (preferred && !isRockColorExcluded(preferred, canvasBg)) return preferred;
+	for (const c of ROCK_COLORS) {
+		if (!isRockColorExcluded(c.hex, canvasBg)) return c.hex;
+	}
+	return '#4371DB';
 }
 
 /** Rock palette entries available in UI / shuffle for the given background. */
@@ -79,7 +93,7 @@ export interface BgSwatch {
 	enabled: boolean;
 }
 
-export type ColorPaletteId = 'warm' | 'cool';
+export type ColorPaletteId = 'warm' | 'cool' | 'balanced';
 
 export interface ColorPalette {
 	id: ColorPaletteId;
@@ -93,30 +107,42 @@ function paletteSwatch(hex: string): Swatch {
 	return found;
 }
 
-/** Warm / Cool top-bar palettes. Paper is first in each (matches expanded bg order). */
+/** Top-bar palettes. Chromatic colors + Paper (bg only) at the end. */
 export const COLOR_PALETTES: ColorPalette[] = [
 	{
 		id: 'warm',
 		name: 'Warm',
 		colors: [
-			paletteSwatch(PAPER_HEX),
-			paletteSwatch('#FFF788'),
 			paletteSwatch('#ED4E3D'),
 			paletteSwatch('#FF9673'),
 			paletteSwatch('#F5DEFF'),
-			paletteSwatch('#DF6BFF')
+			paletteSwatch('#DF6BFF'),
+			paletteSwatch('#FFF788'),
+			paletteSwatch(PAPER_HEX)
 		]
 	},
 	{
 		id: 'cool',
 		name: 'Cool',
 		colors: [
-			paletteSwatch(PAPER_HEX),
 			paletteSwatch('#C8FBFF'),
 			paletteSwatch('#95FF9F'),
 			paletteSwatch('#4371DB'),
 			paletteSwatch('#1A4654'),
-			paletteSwatch(INK_HEX)
+			paletteSwatch('#FFF788'),
+			paletteSwatch(PAPER_HEX)
+		]
+	},
+	{
+		id: 'balanced',
+		name: 'Balanced',
+		colors: [
+			paletteSwatch('#F5DEFF'),
+			paletteSwatch('#DF6BFF'),
+			paletteSwatch('#C8FBFF'),
+			paletteSwatch('#4371DB'),
+			paletteSwatch('#1A4654'),
+			paletteSwatch(PAPER_HEX)
 		]
 	}
 ];
@@ -124,7 +150,11 @@ export const COLOR_PALETTES: ColorPalette[] = [
 function defaultBgSwatchesFor(paletteId: ColorPaletteId): BgSwatch[] {
 	const palette = COLOR_PALETTES.find((p) => p.id === paletteId);
 	const colors = palette?.colors ?? COLOR_PALETTES[0]!.colors;
-	return colors.map((p) => ({
+	// Leftmost = canvas bg: prefer Paper when present, else first chromatic.
+	const paper = colors.find((c) => hexEq(c.hex, PAPER_HEX));
+	const rest = colors.filter((c) => !hexEq(c.hex, PAPER_HEX));
+	const ordered = paper ? [paper, ...rest] : colors;
+	return ordered.map((p) => ({
 		key: p.hex,
 		hex: p.hex,
 		enabled: true
@@ -136,6 +166,27 @@ function bgHexEq(a: string | null, b: string | null): boolean {
 	return hexEq(a, b);
 }
 
+/**
+ * Paper may only sit at index 0 (canvas bg, enabled) or last (deactivated).
+ * Any other placement is corrected by appending Paper disabled at the end.
+ */
+export function normalizePaperPlacement(list: BgSwatch[]): BgSwatch[] {
+	const paperIdx = list.findIndex((s) => s.hex !== null && hexEq(s.hex, PAPER_HEX));
+	if (paperIdx < 0) return list;
+	if (paperIdx === 0) {
+		const paper = list[0]!;
+		if (paper.enabled) return list;
+		const next = list.slice();
+		next[0] = { ...paper, enabled: true };
+		return next;
+	}
+	const next = list.slice();
+	const [paper] = next.splice(paperIdx, 1);
+	if (!paper) return list;
+	next.push({ ...paper, enabled: false });
+	return next;
+}
+
 /** Enabled swatches first (order preserved), then disabled (order preserved). */
 export function partitionBgSwatches(list: BgSwatch[]): BgSwatch[] {
 	const enabled: BgSwatch[] = [];
@@ -144,7 +195,7 @@ export function partitionBgSwatches(list: BgSwatch[]): BgSwatch[] {
 		if (s.enabled) enabled.push(s);
 		else disabled.push(s);
 	}
-	return [...enabled, ...disabled];
+	return normalizePaperPlacement([...enabled, ...disabled]);
 }
 
 export { ROCK_COUNT };
@@ -256,14 +307,10 @@ class AppState {
 		let recolor: { from: string; to: string } | null = null;
 		if (typeof next === 'string') {
 			if (typeof prev === 'string') {
-				recolor = { from: next, to: prev };
+				recolor = { from: next, to: safeRockFillHex(prev, next) };
 			} else {
-				// Leaving transparent: replace rocks that had the new bg with white,
-				// or Ink when the new bg is already white.
-				recolor = {
-					from: next,
-					to: hexEq(next, PAPER_HEX) ? INK_HEX : PAPER_HEX
-				};
+				// Leaving transparent: replace rocks that matched the new bg.
+				recolor = { from: next, to: safeRockFillHex(null, next) };
 			}
 		}
 		this.bgRecolor = recolor;
@@ -307,6 +354,7 @@ class AppState {
 		next.splice(to, 0, placed);
 		this.bgSwatches = next;
 		if (opts?.deferBg) return;
+		this.bgSwatches = normalizePaperPlacement(this.bgSwatches);
 		this.ensureLeftmostEnabled();
 		const newLeft = this.bgSwatches[0]?.hex ?? null;
 		if (!bgHexEq(this.canvasBg, newLeft)) this.selectCanvasBg(newLeft);
@@ -330,6 +378,8 @@ class AppState {
 	toggleBgSwatch(index: number): boolean {
 		const swatch = this.bgSwatches[index];
 		if (!swatch) return false;
+		// Paper is background-only — never toggle rock-pool enable.
+		if (swatch.hex !== null && hexEq(swatch.hex, PAPER_HEX)) return false;
 
 		if (!swatch.enabled) {
 			const next = this.bgSwatches.slice();
@@ -373,12 +423,19 @@ class AppState {
 	}
 
 	/**
-	 * Dice: shuffle enabled swatch order (incl. bg / index 0). Disabled stay on the right.
+	 * Dice: shuffle enabled chromatic swatches only. Paper stays first+enabled
+	 * if it was bg, otherwise last+disabled. Disabled chromatics stay on the right.
 	 * Rocks keep a colorSlot index and Canvas syncs fills from the new order.
 	 */
 	shuffleRockColors() {
-		const enabled = this.bgSwatches.filter((s) => s.enabled);
-		const disabled = this.bgSwatches.filter((s) => !s.enabled);
+		const paperWasFirst =
+			this.bgSwatches[0]?.hex !== null && hexEq(this.bgSwatches[0]!.hex, PAPER_HEX);
+		const paper = this.bgSwatches.find((s) => s.hex !== null && hexEq(s.hex, PAPER_HEX));
+		const chromatic = this.bgSwatches.filter(
+			(s) => !(s.hex !== null && hexEq(s.hex, PAPER_HEX))
+		);
+		const enabled = chromatic.filter((s) => s.enabled);
+		const disabled = chromatic.filter((s) => !s.enabled);
 		if (enabled.length < 2) return;
 
 		const prevKeys = enabled.map((s) => s.key);
@@ -394,7 +451,13 @@ class AppState {
 		}
 		if (nextEnabled.every((s, i) => s.key === prevKeys[i])) return;
 
-		this.bgSwatches = [...nextEnabled, ...disabled];
+		if (paper && paperWasFirst) {
+			this.bgSwatches = [{ ...paper, enabled: true }, ...nextEnabled, ...disabled];
+		} else if (paper) {
+			this.bgSwatches = [...nextEnabled, ...disabled, { ...paper, enabled: false }];
+		} else {
+			this.bgSwatches = [...nextEnabled, ...disabled];
+		}
 		this.ensureLeftmostEnabled();
 
 		const newLeft = this.bgSwatches[0]?.hex ?? null;

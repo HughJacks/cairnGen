@@ -8,6 +8,7 @@
 		ASPECTS,
 		COLOR_PALETTES,
 		hexEq,
+		isPaperHex,
 		isRockColorExcluded,
 		PALETTE,
 		rockColorIndex,
@@ -48,6 +49,7 @@
 	const MAX_ZOOM = 4;
 	const BG_DRAG_THRESHOLD = 2;
 	const PAPER_HEX = '#FFFFFF';
+	const INK_HEX = '#101A31';
 
 	let stageW = $state(0);
 	let stageH = $state(0);
@@ -77,7 +79,38 @@
 
 	function bgSwatchTitle(hex: string | null): string {
 		if (hex === null) return 'Transparent';
+		if (isPaperHex(hex)) return 'Paper (background only)';
 		return PALETTE.find((p) => hexEq(p.hex, hex))?.name ?? hex;
+	}
+
+	function isPaperSwatch(swatch: { hex: string | null }): boolean {
+		return isPaperHex(swatch.hex);
+	}
+
+	/** Paper is bg-only: click moves it to front; no rock-pool toggle. */
+	function onPaperSwatchActivate(index: number) {
+		if (index <= 0) return;
+		app.moveBgSwatchToFront(index);
+		syncRocksFromColorSlots();
+		commitHistory();
+	}
+
+	function toggleBgSwatchAndRemap(index: number) {
+		const swatch = app.bgSwatches[index];
+		if (swatch && isPaperSwatch(swatch)) {
+			onPaperSwatchActivate(index);
+			return;
+		}
+		const activating = swatch ? !swatch.enabled : false;
+		const disabledHex = swatch?.enabled ? swatch.hex : null;
+		if (!app.toggleBgSwatch(index)) return;
+		if (
+			syncRockSlotsAfterPaletteMutation({
+				disabledHex,
+				forceRemap: activating
+			})
+		)
+			commitHistory();
 	}
 
 	function rollBgColors() {
@@ -231,18 +264,9 @@
 		return changed;
 	}
 
-	function toggleBgSwatchAndRemap(index: number) {
-		const swatch = app.bgSwatches[index];
-		const activating = swatch ? !swatch.enabled : false;
-		const disabledHex = swatch?.enabled ? swatch.hex : null;
-		if (!app.toggleBgSwatch(index)) return;
-		if (
-			syncRockSlotsAfterPaletteMutation({
-				disabledHex,
-				forceRemap: activating
-			})
-		)
-			commitHistory();
+	/** Remap rocks whose fill is Paper/Ink (or otherwise outside the chromatic pool). */
+	function coerceExcludedRockFills(): boolean {
+		return syncRockSlotsAfterPaletteMutation({ forceRemap: false });
 	}
 
 	function cacheBgSlotMids() {
@@ -272,7 +296,13 @@
 
 	function applyBgReorder(clientX: number) {
 		if (bgDragIndex === null) return;
-		const target = bgTargetIndexFromClientX(clientX);
+		let target = bgTargetIndexFromClientX(clientX);
+		const dragged = app.bgSwatches[bgDragIndex];
+		// Paper may only land at first (bg) or last (deactivated).
+		if (dragged && isPaperSwatch(dragged)) {
+			const last = app.bgSwatches.length - 1;
+			target = Math.abs(target - 0) <= Math.abs(target - last) ? 0 : last;
+		}
 		if (target === bgDragIndex) return;
 		const from = bgDragIndex;
 		bgDragIndex = target;
@@ -371,7 +401,7 @@
 	}
 
 	/** Swatches shown in a palette strip — live bgSwatches when that palette is active.
-	 *  Condensed fans never lead with Paper/white. */
+	 *  Condensed fans hide Paper and Ink (chrome only). */
 	function paletteDisplaySwatches(palette: ColorPalette, expanded: boolean): BgSwatch[] {
 		const list =
 			app.activePaletteId === palette.id
@@ -379,10 +409,10 @@
 				: (frozenSwatches[palette.id] ??
 					palette.colors.map((c) => ({ key: c.hex, hex: c.hex, enabled: true })));
 		if (expanded) return list;
-		if (list[0]?.hex && hexEq(list[0].hex, PAPER_HEX)) {
-			return [...list.slice(1), list[0]];
-		}
-		return list;
+		return list.filter(
+			(s) =>
+				s.hex !== null && !hexEq(s.hex, PAPER_HEX) && !hexEq(s.hex, INK_HEX)
+		);
 	}
 
 	function trackPaletteStrip(id: ColorPaletteId) {
@@ -720,6 +750,7 @@
 
 		if (bgFill) reapplyBg();
 		app.placedCount = placed.length;
+		coerceExcludedRockFills();
 		selectShape(null);
 		updateGhost();
 	}
@@ -2615,6 +2646,8 @@
 		};
 
 		ready = true;
+		// One-shot: strip legacy Paper/Ink rock fills before the first history snapshot.
+		coerceExcludedRockFills();
 		initHistory();
 	}
 
@@ -3184,7 +3217,11 @@
 									animate:flip={{ duration: interactive ? 320 : 0, easing: cubicOut }}
 									title={interactive ? bgSwatchTitle(swatch.hex) : undefined}
 									aria-label={interactive ? bgSwatchTitle(swatch.hex) : undefined}
-									aria-pressed={interactive ? swatch.enabled : undefined}
+									aria-pressed={interactive
+										? isPaperHex(swatch.hex)
+											? i === 0
+											: swatch.enabled
+										: undefined}
 									style:z-index={!expanded ? palette.colors.length - i : undefined}
 									style:background={interactive && i === 0 && swatch.hex
 										? `color-mix(in srgb, ${swatch.hex} 80%, transparent)`
@@ -3202,7 +3239,14 @@
 									}}
 								>
 									<span
-										class={['bg-dot', { on: interactive ? swatch.enabled : false, pale: !expanded }]}
+										class={[
+											'bg-dot',
+											{
+												on: interactive ? swatch.enabled : false,
+												'is-paper': interactive && isPaperHex(swatch.hex),
+												pale: !expanded
+											}
+										]}
 										style:background={expanded
 											? (swatch.hex ?? undefined)
 											: `color-mix(in srgb, ${swatch.hex ?? '#fff'} 42%, white)`}

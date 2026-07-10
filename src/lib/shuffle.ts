@@ -49,7 +49,7 @@ function poolsFrom(opts: ShuffleOptions): Pools {
 	return {
 		shapes: opts.shapes.length ? opts.shapes : [0],
 		sizeIndex: opts.sizeIndex,
-		colors: opts.colors.length ? opts.colors : ['#101A31']
+		colors: opts.colors.length ? opts.colors : ['#4371DB']
 	};
 }
 
