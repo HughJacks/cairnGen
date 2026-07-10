@@ -545,6 +545,12 @@ export function rotateKinematic(
 
 /** Unlock selected bodies for kinematic dragging. */
 export function beginDrag(paths: paper.Path[]) {
+	// Resample every registered body from current Paper geometry first.
+	// Stale chords (esp. after prior rotations) drift from the visible outline
+	// and show up as invisible walls during drag.
+	for (const path of [...links.keys()]) {
+		rebuildFromPath(path);
+	}
 	for (const p of paths) {
 		let link = links.get(p);
 		if (!link) {
@@ -699,9 +705,16 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 		movers.push({ path: p, link, x: link.body.position.x, y: link.body.position.y });
 	}
 
+	// Fresh Paper samples for obstacles — same oracle as pathOverlapsAny /
+	// rotate / place. Registered bodies can lag after rotation (orientation-
+	// dependent chords) and cause invisible boundaries during drag.
 	const obstacles: Matter.Body[] = [];
-	for (const [path, link] of links) {
-		if (!moving.has(path)) obstacles.push(link.body);
+	const obstaclePaths: paper.Path[] = [];
+	for (const [path] of links) {
+		if (moving.has(path)) continue;
+		obstaclePaths.push(path);
+		const b = bodyForOverlap(path);
+		if (b) obstacles.push(b);
 	}
 
 	const candidates: { x: number; y: number }[] = [];
@@ -786,10 +799,6 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 		return false;
 	}
 
-	const obstaclePaths: paper.Path[] = [];
-	for (const [path] of links) {
-		if (!moving.has(path)) obstaclePaths.push(path);
-	}
 	const paperOrigins = movers.map((m) => m.path.position.clone());
 	const moverPaths = movers.map((m) => m.path);
 
@@ -820,8 +829,8 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 		movers.some((m) => pathOverlapsAny(m.path, obstaclePaths)) ||
 		(movers.length > 1 && selectionSelfOverlaps(moverPaths));
 
-	// Registered-body nestling can leave a pose that fresh samples / Paper
-	// reject (especially after prior rotations). Ease back to a free pose.
+	// Nestling now uses the same fresh-geometry oracle as poseOverlaps, but
+	// Paper fill penetration can still disagree with Matter chords — ease back.
 	applyFrac(1);
 	let frac = 1;
 	if (poseOverlaps()) {
@@ -844,6 +853,5 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 		}
 	}
 
-	// Keep registered bodies translated with Paper; full resample happens in endDrag.
 	return true;
 }

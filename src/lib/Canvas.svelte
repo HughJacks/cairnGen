@@ -2481,6 +2481,8 @@
 		if (shapeDrag) {
 			const { paths, grabOffset } = shapeDrag;
 			moveShapesTo(paths, point, grabOffset);
+			// Keep image clips on the collision path (same as live rotate).
+			syncFillClipsForPaths(paths);
 			updateSelectionVisuals();
 			updateTipPos();
 			didDragShape = true;
