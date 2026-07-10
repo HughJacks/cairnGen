@@ -370,13 +370,19 @@
 		return new Promise<void>((resolve) => setTimeout(resolve, ms));
 	}
 
-	/** Swatches shown in a palette strip — live bgSwatches when that palette is active. */
-	function paletteDisplaySwatches(palette: ColorPalette): BgSwatch[] {
-		if (app.activePaletteId === palette.id) return app.bgSwatches;
-		return (
-			frozenSwatches[palette.id] ??
-			palette.colors.map((c) => ({ key: c.hex, hex: c.hex, enabled: true }))
-		);
+	/** Swatches shown in a palette strip — live bgSwatches when that palette is active.
+	 *  Condensed fans never lead with Paper/white. */
+	function paletteDisplaySwatches(palette: ColorPalette, expanded: boolean): BgSwatch[] {
+		const list =
+			app.activePaletteId === palette.id
+				? app.bgSwatches
+				: (frozenSwatches[palette.id] ??
+					palette.colors.map((c) => ({ key: c.hex, hex: c.hex, enabled: true })));
+		if (expanded) return list;
+		if (list[0]?.hex && hexEq(list[0].hex, PAPER_HEX)) {
+			return [...list.slice(1), list[0]];
+		}
+		return list;
 	}
 
 	function trackPaletteStrip(id: ColorPaletteId) {
@@ -3162,7 +3168,7 @@
 								}
 							}}
 						>
-							{#each paletteDisplaySwatches(palette) as swatch, i (swatch.key)}
+							{#each paletteDisplaySwatches(palette, expanded) as swatch, i (swatch.key)}
 								<!-- tabindex is only set when role=button (expanded interactive) -->
 								<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 								<div
