@@ -344,24 +344,31 @@ function buildStack(
 	}
 }
 
-/** Drop rocks that aren't meaningfully visible on the artboard. */
+/** Drop rocks with no outline sample on the artboard. */
 function cullOffCanvas(placed: paper.Path[], bounds: paper.Rectangle): paper.Path[] {
 	const kept: paper.Path[] = [];
 	for (const path of placed) {
 		const b = path.bounds;
+		let visible = false;
 		if (b.width >= 1e-6 && b.height >= 1e-6 && b.intersects(bounds)) {
-			if (bounds.contains(b.center)) {
-				kept.push(path);
-				continue;
-			}
-			const overlap = b.intersect(bounds);
-			if (overlap && overlap.width >= 1 && overlap.height >= 1) {
-				const frac = (overlap.width * overlap.height) / (b.width * b.height);
-				if (frac >= 0.2) {
-					kept.push(path);
-					continue;
+			const len = path.length;
+			if (len <= 0) {
+				visible = bounds.contains(b.center);
+			} else {
+				const n = Math.max(12, Math.min(48, Math.round(len / 10)));
+				for (let i = 0; i < n; i++) {
+					const pt = path.getPointAt((len * i) / n);
+					if (pt && bounds.contains(pt)) {
+						visible = true;
+						break;
+					}
 				}
+				if (!visible) visible = bounds.contains(path.interiorPoint);
 			}
+		}
+		if (visible) {
+			kept.push(path);
+			continue;
 		}
 		removeBody(path);
 		path.remove();

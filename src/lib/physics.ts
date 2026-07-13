@@ -161,6 +161,14 @@ export function clearBodies() {
 	links.clear();
 }
 
+/** Drop every body whose path is not in `active` (orphans still block drag). */
+export function pruneBodiesExcept(active: Iterable<paper.Path>) {
+	const keep = active instanceof Set ? active : new Set(active);
+	for (const path of [...links.keys()]) {
+		if (!keep.has(path)) removeBody(path);
+	}
+}
+
 /**
  * After Paper mutates geometry (reshape / pathData restore / rotate), rebuild
  * the Matter body so the outline matches.
@@ -548,11 +556,12 @@ export function rotateKinematic(
 	return applied;
 }
 
-/** Unlock selected bodies for kinematic dragging. */
-export function beginDrag(paths: paper.Path[]) {
-	// Resample every registered body from current Paper geometry first.
-	// Stale chords (esp. after prior rotations) drift from the visible outline
-	// and show up as invisible walls during drag.
+/** Unlock selected bodies for kinematic dragging.
+ *  `allPlaced` prunes orphan Matter bodies that are no longer on the canvas. */
+export function beginDrag(paths: paper.Path[], allPlaced?: paper.Path[]) {
+	if (allPlaced) pruneBodiesExcept(allPlaced);
+	// Resample every remaining registered body from current Paper geometry so
+	// drag nestling matches the visible outline (same chords for movers + obstacles).
 	for (const path of [...links.keys()]) {
 		rebuildFromPath(path);
 	}
@@ -710,16 +719,14 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 		movers.push({ path: p, link, x: link.body.position.x, y: link.body.position.y });
 	}
 
-	// Fresh Paper samples for obstacles — same oracle as pathOverlapsAny /
-	// rotate / place. Registered bodies can lag after rotation (orientation-
-	// dependent chords) and cause invisible boundaries during drag.
+	// Use registered bodies for both sides — beginDrag just resampled them from
+	// Paper. Fresh per-frame rebuilds can hull/inflate and invent phantom walls.
 	const obstacles: Matter.Body[] = [];
 	const obstaclePaths: paper.Path[] = [];
-	for (const [path] of links) {
+	for (const [path, link] of links) {
 		if (moving.has(path)) continue;
+		obstacles.push(link.body);
 		obstaclePaths.push(path);
-		const b = bodyForOverlap(path);
-		if (b) obstacles.push(b);
 	}
 
 	const candidates: { x: number; y: number }[] = [];
@@ -830,12 +837,22 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 		}
 	};
 
-	const poseOverlaps = () =>
-		movers.some((m) => pathOverlapsAny(m.path, obstaclePaths)) ||
-		(movers.length > 1 && selectionSelfOverlaps(moverPaths));
+	const poseOverlaps = () => {
+		// Paper-only: Matter chords can still report contact when fills only kiss,
+		// and easing back on that invents a standing gap (phantom wall).
+		if (movers.some((m) => obstaclePaths.some((o) => fillsPenetrate(m.path, o)))) {
+			return true;
+		}
+		if (movers.length <= 1) return false;
+		for (let i = 0; i < moverPaths.length; i++) {
+			for (let j = i + 1; j < moverPaths.length; j++) {
+				if (fillsPenetrate(moverPaths[i]!, moverPaths[j]!)) return true;
+			}
+		}
+		return false;
+	};
 
-	// Nestling now uses the same fresh-geometry oracle as poseOverlaps, but
-	// Paper fill penetration can still disagree with Matter chords — ease back.
+	// Nestle with registered Matter bodies, then ease back only for true Paper bites.
 	applyFrac(1);
 	let frac = 1;
 	if (poseOverlaps()) {

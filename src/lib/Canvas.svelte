@@ -1855,19 +1855,20 @@
 		return true;
 	}
 
-	/** True when enough of the rock sits on the artboard to be seen.
-	 *  A 1px edge kiss still `intersects`, but leaves an invisible collider. */
+	/** True when any part of the rock outline sits on the artboard.
+	 *  AABB `intersects` alone keeps 1px edge kisses that look invisible. */
 	function rockVisibleOnArtboard(path: paper.Path, bounds: paper.Rectangle): boolean {
 		const b = path.bounds;
 		if (b.width < 1e-6 || b.height < 1e-6) return false;
 		if (!b.intersects(bounds)) return false;
-		// Center on-canvas → clearly present.
-		if (bounds.contains(b.center)) return true;
-		const overlap = b.intersect(bounds);
-		if (!overlap || overlap.width < 1 || overlap.height < 1) return false;
-		const frac = (overlap.width * overlap.height) / (b.width * b.height);
-		// Need a real chunk on-canvas — not a sliver the eye can't pick up.
-		return frac >= 0.2;
+		const len = path.length;
+		if (len <= 0) return bounds.contains(b.center);
+		const n = Math.max(12, Math.min(48, Math.round(len / 10)));
+		for (let i = 0; i < n; i++) {
+			const pt = path.getPointAt((len * i) / n);
+			if (pt && bounds.contains(pt)) return true;
+		}
+		return bounds.contains(path.interiorPoint);
 	}
 
 	/** Drop rocks that aren't meaningfully on the artboard. They still collide
@@ -2721,7 +2722,7 @@
 					paths,
 					grabOffset: shape.position.subtract(event.point)
 				};
-				beginDrag(paths);
+				beginDrag(paths, placed);
 			} else {
 				const additive =
 					!!(event as paper.MouseEvent & { event?: MouseEvent }).event?.shiftKey || shiftHeld;
