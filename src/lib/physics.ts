@@ -243,12 +243,40 @@ function bodyFromVerts(
 ): Matter.Body | null {
 	if (verts.length < 3) return null;
 
-	const centre = Vertices.centre(verts);
-	let body: Matter.Body | undefined;
-	try {
-		body = Bodies.fromVertices(centre.x, centre.y, [verts], { ...BODY_OPTS, isStatic }, true);
-	} catch {
-		body = undefined;
+	const make = (points: Matter.Vector[]) => {
+		if (points.length < 3) return undefined;
+		const centre = Vertices.centre(points);
+		try {
+			return Bodies.fromVertices(centre.x, centre.y, [points], { ...BODY_OPTS, isStatic }, true);
+		} catch {
+			return undefined;
+		}
+	};
+
+	/** Guaranteed single-part convex body from a vertex ring. */
+	const makeHullBody = (points: Matter.Vector[]): Matter.Body | undefined => {
+		const hull = Vertices.hull(points as Matter.Vertex[]);
+		if (hull.length < 3) return undefined;
+		const fromVerts = make(hull);
+		if (fromVerts && fromVerts.parts.length <= 1) return fromVerts;
+		// fromVertices can still shard noisy near-convex rings — Body.create
+		// with the hull vertices stays one part.
+		const centre = Vertices.centre(hull);
+		return Body.create({
+			...BODY_OPTS,
+			isStatic,
+			position: centre,
+			vertices: hull
+		});
+	};
+
+	let body = make(verts);
+
+	// Near-convex samples (esp. rock 4's long flat side) often decomp into 2–3
+	// inflated shards from tiny float noise — that desyncs collision outlines
+	// from the visible fill. Prefer one convex body whenever decomp splits.
+	if (body && body.parts.length > 1) {
+		body = makeHullBody(verts) ?? body;
 	}
 
 	if ((!body || body.parts.length === 0) && allowHull) {
@@ -256,13 +284,15 @@ function bodyFromVerts(
 			console.warn('[physics] fromVertices failed; using convex hull fallback');
 			warnedHull = true;
 		}
-		const hull = Vertices.hull(verts as Matter.Vertex[]);
-		if (hull.length < 3) return null;
-		const hc = Vertices.centre(hull);
-		body = Bodies.fromVertices(hc.x, hc.y, [hull], { ...BODY_OPTS, isStatic }, true);
+		body = makeHullBody(verts);
 	}
 
 	if (!body || body.parts.length === 0) return null;
+	if (body.parts.length > 1) {
+		const hulled = makeHullBody(verts);
+		if (hulled && hulled.parts.length <= 1) body = hulled;
+	}
+
 	Body.setAngle(body, 0);
 	Body.setVelocity(body, { x: 0, y: 0 });
 	Body.setAngularVelocity(body, 0);
