@@ -1,6 +1,6 @@
 import paper from 'paper';
 import { ROCK_SIZES, type Mode } from './state.svelte';
-import { maxFreeTranslation, pathOverlapsAny, removeBody, syncBody } from './physics';
+import { maxFreeTranslation, pathOverlapsAny } from './physics';
 
 export interface ShuffleOptions {
 	mode: Mode;
@@ -130,8 +130,8 @@ function dropToRest(
 
 function commit(placed: paper.Path[], cand: paper.Path) {
 	placed.push(cand);
-	// Register immediately so later probes reuse the Matter body.
-	syncBody(cand);
+	// Bodies are registered once after generate mounts the final set — syncing
+	// mid-shuffle left orphans when candidates were later culled/replaced.
 }
 
 /** Centroid of locked (+ already placed) rocks; falls back to canvas center. */
@@ -370,7 +370,6 @@ function cullOffCanvas(placed: paper.Path[], bounds: paper.Rectangle): paper.Pat
 			kept.push(path);
 			continue;
 		}
-		removeBody(path);
 		path.remove();
 	}
 	return kept;

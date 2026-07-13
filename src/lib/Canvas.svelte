@@ -30,6 +30,7 @@
 		syncBody,
 		removeBody,
 		clearBodies,
+		resetBodies,
 		rebuildFromPath,
 		beginDrag,
 		endDrag,
@@ -2205,16 +2206,17 @@
 			removeFill(p);
 			attach.delete(p);
 			solidOnly.delete(p);
-			removeBody(p);
 			p.remove();
 		}
 		placed = locked;
 		groupParent = locked.map((_, i) => i);
 		selectShape(null);
+		// Wipe Matter entirely, then re-register only locked survivors — same
+		// hard reset undo/restore uses, so prior-layout bodies cannot linger.
+		resetBodies(locked);
 		if (!locked.length) {
 			clearFills();
 			attach.clear();
-			clearBodies();
 			rockMeta = new WeakMap();
 			solidOnly = new WeakSet();
 		} else {
@@ -2467,8 +2469,7 @@
 			obstacles: lockedPaths
 		});
 
-		// Bodies are already registered during generateShuffle so probes reuse
-		// Matter SAT; just mount paths and record meta here.
+		// Mount the new composition, then rebuild Matter from that set alone.
 		for (const rock of rocks) {
 			paper.project.activeLayer.addChild(rock);
 			placed.push(rock);
@@ -2500,11 +2501,15 @@
 			cullOffCanvasPlaced(bounds);
 		}
 
+		// Final authority after layout/cull: collision world === visible rocks.
+		resetBodies(placed);
+
 		recomputeGroups();
 		if (app.backgroundImageId || attach.size) syncFills();
 		app.placedCount = placed.length;
 		selectShape(null);
 		updateGhost();
+		paper.view.update();
 		commitHistory();
 	}
 

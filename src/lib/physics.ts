@@ -151,14 +151,16 @@ export function removeBody(path: paper.Path) {
 
 /** Drop every body (paths themselves are left alone). */
 export function clearBodies() {
-	if (!engine) {
-		links.clear();
-		return;
-	}
-	for (const link of links.values()) {
-		World.remove(engine.world, link.body);
-	}
 	links.clear();
+	if (!engine) return;
+	// World.clear drops compound parts too — safer than removing link-by-link.
+	World.clear(engine.world, false);
+}
+
+/** Replace the physics world so it matches exactly the given paths. */
+export function resetBodies(paths: Iterable<paper.Path>) {
+	clearBodies();
+	for (const path of paths) syncBody(path);
 }
 
 /** Drop every body whose path is not in `active` (orphans still block drag). */
