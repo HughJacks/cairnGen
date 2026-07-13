@@ -25,6 +25,11 @@ const NORMAL_PROBE = 2.5;
 /** Outline sample must sit at least this far inside another fill to count as
  *  overlap — keeps flush edge contact free while catching real bites. */
 const PAPER_PENETRATE = 1.25;
+/** Shrink Matter outline samples toward their centre so chord/decomp inflation
+ *  doesn't invent walls outside the visible Paper fill. */
+const COLLISION_INSET = 1.35;
+/** Max separation reconcile will try when clearing Matter-only overlaps. */
+const RECONCILE_REACH = 64;
 
 interface BodyLink {
 	body: Matter.Body;
@@ -203,7 +208,21 @@ function sampleOutline(path: paper.Path, count = SAMPLE_COUNT): Matter.Vector[] 
 		const pt = path.getPointAt((len * i) / n);
 		if (pt) pts.push({ x: pt.x, y: pt.y });
 	}
-	return pts;
+	return insetVerts(pts, COLLISION_INSET);
+}
+
+/** Pull outline samples inward so convex chords sit inside the visible fill. */
+function insetVerts(verts: Matter.Vector[], amount: number): Matter.Vector[] {
+	if (amount <= 0 || verts.length < 3) return verts;
+	const c = Vertices.centre(verts);
+	return verts.map((v) => {
+		const dx = c.x - v.x;
+		const dy = c.y - v.y;
+		const len = Math.hypot(dx, dy);
+		if (len < 1e-6) return { x: v.x, y: v.y };
+		const s = Math.min(amount, len * 0.35) / len;
+		return { x: v.x + dx * s, y: v.y + dy * s };
+	});
 }
 
 function bodyFromVerts(
@@ -345,7 +364,7 @@ export function matterFalseOverlaps(paths: paper.Path[]): {
  */
 export function reconcileRegisteredOverlaps(paths: paper.Path[]): number {
 	let fixed = 0;
-	for (let pass = 0; pass < 8; pass++) {
+	for (let pass = 0; pass < 10; pass++) {
 		let moved = false;
 		for (let i = 0; i < paths.length; i++) {
 			const a = paths[i]!;
@@ -355,39 +374,79 @@ export function reconcileRegisteredOverlaps(paths: paper.Path[]): number {
 				const b = paths[j]!;
 				const lb = links.get(b);
 				if (!lb) continue;
-				if (!bodiesCollide(la.body, lb.body)) continue;
+				const col = Collision.collides(la.body, lb.body);
+				if (!col?.collided) continue;
 				if (fillsPenetrate(a, b)) continue;
 
 				// Prefer moving the higher rock (same as export settle).
 				const mover = a.bounds.bottom < b.bounds.bottom ? a : b;
 				const other = mover === a ? b : a;
 				const link = links.get(mover)!;
-				let dir = mover.position.subtract(other.position);
-				if (dir.length < 1e-6) dir = new paper.Point(0, -1);
-				dir = dir.normalize();
+				const otherBody = links.get(other)!.body;
 
-				// Smallest translation that clears Matter contact.
-				const reach = 12;
-				let lo = 0;
-				let hi = reach;
+				// Separate along Matter contact normal when available; fall back
+				// to centres. Depth can exceed the old 12px reach after nestling.
+				let nx = col.normal.x;
+				let ny = col.normal.y;
+				if (col.bodyA === link.body) {
+					nx = -nx;
+					ny = -ny;
+				}
+				let nLen = Math.hypot(nx, ny);
+				if (nLen < 1e-6) {
+					const fallback = mover.position.subtract(other.position);
+					if (fallback.length < 1e-6) {
+						nx = 0;
+						ny = -1;
+					} else {
+						nx = fallback.x / fallback.length;
+						ny = fallback.y / fallback.length;
+					}
+					nLen = 1;
+				} else {
+					nx /= nLen;
+					ny /= nLen;
+				}
+
+				const need = Math.min(RECONCILE_REACH, Math.max(4, (col.depth ?? 2) + 3));
 				const origin = { x: link.body.position.x, y: link.body.position.y };
-				Body.setPosition(link.body, { x: origin.x + dir.x * hi, y: origin.y + dir.y * hi });
-				const clearsFar = !bodiesCollide(link.body, links.get(other)!.body);
+				Body.setPosition(link.body, {
+					x: origin.x + nx * need,
+					y: origin.y + ny * need
+				});
+				let clearsFar = !bodiesCollide(link.body, otherBody);
+				if (!clearsFar) {
+					Body.setPosition(link.body, {
+						x: origin.x + nx * RECONCILE_REACH,
+						y: origin.y + ny * RECONCILE_REACH
+					});
+					clearsFar = !bodiesCollide(link.body, otherBody);
+				}
 				Body.setPosition(link.body, origin);
-				if (!clearsFar) continue;
+				if (!clearsFar) {
+					// Last resort: rebuild denser; chord set may still kiss.
+					rebuildFromPath(mover);
+					rebuildFromPath(other);
+					if (bodiesCollide(links.get(mover)!.body, links.get(other)!.body)) continue;
+					fixed++;
+					moved = true;
+					continue;
+				}
 
-				for (let k = 0; k < 10; k++) {
+				let lo = 0;
+				let hi = need;
+				for (let k = 0; k < 12; k++) {
 					const mid = (lo + hi) / 2;
 					Body.setPosition(link.body, {
-						x: origin.x + dir.x * mid,
-						y: origin.y + dir.y * mid
+						x: origin.x + nx * mid,
+						y: origin.y + ny * mid
 					});
-					if (bodiesCollide(link.body, links.get(other)!.body)) lo = mid;
+					if (bodiesCollide(link.body, otherBody)) lo = mid;
 					else hi = mid;
 				}
 				Body.setPosition(link.body, {
-					x: origin.x + dir.x * hi,
-					y: origin.y + dir.y * hi
+					x: origin.x + nx * hi,
+					y: origin.y + ny * hi
 				});
 				link.lastX = origin.x;
 				link.lastY = origin.y;
@@ -845,7 +904,7 @@ export function beginDrag(paths: paper.Path[], allPlaced?: paper.Path[]) {
 
 /** Lock bodies again after drag ends; rebuild from Paper so rest pose matches
  *  the same samples rotate/placement use (avoids angle-dependent drift). */
-export function endDrag(paths: paper.Path[]) {
+export function endDrag(paths: paper.Path[], allPlaced?: paper.Path[]) {
 	const t0 = performance.now();
 	for (const p of paths) {
 		const link = links.get(p);
@@ -856,9 +915,12 @@ export function endDrag(paths: paper.Path[]) {
 		Body.setStatic(link.body, true);
 		rebuildFromPath(p);
 	}
+	const reconcileSet = allPlaced ?? [...links.keys()];
+	const fixed = reconcileSet.length ? reconcileRegisteredOverlaps(reconcileSet) : 0;
 	debugJson('drag:end', {
 		movers: paths.map((p, i) => pathDebugId(p, i)),
 		frames: dragFrame,
+		reconciledFalseOverlaps: fixed,
 		ms: +(performance.now() - t0).toFixed(2)
 	});
 	dragFrame = 0;
@@ -885,9 +947,10 @@ function placeMovers(movers: Mover[], ox: number, oy: number) {
 function maxFreeFrac(movers: Mover[], obstacles: Matter.Body[], dx: number, dy: number): number {
 	if (Math.abs(dx) < 1e-8 && Math.abs(dy) < 1e-8) return 0;
 
-	// If Matter already overlaps at rest (chord false-positive after generate),
-	// nestling returns 0 forever. Allow the full step and let Paper ease back.
 	placeMovers(movers, 0, 0);
+	// Residual Matter-only overlap should already be filtered from `obstacles`.
+	// If anything remains, nestling would stick at 0 — allow the step and let
+	// Paper ease-back handle true bites.
 	if (moversHitObstacles(movers, obstacles)) return 1;
 
 	placeMovers(movers, dx, dy);
@@ -905,6 +968,15 @@ function maxFreeFrac(movers: Mover[], obstacles: Matter.Body[], dx: number, dy: 
 	}
 	placeMovers(movers, 0, 0);
 	return lo;
+}
+
+/** Matter contact without Paper fill bite — ignore as a nestling wall. */
+function isGhostObstacle(movers: Mover[], obstaclePath: paper.Path, obstacleBody: Matter.Body): boolean {
+	for (const m of movers) {
+		if (!bodiesCollide(m.link.body, obstacleBody)) continue;
+		if (!fillsPenetrate(m.path, obstaclePath)) return true;
+	}
+	return false;
 }
 
 /**
@@ -1000,10 +1072,16 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 
 	// Use registered bodies for both sides — beginDrag just resampled them from
 	// Paper. Fresh per-frame rebuilds can hull/inflate and invent phantom walls.
+	// Skip Matter-only (ghost) contacts: they invent invisible walls after nestling.
 	const obstacles: Matter.Body[] = [];
 	const obstaclePaths: paper.Path[] = [];
+	let ghostSkipped = 0;
 	for (const [path, link] of links) {
 		if (moving.has(path)) continue;
+		if (isGhostObstacle(movers, path, link.body)) {
+			ghostSkipped++;
+			continue;
+		}
 		obstacles.push(link.body);
 		obstaclePaths.push(path);
 	}
@@ -1014,7 +1092,7 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 	const paperRestHit = movers.some((m) =>
 		obstaclePaths.some((o) => fillsPenetrate(m.path, o))
 	);
-	const ghostRest = matterRestHit && !paperRestHit;
+	const ghostRest = ghostSkipped > 0 || (matterRestHit && !paperRestHit);
 
 	const candidates: { x: number; y: number }[] = [];
 	const fNestle = maxFreeFrac(movers, obstacles, dx, dy);
@@ -1122,6 +1200,7 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 			best: { x: +best.x.toFixed(2), y: +best.y.toFixed(2), len: +appliedTravel.toFixed(2) },
 			paperFrac: +paperFrac.toFixed(4),
 			ghostRest,
+			ghostSkipped,
 			matterRestHit,
 			paperRestHit,
 			sticky,
