@@ -2241,7 +2241,9 @@
 			seed: app.shuffleSeed,
 			lockedKept: locked.length
 		});
-		return locked;
+		// Return a copy — `placed` aliases `locked` above; callers must not share
+		// that array or mounting new rocks will inflate "lockedPaths" and skip recenter.
+		return locked.slice();
 	}
 
 	function layerPathSummary(): { totalChildren: number; pathChildren: number } {
@@ -2500,6 +2502,7 @@
 		});
 
 		const lockedPaths = clearUnlockedPlaced();
+		const lockedCount = lockedPaths.length;
 		resetOverlay();
 
 		const bounds = viewBounds();
@@ -2511,7 +2514,7 @@
 				w: bounds.width,
 				h: bounds.height
 			},
-			lockedObstacles: lockedPaths.length,
+			lockedObstacles: lockedCount,
 			enabledShapes: [...app.enabledShapes],
 			enabledColors: [...app.enabledColors]
 		});
@@ -2574,15 +2577,30 @@
 		debugPhysicsSnapshot('shuffle:after-mount-before-reposition', placed, {
 			seed,
 			genIndex,
-			locked: lockedPaths.length
+			lockedCount,
+			willRecenter: lockedCount === 0
 		});
 
 		// Rocks were just generated at this canvas size, so anchor here without
 		// rescaling; later artboard changes will scale from this baseline.
 		// Skip recentering when locked rocks remain — it would move them.
+		// Use lockedCount (captured before mount), never lockedPaths.length —
+		// that array used to alias `placed` and grow as rocks were pushed.
 		placedArtboard = { w: bounds.width, h: bounds.height };
-		if (!lockedPaths.length) {
+		if (lockedCount === 0) {
 			repositionPlaced(bounds.width, bounds.height);
+			const u = placed.length ? unitedBounds() : null;
+			console.log('[cairn:shuffle] recentered composition', {
+				seed,
+				united: u
+					? {
+							left: +u.left.toFixed(1),
+							top: +u.top.toFixed(1),
+							w: +u.width.toFixed(1),
+							h: +u.height.toFixed(1)
+						}
+					: null
+			});
 		} else {
 			// repositionPlaced already culls; when skipped, still drop any newly
 			// generated rocks that landed fully off the current artboard.
