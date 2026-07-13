@@ -115,21 +115,28 @@ export function debugPhysicsSnapshot(
 			orphans: orphans.length,
 			missing: missing.length
 		},
+		matterFalseOverlaps: matterFalseOverlaps(placed),
 		rocks,
 		orphans: orphanDetails,
 		missing: missing.map((p, i) => pathDebugId(p, i))
 	};
 
 	console.groupCollapsed(
-		`[cairn:physics] ${label} | placed=${placed.length} links=${links.size} world.bodies=${worldBodies} orphans=${orphans.length} missing=${missing.length}`
+		`[cairn:physics] ${label} | placed=${placed.length} links=${links.size} world.bodies=${worldBodies} orphans=${orphans.length} missing=${missing.length} falseOverlaps=${summary.matterFalseOverlaps.length}`
 	);
 	console.log(summary);
-	if (orphans.length || missing.length || (worldBodies >= 0 && worldBodies > links.size)) {
+	if (
+		orphans.length ||
+		missing.length ||
+		(worldBodies >= 0 && worldBodies > links.size) ||
+		summary.matterFalseOverlaps.length
+	) {
 		console.warn('[cairn:physics] mismatch detected', {
 			orphans: orphanDetails,
 			missing: missing.map((p, i) => pathDebugId(p, i)),
 			worldBodies,
-			links: links.size
+			links: links.size,
+			matterFalseOverlaps: summary.matterFalseOverlaps
 		});
 	}
 	console.groupEnd();
@@ -263,6 +270,94 @@ export function clearBodies() {
 export function resetBodies(paths: Iterable<paper.Path>) {
 	clearBodies();
 	for (const path of paths) syncBody(path);
+}
+
+/** Pairs whose registered Matter bodies overlap while Paper fills only kiss.
+ *  Common after generate — chord samples disagree with flush nestling. */
+export function matterFalseOverlaps(paths: paper.Path[]): {
+	a: number;
+	b: number;
+	aId: string;
+	bId: string;
+}[] {
+	const out: { a: number; b: number; aId: string; bId: string }[] = [];
+	for (let i = 0; i < paths.length; i++) {
+		const a = paths[i]!;
+		const la = links.get(a);
+		if (!la) continue;
+		for (let j = i + 1; j < paths.length; j++) {
+			const b = paths[j]!;
+			const lb = links.get(b);
+			if (!lb) continue;
+			if (!bodiesCollide(la.body, lb.body)) continue;
+			if (fillsPenetrate(a, b)) continue;
+			out.push({ a: i, b: j, aId: pathDebugId(a, i), bId: pathDebugId(b, j) });
+		}
+	}
+	return out;
+}
+
+/**
+ * Nudge rocks whose Matter chords overlap without true Paper penetration so
+ * drag doesn't start already "blocked" (invisible wall until a later rebuild).
+ */
+export function reconcileRegisteredOverlaps(paths: paper.Path[]): number {
+	let fixed = 0;
+	for (let pass = 0; pass < 8; pass++) {
+		let moved = false;
+		for (let i = 0; i < paths.length; i++) {
+			const a = paths[i]!;
+			const la = links.get(a);
+			if (!la) continue;
+			for (let j = i + 1; j < paths.length; j++) {
+				const b = paths[j]!;
+				const lb = links.get(b);
+				if (!lb) continue;
+				if (!bodiesCollide(la.body, lb.body)) continue;
+				if (fillsPenetrate(a, b)) continue;
+
+				// Prefer moving the higher rock (same as export settle).
+				const mover = a.bounds.bottom < b.bounds.bottom ? a : b;
+				const other = mover === a ? b : a;
+				const link = links.get(mover)!;
+				let dir = mover.position.subtract(other.position);
+				if (dir.length < 1e-6) dir = new paper.Point(0, -1);
+				dir = dir.normalize();
+
+				// Smallest translation that clears Matter contact.
+				const reach = 12;
+				let lo = 0;
+				let hi = reach;
+				const origin = { x: link.body.position.x, y: link.body.position.y };
+				Body.setPosition(link.body, { x: origin.x + dir.x * hi, y: origin.y + dir.y * hi });
+				const clearsFar = !bodiesCollide(link.body, links.get(other)!.body);
+				Body.setPosition(link.body, origin);
+				if (!clearsFar) continue;
+
+				for (let k = 0; k < 10; k++) {
+					const mid = (lo + hi) / 2;
+					Body.setPosition(link.body, {
+						x: origin.x + dir.x * mid,
+						y: origin.y + dir.y * mid
+					});
+					if (bodiesCollide(link.body, links.get(other)!.body)) lo = mid;
+					else hi = mid;
+				}
+				Body.setPosition(link.body, {
+					x: origin.x + dir.x * hi,
+					y: origin.y + dir.y * hi
+				});
+				link.lastX = origin.x;
+				link.lastY = origin.y;
+				applyBodyToPath(mover, link);
+				rebuildFromPath(mover);
+				fixed++;
+				moved = true;
+			}
+		}
+		if (!moved) break;
+	}
+	return fixed;
 }
 
 /** Drop every body whose path is not in `active` (orphans still block drag). */
@@ -691,6 +786,12 @@ export function beginDrag(paths: paper.Path[], allPlaced?: paper.Path[]) {
 		movers: paths.map((p, i) => pathDebugId(p, i)),
 		obstacleCount: Math.max(0, links.size - paths.length)
 	});
+	if (allPlaced?.length) {
+		const fixed = reconcileRegisteredOverlaps(allPlaced);
+		if (fixed && debugPhysicsEnabled()) {
+			console.warn('[cairn:physics] beginDrag reconciled false overlaps', { fixed });
+		}
+	}
 }
 
 /** Lock bodies again after drag ends; rebuild from Paper so rest pose matches
@@ -727,6 +828,11 @@ function placeMovers(movers: Mover[], ox: number, oy: number) {
 /** Largest fraction of (dx,dy) the group can travel without penetrating obstacles. */
 function maxFreeFrac(movers: Mover[], obstacles: Matter.Body[], dx: number, dy: number): number {
 	if (Math.abs(dx) < 1e-8 && Math.abs(dy) < 1e-8) return 0;
+
+	// If Matter already overlaps at rest (chord false-positive after generate),
+	// nestling returns 0 forever. Allow the full step and let Paper ease back.
+	placeMovers(movers, 0, 0);
+	if (moversHitObstacles(movers, obstacles)) return 1;
 
 	placeMovers(movers, dx, dy);
 	const freeFull = !moversHitObstacles(movers, obstacles);

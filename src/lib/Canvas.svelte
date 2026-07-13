@@ -38,7 +38,8 @@
 		rotateKinematic,
 		pathOverlapsAny,
 		setPathTranslateHook,
-		debugPhysicsSnapshot
+		debugPhysicsSnapshot,
+		reconcileRegisteredOverlaps
 	} from './physics';
 	import { generateShuffle } from './shuffle';
 
@@ -2590,11 +2591,13 @@
 
 		// Final authority after layout/cull: collision world === visible rocks.
 		resetBodies(placed);
+		const reconciled = reconcileRegisteredOverlaps(placed);
 		debugPhysicsSnapshot('shuffle:final', placed, {
 			seed,
 			genIndex,
 			layer: layerPathSummary(),
-			note: 'If orphans>0 or world.bodies>>links, prior bodies leaked into this layout'
+			reconciledFalseOverlaps: reconciled,
+			note: 'falseOverlaps = Matter chords overlapping while Paper fills only kiss'
 		});
 
 		recomputeGroups();
