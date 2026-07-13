@@ -3291,6 +3291,17 @@
 			else app.undo();
 			return;
 		}
+		if ((event.key === 'd' || event.key === 'D') && !mod && !event.altKey) {
+			const t = event.target as HTMLElement | null;
+			if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) {
+				return;
+			}
+			const w = window as unknown as { __CAIRN_DEBUG_PHYSICS?: boolean };
+			const enabled = !w.__CAIRN_DEBUG_PHYSICS;
+			w.__CAIRN_DEBUG_PHYSICS = enabled;
+			console.log('[cairn] debug logging', enabled ? 'ON' : 'OFF');
+			return;
+		}
 		if (app.imageEditId) {
 			if (event.key === 'Escape') {
 				event.preventDefault();
