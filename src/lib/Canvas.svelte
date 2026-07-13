@@ -39,9 +39,11 @@
 		pathOverlapsAny,
 		setPathTranslateHook,
 		debugPhysicsSnapshot,
+		debugPhysicsEnabled,
 		debugJson,
 		dumpDebugEvents,
 		clearDebugEvents,
+		getCollisionDebugOutlines,
 		reconcileRegisteredOverlaps
 	} from './physics';
 	import { generateShuffle } from './shuffle';
@@ -561,6 +563,8 @@
 	const selectedPath = $derived(selectedPaths.at(-1) ?? null);
 	const multiSelected = $derived(selectedPaths.length > 1);
 	let selectionOutlines: paper.Path[] = [];
+	/** Matter collision body outlines (physics debug mode only). */
+	let collisionDebugGroup: paper.Group | null = null;
 	let ghostRaf = 0;
 	let shiftHeld = $state(false);
 
@@ -1721,6 +1725,60 @@
 		for (const outline of selectionOutlines) outline.bringToFront();
 	}
 
+	function clearCollisionDebug() {
+		if (!collisionDebugGroup) return;
+		collisionDebugGroup.removeChildren();
+		collisionDebugGroup.visible = false;
+	}
+
+	function destroyCollisionDebug() {
+		paper.view.onFrame = null as unknown as typeof paper.view.onFrame;
+		if (!collisionDebugGroup) return;
+		collisionDebugGroup.remove();
+		collisionDebugGroup = null;
+	}
+
+	function setCollisionDebugFrameLoop(on: boolean) {
+		if (on) {
+			paper.view.onFrame = () => {
+				if (!debugPhysicsEnabled()) return;
+				updateCollisionDebug();
+			};
+		} else {
+			paper.view.onFrame = null as unknown as typeof paper.view.onFrame;
+		}
+	}
+
+	function updateCollisionDebug() {
+		if (!debugPhysicsEnabled() || !ready || !paper.project) {
+			clearCollisionDebug();
+			return;
+		}
+		if (!collisionDebugGroup || !collisionDebugGroup.project) {
+			collisionDebugGroup = new paper.Group();
+			collisionDebugGroup.locked = true;
+			collisionDebugGroup.opacity = 0.9;
+			paper.project.activeLayer.addChild(collisionDebugGroup);
+		}
+		collisionDebugGroup.visible = true;
+		collisionDebugGroup.removeChildren();
+		for (const outline of getCollisionDebugOutlines()) {
+			const stroke = outline.compound ? '#00E5A8' : '#FF2BD6';
+			for (const ring of outline.rings) {
+				if (ring.length < 2) continue;
+				const path = new paper.Path(ring.map((p) => new paper.Point(p.x, p.y)));
+				path.closed = true;
+				path.fillColor = null;
+				path.strokeColor = new paper.Color(stroke);
+				path.strokeWidth = 1.25;
+				path.strokeScaling = false;
+				path.opacity = 0.9;
+				collisionDebugGroup.addChild(path);
+			}
+		}
+		collisionDebugGroup.bringToFront();
+	}
+
 	function updateSelectionOutline() {
 		for (const outline of selectionOutlines) outline.remove();
 		selectionOutlines = [];
@@ -2188,6 +2246,7 @@
 		// Pins reference instances that are about to be removed.
 		attach.clear();
 		clearBodies();
+		clearCollisionDebug();
 		for (const p of placed) p.remove();
 		placed = [];
 		groupParent = [];
@@ -2323,6 +2382,7 @@
 		ghostSuppressedUntil = 0;
 		ghost?.remove();
 		for (const outline of selectionOutlines) outline.remove();
+		destroyCollisionDebug();
 		clearMarquee();
 		clearEditGhost();
 		ghost = null;
@@ -2918,6 +2978,7 @@
 			}
 			if (ghostRaf) cancelAnimationFrame(ghostRaf);
 			setPathTranslateHook(null);
+			destroyCollisionDebug();
 			destroyWorld();
 			placed = [];
 			groupParent = [];
@@ -3299,7 +3360,14 @@
 			const w = window as unknown as { __CAIRN_DEBUG_PHYSICS?: boolean };
 			const enabled = w.__CAIRN_DEBUG_PHYSICS !== true;
 			w.__CAIRN_DEBUG_PHYSICS = enabled;
-			console.log('[cairn] debug logging', enabled ? 'ON' : 'OFF');
+			console.log('[cairn] debug logging+outlines', enabled ? 'ON' : 'OFF');
+			if (enabled) {
+				setCollisionDebugFrameLoop(true);
+				updateCollisionDebug();
+			} else {
+				setCollisionDebugFrameLoop(false);
+				clearCollisionDebug();
+			}
 			return;
 		}
 		if (app.imageEditId) {

@@ -82,6 +82,37 @@ export function clearDebugEvents(): void {
 	debugEvents.length = 0;
 }
 
+export type CollisionDebugOutline = {
+	/** World-space polygon rings for this body. */
+	rings: { x: number; y: number }[][];
+	/** True when body has multiple convex parts (decomp). */
+	compound: boolean;
+};
+
+function copyVertexRing(verts: Matter.Vector[]): { x: number; y: number }[] {
+	return verts.map((v) => ({ x: v.x, y: v.y }));
+}
+
+/** Snapshot of every registered Matter body outline (convex parts). */
+export function getCollisionDebugOutlines(): CollisionDebugOutline[] {
+	if (links.size === 0) return [];
+	const out: CollisionDebugOutline[] = [];
+	for (const { body } of links.values()) {
+		const compound = body.parts.length > 1;
+		const rings: { x: number; y: number }[][] = [];
+		if (!compound) {
+			rings.push(copyVertexRing(body.vertices));
+		} else {
+			// parts[0] is the parent hull — skip it; parts[1..] are the real collision pieces.
+			for (let i = 1; i < body.parts.length; i++) {
+				rings.push(copyVertexRing(body.parts[i]!.vertices));
+			}
+		}
+		out.push({ rings, compound });
+	}
+	return out;
+}
+
 function pathDebugId(path: paper.Path, index?: number): string {
 	const data = path.data as { rockIndex?: number; sizeIndex?: number; rotation?: number } | undefined;
 	const b = path.bounds;
