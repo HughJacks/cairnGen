@@ -36,10 +36,51 @@ let engine: Matter.Engine | null = null;
 const links = new Map<paper.Path, BodyLink>();
 let warnedHull = false;
 
-/** Opt in with `window.__CAIRN_DEBUG_PHYSICS = true` (off by default). */
+const DEBUG_RING = 400;
+const debugEvents: Record<string, unknown>[] = [];
+let dragFrame = 0;
+let lastDragLogAt = 0;
+
+/** On by default for deploy debugging. Silence with `window.__CAIRN_DEBUG_PHYSICS = false`. */
 export function debugPhysicsEnabled(): boolean {
 	if (typeof window === 'undefined') return false;
-	return (window as unknown as { __CAIRN_DEBUG_PHYSICS?: boolean }).__CAIRN_DEBUG_PHYSICS === true;
+	const flag = (window as unknown as { __CAIRN_DEBUG_PHYSICS?: boolean }).__CAIRN_DEBUG_PHYSICS;
+	return flag !== false;
+}
+
+/** Single-line raw JSON for easy copy/paste from the hosted console. */
+export function debugJson(event: string, data: Record<string, unknown> = {}): void {
+	if (!debugPhysicsEnabled()) return;
+	const entry: Record<string, unknown> = {
+		t: +performance.now().toFixed(2),
+		iso: new Date().toISOString(),
+		event,
+		...data
+	};
+	debugEvents.push(entry);
+	if (debugEvents.length > DEBUG_RING) debugEvents.shift();
+	const w = window as unknown as {
+		__cairnDebugEvents?: unknown[];
+		__cairnLastDebug?: unknown;
+	};
+	w.__cairnDebugEvents = debugEvents;
+	w.__cairnLastDebug = entry;
+	console.log(JSON.stringify(entry));
+}
+
+/** Dump the recent event ring as one JSON string (also logged). */
+export function dumpDebugEvents(): string {
+	const payload = JSON.stringify({
+		dumpedAt: new Date().toISOString(),
+		count: debugEvents.length,
+		events: debugEvents
+	});
+	console.log(payload);
+	return payload;
+}
+
+export function clearDebugEvents(): void {
+	debugEvents.length = 0;
 }
 
 function pathDebugId(path: paper.Path, index?: number): string {
@@ -70,6 +111,7 @@ export function debugPhysicsSnapshot(
 	const missing = placed.filter((p) => !links.has(p));
 	const worldBodies = engine?.world.bodies.length ?? -1;
 	const worldComposites = engine?.world.composites.length ?? -1;
+	const falseOverlaps = matterFalseOverlaps(placed);
 
 	const rocks = placed.map((path, i) => {
 		const link = links.get(path);
@@ -103,7 +145,31 @@ export function debugPhysicsSnapshot(
 			: null
 	}));
 
-	const summary = {
+	const mismatch =
+		orphans.length > 0 ||
+		missing.length > 0 ||
+		(worldBodies >= 0 && worldBodies > links.size) ||
+		falseOverlaps.length > 0;
+
+	debugJson(`physics:${label}`, {
+		...extra,
+		counts: {
+			placed: placed.length,
+			links: links.size,
+			worldBodies,
+			worldComposites,
+			orphans: orphans.length,
+			missing: missing.length,
+			falseOverlaps: falseOverlaps.length
+		},
+		matterFalseOverlaps: falseOverlaps,
+		rocks,
+		orphans: orphanDetails,
+		missing: missing.map((p, i) => pathDebugId(p, i)),
+		mismatch
+	});
+
+	(window as unknown as { __cairnLastPhysicsDebug?: unknown }).__cairnLastPhysicsDebug = {
 		label,
 		...extra,
 		counts: {
@@ -114,34 +180,11 @@ export function debugPhysicsSnapshot(
 			orphans: orphans.length,
 			missing: missing.length
 		},
-		matterFalseOverlaps: matterFalseOverlaps(placed),
+		matterFalseOverlaps: falseOverlaps,
 		rocks,
 		orphans: orphanDetails,
 		missing: missing.map((p, i) => pathDebugId(p, i))
 	};
-
-	console.groupCollapsed(
-		`[cairn:physics] ${label} | placed=${placed.length} links=${links.size} world.bodies=${worldBodies} orphans=${orphans.length} missing=${missing.length} falseOverlaps=${summary.matterFalseOverlaps.length}`
-	);
-	console.log(summary);
-	if (
-		orphans.length ||
-		missing.length ||
-		(worldBodies >= 0 && worldBodies > links.size) ||
-		summary.matterFalseOverlaps.length
-	) {
-		console.warn('[cairn:physics] mismatch detected', {
-			orphans: orphanDetails,
-			missing: missing.map((p, i) => pathDebugId(p, i)),
-			worldBodies,
-			links: links.size,
-			matterFalseOverlaps: summary.matterFalseOverlaps
-		});
-	}
-	console.groupEnd();
-
-	// Last snapshot for easy copy/paste from the console.
-	(window as unknown as { __cairnLastPhysicsDebug?: unknown }).__cairnLastPhysicsDebug = summary;
 }
 
 /** Called after Paper geometry is translated by physics so snap sample caches stay valid. */
@@ -757,6 +800,9 @@ export function rotateKinematic(
 /** Unlock selected bodies for kinematic dragging.
  *  `allPlaced` prunes orphan Matter bodies that are no longer on the canvas. */
 export function beginDrag(paths: paper.Path[], allPlaced?: paper.Path[]) {
+	dragFrame = 0;
+	lastDragLogAt = 0;
+	const t0 = performance.now();
 	if (allPlaced) pruneBodiesExcept(allPlaced);
 	debugPhysicsSnapshot('beginDrag:before-rebuild', allPlaced ?? paths, {
 		movers: paths.length
@@ -785,17 +831,22 @@ export function beginDrag(paths: paper.Path[], allPlaced?: paper.Path[]) {
 		movers: paths.map((p, i) => pathDebugId(p, i)),
 		obstacleCount: Math.max(0, links.size - paths.length)
 	});
+	let fixed = 0;
 	if (allPlaced?.length) {
-		const fixed = reconcileRegisteredOverlaps(allPlaced);
-		if (fixed && debugPhysicsEnabled()) {
-			console.warn('[cairn:physics] beginDrag reconciled false overlaps', { fixed });
-		}
+		fixed = reconcileRegisteredOverlaps(allPlaced);
 	}
+	debugJson('drag:begin', {
+		movers: paths.map((p, i) => pathDebugId(p, i)),
+		obstacleCount: Math.max(0, links.size - paths.length),
+		reconciledFalseOverlaps: fixed,
+		ms: +(performance.now() - t0).toFixed(2)
+	});
 }
 
 /** Lock bodies again after drag ends; rebuild from Paper so rest pose matches
  *  the same samples rotate/placement use (avoids angle-dependent drift). */
 export function endDrag(paths: paper.Path[]) {
+	const t0 = performance.now();
 	for (const p of paths) {
 		const link = links.get(p);
 		if (!link) continue;
@@ -805,6 +856,12 @@ export function endDrag(paths: paper.Path[]) {
 		Body.setStatic(link.body, true);
 		rebuildFromPath(p);
 	}
+	debugJson('drag:end', {
+		movers: paths.map((p, i) => pathDebugId(p, i)),
+		frames: dragFrame,
+		ms: +(performance.now() - t0).toFixed(2)
+	});
+	dragFrame = 0;
 }
 
 type Mover = { path: paper.Path; link: BodyLink; x: number; y: number };
@@ -918,14 +975,20 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 	if (!engine || paths.length === 0) return false;
 	if (delta.length < 1e-6) return true;
 
+	const t0 = performance.now();
+	dragFrame += 1;
+
 	let dx = delta.x;
 	let dy = delta.y;
-	const travel = Math.hypot(dx, dy);
-	if (travel > MAX_FRAME_TRAVEL) {
-		const s = MAX_FRAME_TRAVEL / travel;
+	const wantTravel = Math.hypot(dx, dy);
+	let capped = false;
+	if (wantTravel > MAX_FRAME_TRAVEL) {
+		const s = MAX_FRAME_TRAVEL / wantTravel;
 		dx *= s;
 		dy *= s;
+		capped = true;
 	}
+	const travel = Math.hypot(dx, dy);
 
 	const movers: Mover[] = [];
 	const moving = new Set(paths);
@@ -945,12 +1008,21 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 		obstaclePaths.push(path);
 	}
 
+	// Ghost: Matter already overlaps at rest while Paper fills only kiss.
+	placeMovers(movers, 0, 0);
+	const matterRestHit = moversHitObstacles(movers, obstacles);
+	const paperRestHit = movers.some((m) =>
+		obstaclePaths.some((o) => fillsPenetrate(m.path, o))
+	);
+	const ghostRest = matterRestHit && !paperRestHit;
+
 	const candidates: { x: number; y: number }[] = [];
 	const fNestle = maxFreeFrac(movers, obstacles, dx, dy);
 	const nestX = dx * fNestle;
 	const nestY = dy * fNestle;
 	candidates.push({ x: nestX, y: nestY });
 
+	let usedSlide = false;
 	if (fNestle < 0.999) {
 		const remainX = dx - nestX;
 		const remainY = dy - nestY;
@@ -964,6 +1036,7 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 			const slideX = tangent.tx * along * SLIDE_GAIN;
 			const slideY = tangent.ty * along * SLIDE_GAIN;
 			if (Math.abs(slideX) > 1e-4 || Math.abs(slideY) > 1e-4) {
+				usedSlide = true;
 				placeMovers(movers, nestX, nestY);
 				const fromNest = movers.map((m) => ({
 					...m,
@@ -1022,8 +1095,46 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 		}
 	}
 
+	const appliedTravel = Math.hypot(best.x, best.y);
+	const sticky = travel > 1 && appliedTravel < 0.25;
+
+	const finishLog = (result: 'moved' | 'blocked' | 'eased-out', paperFrac = 1) => {
+		const ms = performance.now() - t0;
+		const now = performance.now();
+		const interesting =
+			ghostRest ||
+			sticky ||
+			matterRestHit ||
+			paperRestHit ||
+			result !== 'moved' ||
+			fNestle < 0.5 ||
+			ms > 8 ||
+			capped;
+		if (!interesting) return;
+		if (now - lastDragLogAt < 45 && dragFrame > 3 && ms <= 12 && !ghostRest) return;
+		lastDragLogAt = now;
+		debugJson('drag:frame', {
+			frame: dragFrame,
+			result,
+			want: { x: +delta.x.toFixed(2), y: +delta.y.toFixed(2), len: +wantTravel.toFixed(2) },
+			step: { x: +dx.toFixed(2), y: +dy.toFixed(2), len: +travel.toFixed(2), capped },
+			fNestle: +fNestle.toFixed(4),
+			best: { x: +best.x.toFixed(2), y: +best.y.toFixed(2), len: +appliedTravel.toFixed(2) },
+			paperFrac: +paperFrac.toFixed(4),
+			ghostRest,
+			matterRestHit,
+			paperRestHit,
+			sticky,
+			usedSlide,
+			movers: movers.length,
+			obstacles: obstacles.length,
+			ms: +ms.toFixed(2)
+		});
+	};
+
 	if (Math.abs(best.x) < 1e-4 && Math.abs(best.y) < 1e-4) {
 		placeMovers(movers, 0, 0);
+		finishLog('blocked');
 		return false;
 	}
 
@@ -1083,13 +1194,18 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 		}
 		frac = lo;
 		resetPose();
-		if (frac < 1e-4) return false;
+		if (frac < 1e-4) {
+			finishLog('eased-out', 0);
+			return false;
+		}
 		applyFrac(frac);
 		if (poseOverlaps()) {
 			resetPose();
+			finishLog('eased-out', frac);
 			return false;
 		}
 	}
 
+	finishLog('moved', frac);
 	return true;
 }

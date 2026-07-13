@@ -39,7 +39,9 @@
 		pathOverlapsAny,
 		setPathTranslateHook,
 		debugPhysicsSnapshot,
-		debugPhysicsEnabled,
+		debugJson,
+		dumpDebugEvents,
+		clearDebugEvents,
 		reconcileRegisteredOverlaps
 	} from './physics';
 	import { generateShuffle } from './shuffle';
@@ -2204,14 +2206,12 @@
 	function clearUnlockedPlaced(): paper.Path[] {
 		const locked = placed.filter(isLocked);
 		const unlocked = placed.filter((p) => !isLocked(p));
-		if (debugPhysicsEnabled()) {
-			console.log('[cairn:shuffle] clearUnlockedPlaced:before', {
-				seed: app.shuffleSeed,
-				placed: placed.length,
-				locked: locked.length,
-				unlocked: unlocked.length
-			});
-		}
+		debugJson('shuffle:clearUnlockedPlaced:before', {
+			seed: app.shuffleSeed,
+			placed: placed.length,
+			locked: locked.length,
+			unlocked: unlocked.length
+		});
 		debugPhysicsSnapshot('shuffle:before-clear', placed, {
 			seed: app.shuffleSeed,
 			locked: locked.length,
@@ -2492,40 +2492,29 @@
 		if (!ready) return;
 		const seed = app.shuffleSeed;
 		const genIndex = seed; // seed increments per click; 1 = first, 2 = second
-		const debug = debugPhysicsEnabled();
-		if (debug) {
-			console.group(`[cairn:shuffle] generate #${genIndex} seed=${seed} mode=${app.mode}`);
-			console.log('[cairn:shuffle] start', {
-				genIndex,
-				seed,
-				mode: app.mode,
-				sizeIndex: app.sizeIndex,
-				aspect: app.aspect,
-				artboard: { w: artboard.w, h: artboard.h },
-				layer: layerPathSummary(),
-				placedBefore: placed.length
-			});
-		}
+		debugJson('shuffle:start', {
+			genIndex,
+			seed,
+			mode: app.mode,
+			sizeIndex: app.sizeIndex,
+			aspect: app.aspect,
+			artboard: { w: artboard.w, h: artboard.h },
+			layer: layerPathSummary(),
+			placedBefore: placed.length
+		});
 
 		const lockedPaths = clearUnlockedPlaced();
 		const lockedCount = lockedPaths.length;
 		resetOverlay();
 
 		const bounds = viewBounds();
-		if (debug) {
-			console.log('[cairn:shuffle] generating', {
-				seed,
-				bounds: {
-					x: bounds.x,
-					y: bounds.y,
-					w: bounds.width,
-					h: bounds.height
-				},
-				lockedObstacles: lockedCount,
-				enabledShapes: [...app.enabledShapes],
-				enabledColors: [...app.enabledColors]
-			});
-		}
+		debugJson('shuffle:generating', {
+			seed,
+			bounds: { x: bounds.x, y: bounds.y, w: bounds.width, h: bounds.height },
+			lockedObstacles: lockedCount,
+			enabledShapes: [...app.enabledShapes],
+			enabledColors: [...app.enabledColors]
+		});
 
 		const rocks = generateShuffle(sourcePaths, bounds, {
 			mode: app.mode,
@@ -2535,34 +2524,32 @@
 			seed,
 			obstacles: lockedPaths
 		});
-		if (debug) {
-			console.log('[cairn:shuffle] generated paths', {
-				seed,
-				count: rocks.length,
-				rocks: rocks.map((r, i) => {
-					const data = r.data as {
-						rockIndex?: number;
-						sizeIndex?: number;
-						rotation?: number;
-					};
-					const b = r.bounds;
-					return {
-						i,
-						rockIndex: data?.rockIndex,
-						sizeIndex: data?.sizeIndex,
-						rotation: data?.rotation !== undefined ? +data.rotation.toFixed(1) : null,
-						pos: { x: +r.position.x.toFixed(1), y: +r.position.y.toFixed(1) },
-						bounds: {
-							left: +b.left.toFixed(1),
-							top: +b.top.toFixed(1),
-							w: +b.width.toFixed(1),
-							h: +b.height.toFixed(1)
-						},
-						onArtboard: rockVisibleOnArtboard(r, bounds)
-					};
-				})
-			});
-		}
+		debugJson('shuffle:generated', {
+			seed,
+			count: rocks.length,
+			rocks: rocks.map((r, i) => {
+				const data = r.data as {
+					rockIndex?: number;
+					sizeIndex?: number;
+					rotation?: number;
+				};
+				const b = r.bounds;
+				return {
+					i,
+					rockIndex: data?.rockIndex,
+					sizeIndex: data?.sizeIndex,
+					rotation: data?.rotation !== undefined ? +data.rotation.toFixed(1) : null,
+					pos: { x: +r.position.x.toFixed(1), y: +r.position.y.toFixed(1) },
+					bounds: {
+						left: +b.left.toFixed(1),
+						top: +b.top.toFixed(1),
+						w: +b.width.toFixed(1),
+						h: +b.height.toFixed(1)
+					},
+					onArtboard: rockVisibleOnArtboard(r, bounds)
+				};
+			})
+		});
 
 		// Mount the new composition, then rebuild Matter from that set alone.
 		for (const rock of rocks) {
@@ -2599,20 +2586,18 @@
 		placedArtboard = { w: bounds.width, h: bounds.height };
 		if (lockedCount === 0) {
 			repositionPlaced(bounds.width, bounds.height);
-			if (debug) {
-				const u = placed.length ? unitedBounds() : null;
-				console.log('[cairn:shuffle] recentered composition', {
-					seed,
-					united: u
-						? {
-								left: +u.left.toFixed(1),
-								top: +u.top.toFixed(1),
-								w: +u.width.toFixed(1),
-								h: +u.height.toFixed(1)
-							}
-						: null
-				});
-			}
+			const u = placed.length ? unitedBounds() : null;
+			debugJson('shuffle:recentered', {
+				seed,
+				united: u
+					? {
+							left: +u.left.toFixed(1),
+							top: +u.top.toFixed(1),
+							w: +u.width.toFixed(1),
+							h: +u.height.toFixed(1)
+						}
+					: null
+			});
 		} else {
 			// repositionPlaced already culls; when skipped, still drop any newly
 			// generated rocks that landed fully off the current artboard.
@@ -2637,15 +2622,12 @@
 		updateGhost();
 		paper.view.update();
 		commitHistory();
-		if (debug) {
-			console.log('[cairn:shuffle] done', {
-				seed,
-				genIndex,
-				placed: placed.length,
-				layer: layerPathSummary()
-			});
-			console.groupEnd();
-		}
+		debugJson('shuffle:done', {
+			seed,
+			genIndex,
+			placed: placed.length,
+			layer: layerPathSummary()
+		});
 	}
 
 	function placeRock(point: paper.Point) {
@@ -2796,12 +2778,17 @@
 			__bg: () => unknown;
 			__CAIRN_DEBUG_PHYSICS?: boolean;
 			__cairnDumpPhysics?: () => void;
+			__cairnDumpDebug?: () => string;
+			__cairnClearDebug?: () => void;
 		};
+		if (w.__CAIRN_DEBUG_PHYSICS === undefined) w.__CAIRN_DEBUG_PHYSICS = true;
 		w.__cairnDumpPhysics = () =>
 			debugPhysicsSnapshot('manual-dump', placed, {
 				seed: app.shuffleSeed,
 				layer: layerPathSummary()
 			});
+		w.__cairnDumpDebug = () => dumpDebugEvents();
+		w.__cairnClearDebug = () => clearDebugEvents();
 		w.__paper = paper;
 		w.__bg = () =>
 			bgFill
