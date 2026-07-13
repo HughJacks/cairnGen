@@ -2748,13 +2748,13 @@
 	function handleViewUp() {
 		if (imageDrag && didDragImage && !app.imageEditId) commitHistory();
 		if (shapeDrag && didDragShape) {
-			endDrag(shapeDrag.paths, placed);
+			endDrag(shapeDrag.paths);
 			finalizeShapeTransform();
 			cullOffCanvasPlaced();
 			updateTipPos();
 			commitHistory();
 		} else if (shapeDrag) {
-			endDrag(shapeDrag.paths, placed);
+			endDrag(shapeDrag.paths);
 		}
 		if (marqueeDrag && didDragMarquee && marqueePath) {
 			applyMarqueeSelection(marqueePath.bounds, marqueeDrag.additive, marqueeDrag.baseline);
