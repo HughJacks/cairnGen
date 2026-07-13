@@ -36,6 +36,108 @@ let engine: Matter.Engine | null = null;
 const links = new Map<paper.Path, BodyLink>();
 let warnedHull = false;
 
+/** Toggle with `window.__CAIRN_DEBUG_PHYSICS = false` to silence. */
+function debugPhysicsEnabled(): boolean {
+	if (typeof window === 'undefined') return false;
+	const flag = (window as unknown as { __CAIRN_DEBUG_PHYSICS?: boolean }).__CAIRN_DEBUG_PHYSICS;
+	return flag !== false;
+}
+
+function pathDebugId(path: paper.Path, index?: number): string {
+	const data = path.data as { rockIndex?: number; sizeIndex?: number; rotation?: number } | undefined;
+	const b = path.bounds;
+	const parts = [
+		index !== undefined ? `#${index}` : null,
+		data?.rockIndex !== undefined ? `rock${data.rockIndex}` : null,
+		data?.sizeIndex !== undefined ? `sz${data.sizeIndex}` : null,
+		`pos(${path.position.x.toFixed(1)},${path.position.y.toFixed(1)})`,
+		`bounds(${b.left.toFixed(1)},${b.top.toFixed(1)},${b.width.toFixed(1)}x${b.height.toFixed(1)})`,
+		path.visible === false ? 'hiddenPath' : null
+	];
+	return parts.filter(Boolean).join(' ');
+}
+
+/** Snapshot Matter links vs placed rocks for phantom-collision debugging. */
+export function debugPhysicsSnapshot(
+	label: string,
+	placed: paper.Path[],
+	extra?: Record<string, unknown>
+): void {
+	if (!debugPhysicsEnabled()) return;
+
+	const placedSet = new Set(placed);
+	const linkPaths = [...links.keys()];
+	const orphans = linkPaths.filter((p) => !placedSet.has(p));
+	const missing = placed.filter((p) => !links.has(p));
+	const worldBodies = engine?.world.bodies.length ?? -1;
+	const worldComposites = engine?.world.composites.length ?? -1;
+
+	const rocks = placed.map((path, i) => {
+		const link = links.get(path);
+		const body = link?.body;
+		const dx = body ? body.position.x - path.position.x : null;
+		const dy = body ? body.position.y - path.position.y : null;
+		return {
+			id: pathDebugId(path, i),
+			hasBody: !!body,
+			bodyPos: body
+				? { x: +body.position.x.toFixed(2), y: +body.position.y.toFixed(2) }
+				: null,
+			pathPos: { x: +path.position.x.toFixed(2), y: +path.position.y.toFixed(2) },
+			bodyMinusPath:
+				dx !== null && dy !== null
+					? { x: +dx.toFixed(2), y: +dy.toFixed(2) }
+					: null,
+			parts: body?.parts.length ?? 0,
+			inProject: !!path.project
+		};
+	});
+
+	const orphanDetails = orphans.map((path) => ({
+		id: pathDebugId(path),
+		inProject: !!path.project,
+		bodyPos: links.get(path)
+			? {
+					x: +links.get(path)!.body.position.x.toFixed(2),
+					y: +links.get(path)!.body.position.y.toFixed(2)
+				}
+			: null
+	}));
+
+	const summary = {
+		label,
+		...extra,
+		counts: {
+			placed: placed.length,
+			links: links.size,
+			worldBodies,
+			worldComposites,
+			orphans: orphans.length,
+			missing: missing.length
+		},
+		rocks,
+		orphans: orphanDetails,
+		missing: missing.map((p, i) => pathDebugId(p, i))
+	};
+
+	console.groupCollapsed(
+		`[cairn:physics] ${label} | placed=${placed.length} links=${links.size} world.bodies=${worldBodies} orphans=${orphans.length} missing=${missing.length}`
+	);
+	console.log(summary);
+	if (orphans.length || missing.length || (worldBodies >= 0 && worldBodies > links.size)) {
+		console.warn('[cairn:physics] mismatch detected', {
+			orphans: orphanDetails,
+			missing: missing.map((p, i) => pathDebugId(p, i)),
+			worldBodies,
+			links: links.size
+		});
+	}
+	console.groupEnd();
+
+	// Last snapshot for easy copy/paste from the console.
+	(window as unknown as { __cairnLastPhysicsDebug?: unknown }).__cairnLastPhysicsDebug = summary;
+}
+
 /** Called after Paper geometry is translated by physics so snap sample caches stay valid. */
 let onPathTranslated: ((path: paper.Path) => void) | null = null;
 
@@ -562,6 +664,9 @@ export function rotateKinematic(
  *  `allPlaced` prunes orphan Matter bodies that are no longer on the canvas. */
 export function beginDrag(paths: paper.Path[], allPlaced?: paper.Path[]) {
 	if (allPlaced) pruneBodiesExcept(allPlaced);
+	debugPhysicsSnapshot('beginDrag:before-rebuild', allPlaced ?? paths, {
+		movers: paths.length
+	});
 	// Resample every remaining registered body from current Paper geometry so
 	// drag nestling matches the visible outline (same chords for movers + obstacles).
 	for (const path of [...links.keys()]) {
@@ -582,6 +687,10 @@ export function beginDrag(paths: paper.Path[], allPlaced?: paper.Path[]) {
 		link.lastX = link.body.position.x;
 		link.lastY = link.body.position.y;
 	}
+	debugPhysicsSnapshot('beginDrag:after-rebuild', allPlaced ?? paths, {
+		movers: paths.map((p, i) => pathDebugId(p, i)),
+		obstacleCount: Math.max(0, links.size - paths.length)
+	});
 }
 
 /** Lock bodies again after drag ends; rebuild from Paper so rest pose matches

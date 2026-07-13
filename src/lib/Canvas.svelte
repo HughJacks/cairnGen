@@ -37,7 +37,8 @@
 		moveKinematic,
 		rotateKinematic,
 		pathOverlapsAny,
-		setPathTranslateHook
+		setPathTranslateHook,
+		debugPhysicsSnapshot
 	} from './physics';
 	import { generateShuffle } from './shuffle';
 
@@ -2200,8 +2201,19 @@
 	/** Remove unlocked rocks only; return survivors that stay through generate. */
 	function clearUnlockedPlaced(): paper.Path[] {
 		const locked = placed.filter(isLocked);
-		cancelSlamAnimations();
 		const unlocked = placed.filter((p) => !isLocked(p));
+		console.log('[cairn:shuffle] clearUnlockedPlaced:before', {
+			seed: app.shuffleSeed,
+			placed: placed.length,
+			locked: locked.length,
+			unlocked: unlocked.length
+		});
+		debugPhysicsSnapshot('shuffle:before-clear', placed, {
+			seed: app.shuffleSeed,
+			locked: locked.length,
+			unlocked: unlocked.length
+		});
+		cancelSlamAnimations();
 		for (const p of unlocked) {
 			removeFill(p);
 			attach.delete(p);
@@ -2224,7 +2236,23 @@
 			syncFills();
 		}
 		app.placedCount = placed.length;
+		debugPhysicsSnapshot('shuffle:after-clear', placed, {
+			seed: app.shuffleSeed,
+			lockedKept: locked.length
+		});
 		return locked;
+	}
+
+	function layerPathSummary(): { totalChildren: number; pathChildren: number } {
+		if (!ready || !paper.project?.activeLayer) {
+			return { totalChildren: 0, pathChildren: 0 };
+		}
+		const children = paper.project.activeLayer.children;
+		let pathChildren = 0;
+		for (const child of children) {
+			if (child instanceof paper.Path) pathChildren++;
+		}
+		return { totalChildren: children.length, pathChildren };
 	}
 
 	function resetOverlay() {
@@ -2456,17 +2484,70 @@
 
 	function runShuffle() {
 		if (!ready) return;
+		const seed = app.shuffleSeed;
+		const genIndex = seed; // seed increments per click; 1 = first, 2 = second
+		console.group(`[cairn:shuffle] generate #${genIndex} seed=${seed} mode=${app.mode}`);
+		console.log('[cairn:shuffle] start', {
+			genIndex,
+			seed,
+			mode: app.mode,
+			sizeIndex: app.sizeIndex,
+			aspect: app.aspect,
+			artboard: { w: artboard.w, h: artboard.h },
+			layer: layerPathSummary(),
+			placedBefore: placed.length
+		});
+
 		const lockedPaths = clearUnlockedPlaced();
 		resetOverlay();
 
 		const bounds = viewBounds();
+		console.log('[cairn:shuffle] generating', {
+			seed,
+			bounds: {
+				x: bounds.x,
+				y: bounds.y,
+				w: bounds.width,
+				h: bounds.height
+			},
+			lockedObstacles: lockedPaths.length,
+			enabledShapes: [...app.enabledShapes],
+			enabledColors: [...app.enabledColors]
+		});
+
 		const rocks = generateShuffle(sourcePaths, bounds, {
 			mode: app.mode,
 			colors: app.enabledColors,
 			shapes: app.enabledShapes,
 			sizeIndex: app.sizeIndex,
-			seed: app.shuffleSeed,
+			seed,
 			obstacles: lockedPaths
+		});
+		console.log('[cairn:shuffle] generated paths', {
+			seed,
+			count: rocks.length,
+			rocks: rocks.map((r, i) => {
+				const data = r.data as {
+					rockIndex?: number;
+					sizeIndex?: number;
+					rotation?: number;
+				};
+				const b = r.bounds;
+				return {
+					i,
+					rockIndex: data?.rockIndex,
+					sizeIndex: data?.sizeIndex,
+					rotation: data?.rotation !== undefined ? +data.rotation.toFixed(1) : null,
+					pos: { x: +r.position.x.toFixed(1), y: +r.position.y.toFixed(1) },
+					bounds: {
+						left: +b.left.toFixed(1),
+						top: +b.top.toFixed(1),
+						w: +b.width.toFixed(1),
+						h: +b.height.toFixed(1)
+					},
+					onArtboard: rockVisibleOnArtboard(r, bounds)
+				};
+			})
 		});
 
 		// Mount the new composition, then rebuild Matter from that set alone.
@@ -2489,6 +2570,12 @@
 			});
 		}
 
+		debugPhysicsSnapshot('shuffle:after-mount-before-reposition', placed, {
+			seed,
+			genIndex,
+			locked: lockedPaths.length
+		});
+
 		// Rocks were just generated at this canvas size, so anchor here without
 		// rescaling; later artboard changes will scale from this baseline.
 		// Skip recentering when locked rocks remain — it would move them.
@@ -2503,6 +2590,12 @@
 
 		// Final authority after layout/cull: collision world === visible rocks.
 		resetBodies(placed);
+		debugPhysicsSnapshot('shuffle:final', placed, {
+			seed,
+			genIndex,
+			layer: layerPathSummary(),
+			note: 'If orphans>0 or world.bodies>>links, prior bodies leaked into this layout'
+		});
 
 		recomputeGroups();
 		if (app.backgroundImageId || attach.size) syncFills();
@@ -2511,6 +2604,13 @@
 		updateGhost();
 		paper.view.update();
 		commitHistory();
+		console.log('[cairn:shuffle] done', {
+			seed,
+			genIndex,
+			placed: placed.length,
+			layer: layerPathSummary()
+		});
+		console.groupEnd();
 	}
 
 	function placeRock(point: paper.Point) {
@@ -2656,8 +2756,20 @@
 		paper.setup(canvasEl);
 		createWorld();
 		setPathTranslateHook((path) => invalidateSamples(path));
-		(window as unknown as { __paper: typeof paper; __bg: () => unknown }).__paper = paper;
-		(window as unknown as { __bg: () => unknown }).__bg = () =>
+		const w = window as unknown as {
+			__paper: typeof paper;
+			__bg: () => unknown;
+			__CAIRN_DEBUG_PHYSICS?: boolean;
+			__cairnDumpPhysics?: () => void;
+		};
+		if (w.__CAIRN_DEBUG_PHYSICS === undefined) w.__CAIRN_DEBUG_PHYSICS = true;
+		w.__cairnDumpPhysics = () =>
+			debugPhysicsSnapshot('manual-dump', placed, {
+				seed: app.shuffleSeed,
+				layer: layerPathSummary()
+			});
+		w.__paper = paper;
+		w.__bg = () =>
 			bgFill
 				? {
 						groupCount: bgFill.groups.length,
