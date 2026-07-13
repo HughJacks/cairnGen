@@ -877,6 +877,63 @@ function isGhostObstacle(movers: Mover[], obstaclePath: paper.Path, obstacleBody
 }
 
 /**
+ * Paper free-fraction along (dx,dy). Skips sample-cache invalidation during probes
+ * so reverse-ghost checks stay cheap.
+ */
+function paperFreeFrac(
+	movers: Mover[],
+	paperObstacles: paper.Path[],
+	dx: number,
+	dy: number
+): number {
+	if (Math.abs(dx) < 1e-8 && Math.abs(dy) < 1e-8) return 0;
+	const origins = movers.map((m) => m.path.position.clone());
+	const moverPaths = movers.map((m) => m.path);
+
+	const reset = () => {
+		for (let i = 0; i < movers.length; i++) movers[i]!.path.position = origins[i]!;
+	};
+	const apply = (frac: number) => {
+		for (let i = 0; i < movers.length; i++) {
+			movers[i]!.path.position = origins[i]!.add(new paper.Point(dx * frac, dy * frac));
+		}
+	};
+	const hits = () => {
+		for (const m of movers) {
+			for (const o of paperObstacles) {
+				if (fillsPenetrate(m.path, o)) return true;
+			}
+		}
+		if (movers.length <= 1) return false;
+		for (let i = 0; i < moverPaths.length; i++) {
+			for (let j = i + 1; j < moverPaths.length; j++) {
+				if (fillsPenetrate(moverPaths[i]!, moverPaths[j]!)) return true;
+			}
+		}
+		return false;
+	};
+
+	if (hits()) return 0;
+	apply(1);
+	if (!hits()) {
+		reset();
+		return 1;
+	}
+	reset();
+
+	let lo = 0;
+	let hi = 1;
+	for (let i = 0; i < 8; i++) {
+		const mid = (lo + hi) / 2;
+		apply(mid);
+		if (hits()) hi = mid;
+		else lo = mid;
+		reset();
+	}
+	return lo;
+}
+
+/**
  * Probe slightly into the blocked push to read a Matter contact normal, then
  * return a unit tangent aligned with the remaining drag (for edge sliding).
  */
@@ -988,13 +1045,25 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 	const ghostRest = ghostSkipped > 0;
 
 	const candidates: { x: number; y: number }[] = [];
-	const fNestle = maxFreeFrac(movers, obstacles, dx, dy);
+	let fNestle = maxFreeFrac(movers, obstacles, dx, dy);
+	// Reverse ghost: Matter is flush-blocked while Paper still has room (chord
+	// inflation / body mismatch). One Paper probe avoids a zero-travel frame.
+	let usedPaperOverride = false;
+	if (fNestle < 0.02 && travel > 0.5) {
+		const fPaper = paperFreeFrac(movers, paperObstacles, dx, dy);
+		if (fPaper > fNestle + 1e-4) {
+			fNestle = fPaper;
+			usedPaperOverride = true;
+		}
+	}
 	const nestX = dx * fNestle;
 	const nestY = dy * fNestle;
 	candidates.push({ x: nestX, y: nestY });
 
 	let usedSlide = false;
-	if (fNestle < 0.999) {
+	// Only Matter-slide when Matter itself nestled — Paper-override means the
+	// Matter contact normal is untrustworthy for tangential slides.
+	if (fNestle < 0.999 && !usedPaperOverride) {
 		const remainX = dx - nestX;
 		const remainY = dy - nestY;
 
@@ -1046,21 +1115,17 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 		placeMovers(movers, 0, 0);
 	}
 
-	let best = candidates[0]!;
-	let bestScore = -1;
 	const targetLen2 = dx * dx + dy * dy;
-	for (const c of candidates) {
-		const score = (c.x * dx + c.y * dy) / Math.max(targetLen2, 1e-8);
-		if (
-			score > bestScore + 1e-6 ||
-			(Math.abs(score - bestScore) < 1e-6 &&
-				c.x * c.x + c.y * c.y > best.x * best.x + best.y * best.y)
-		) {
-			best = c;
-			bestScore = score;
-		}
-	}
+	const ranked = candidates
+		.map((c) => ({
+			c,
+			score: (c.x * dx + c.y * dy) / Math.max(targetLen2, 1e-8),
+			len: Math.hypot(c.x, c.y)
+		}))
+		.filter((r) => r.len > 1e-4)
+		.sort((a, b) => b.score - a.score || b.len - a.len);
 
+	let best = ranked[0]?.c ?? candidates[0]!;
 	const appliedTravel = Math.hypot(best.x, best.y);
 	const sticky = travel > 1 && appliedTravel < 0.25;
 
@@ -1072,6 +1137,7 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 			ghostRest ||
 			sticky ||
 			matterRestHit ||
+			usedPaperOverride ||
 			result !== 'moved' ||
 			fNestle < 0.5 ||
 			ms > 8 ||
@@ -1085,10 +1151,11 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 			want: { x: +delta.x.toFixed(2), y: +delta.y.toFixed(2), len: +wantTravel.toFixed(2) },
 			step: { x: +dx.toFixed(2), y: +dy.toFixed(2), len: +travel.toFixed(2), capped },
 			fNestle: +fNestle.toFixed(4),
-			best: { x: +best.x.toFixed(2), y: +best.y.toFixed(2), len: +appliedTravel.toFixed(2) },
+			best: { x: +best.x.toFixed(2), y: +best.y.toFixed(2), len: +Math.hypot(best.x, best.y).toFixed(2) },
 			paperFrac: +paperFrac.toFixed(4),
 			ghostRest,
 			ghostSkipped,
+			usedPaperOverride,
 			matterRestHit,
 			sticky,
 			usedSlide,
@@ -1098,7 +1165,7 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 		});
 	};
 
-	if (Math.abs(best.x) < 1e-4 && Math.abs(best.y) < 1e-4) {
+	if (!ranked.length) {
 		placeMovers(movers, 0, 0);
 		finishLog('blocked');
 		return false;
@@ -1143,32 +1210,48 @@ export function moveKinematic(paths: paper.Path[], delta: paper.Point): boolean 
 		return false;
 	};
 
-	applyFrac(1);
-	let frac = 1;
-	if (poseOverlaps()) {
-		let lo = 0;
+	// Try Matter candidates in score order. Skip any whose direction Paper
+	// rejects immediately — those used to burn a full ease-search down to 0
+	// every frame (sticky + lag).
+	for (const entry of ranked) {
+		best = entry.c;
+		resetPose();
+		applyFrac(1);
+		if (!poseOverlaps()) {
+			finishLog('moved', 1);
+			return true;
+		}
+		resetPose();
+		applyFrac(0.06);
+		if (poseOverlaps()) {
+			resetPose();
+			continue;
+		}
+		let lo = 0.06;
 		let hi = 1;
-		for (let i = 0; i < SEARCH_ITERS; i++) {
+		for (let i = 0; i < 8; i++) {
 			const mid = (lo + hi) / 2;
 			resetPose();
 			applyFrac(mid);
 			if (poseOverlaps()) hi = mid;
 			else lo = mid;
 		}
-		frac = lo;
 		resetPose();
-		if (frac < 1e-4) {
-			finishLog('eased-out', 0);
-			return false;
-		}
-		applyFrac(frac);
+		if (lo < 1e-4) continue;
+		applyFrac(lo);
 		if (poseOverlaps()) {
 			resetPose();
-			finishLog('eased-out', frac);
-			return false;
+			continue;
 		}
+		finishLog('moved', lo);
+		return true;
 	}
 
-	finishLog('moved', frac);
-	return true;
+	placeMovers(movers, 0, 0);
+	for (const m of movers) {
+		m.link.lastX = m.x;
+		m.link.lastY = m.y;
+	}
+	finishLog('blocked');
+	return false;
 }
