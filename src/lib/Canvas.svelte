@@ -2781,7 +2781,7 @@
 			__cairnDumpDebug?: () => string;
 			__cairnClearDebug?: () => void;
 		};
-		if (w.__CAIRN_DEBUG_PHYSICS === undefined) w.__CAIRN_DEBUG_PHYSICS = true;
+		if (w.__CAIRN_DEBUG_PHYSICS === undefined) w.__CAIRN_DEBUG_PHYSICS = false;
 		w.__cairnDumpPhysics = () =>
 			debugPhysicsSnapshot('manual-dump', placed, {
 				seed: app.shuffleSeed,
@@ -3297,7 +3297,7 @@
 				return;
 			}
 			const w = window as unknown as { __CAIRN_DEBUG_PHYSICS?: boolean };
-			const enabled = w.__CAIRN_DEBUG_PHYSICS === false;
+			const enabled = w.__CAIRN_DEBUG_PHYSICS !== true;
 			w.__CAIRN_DEBUG_PHYSICS = enabled;
 			console.log('[cairn] debug logging', enabled ? 'ON' : 'OFF');
 			return;
