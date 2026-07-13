@@ -575,18 +575,49 @@
 	);
 
 	function placeTip() {
-		if (!tipEl || !tipAnchor) return;
+		if (!tipEl || !tipAnchor || !canvasEl) return;
 		const pad = 8;
+		const gap = 10;
 		const { width: tw, height: th } = tipEl.getBoundingClientRect();
 		if (tw < 1 || th < 1) return;
-		const vw = window.innerWidth;
-		const vh = window.innerHeight;
+		const canvas = canvasEl.getBoundingClientRect();
+		if (canvas.width < 1 || canvas.height < 1) return;
+
+		const ax = tipAnchor.x;
+		const ay = tipAnchor.y;
 		// Single: bottom-left on the rock center. Multi: centered above the group.
-		let left = selectedPaths.length > 1 ? tipAnchor.x - tw / 2 : tipAnchor.x;
-		let top = tipAnchor.y - th;
-		left = Math.min(Math.max(left, pad), vw - tw - pad);
-		top = Math.min(Math.max(top, pad), vh - th - pad);
-		tipPos = { left, top };
+		const baseLeft = selectedPaths.length > 1 ? ax - tw / 2 : ax;
+
+		const minLeft = canvas.left + pad;
+		const maxLeft = canvas.right - tw - pad;
+		const minTop = canvas.top + pad;
+		const maxTop = canvas.bottom - th - pad;
+
+		const clampPos = (left: number, top: number) => ({
+			left: maxLeft >= minLeft ? Math.min(Math.max(left, minLeft), maxLeft) : canvas.left + (canvas.width - tw) / 2,
+			top: maxTop >= minTop ? Math.min(Math.max(top, minTop), maxTop) : canvas.top + (canvas.height - th) / 2
+		});
+
+		// Prefer above the rock; fall back below / beside — all clamped to the canvas.
+		const candidates = [
+			{ left: baseLeft, top: ay - th - gap },
+			{ left: baseLeft, top: ay + gap },
+			{ left: ax - tw - gap, top: ay - th / 2 },
+			{ left: ax + gap, top: ay - th / 2 }
+		];
+
+		let best = clampPos(candidates[0]!.left, candidates[0]!.top);
+		let bestDist = Infinity;
+		for (const c of candidates) {
+			const p = clampPos(c.left, c.top);
+			const dist = Math.hypot(p.left - c.left, p.top - c.top);
+			if (dist < bestDist - 1e-6) {
+				best = p;
+				bestDist = dist;
+				if (dist < 1e-6) break;
+			}
+		}
+		tipPos = best;
 	}
 
 	function clampTip(node: HTMLElement) {
@@ -594,6 +625,7 @@
 		placeTip();
 		const ro = new ResizeObserver(() => placeTip());
 		ro.observe(node);
+		if (canvasEl) ro.observe(canvasEl);
 		window.addEventListener('resize', placeTip);
 		return () => {
 			if (tipEl === node) tipEl = undefined;
@@ -751,6 +783,7 @@
 		if (bgFill) reapplyBg();
 		app.placedCount = placed.length;
 		coerceExcludedRockFills();
+		cullOffCanvasPlaced();
 		selectShape(null);
 		updateGhost();
 	}
@@ -1794,6 +1827,44 @@
 		return true;
 	}
 
+	/** Drop rocks that sit fully outside the artboard. They still collide and
+	 *  read as phantom walls after an aspect change or off-canvas drag. */
+	function cullOffCanvasPlaced(bounds: paper.Rectangle = viewBounds()): boolean {
+		if (placed.length === 0) return false;
+		const kept: paper.Path[] = [];
+		let removed = false;
+		for (const rock of placed) {
+			if (rock.bounds.intersects(bounds)) {
+				kept.push(rock);
+				continue;
+			}
+			removed = true;
+			removeFill(rock);
+			attach.delete(rock);
+			solidOnly.delete(rock);
+			removeBody(rock);
+			rock.remove();
+		}
+		if (!removed) return false;
+
+		placed = kept;
+		const nextSel = selectedPaths.filter((p) => kept.includes(p));
+		if (nextSel.length !== selectedPaths.length) {
+			selectedPaths = nextSel;
+			if (!nextSel.length) {
+				selectShape(null);
+			} else {
+				syncSelectionUi(nextSel[nextSel.length - 1]!);
+				updateSelectionVisuals();
+			}
+		}
+		recomputeGroups();
+		if (app.backgroundImageId || attach.size) syncFills();
+		app.placedCount = placed.length;
+		updateTipPos();
+		return true;
+	}
+
 	function findGroup(i: number): number {
 		while (groupParent[i] !== i) {
 			groupParent[i] = groupParent[groupParent[i]];
@@ -2379,21 +2450,11 @@
 		placedArtboard = { w: bounds.width, h: bounds.height };
 		if (!lockedPaths.length) {
 			repositionPlaced(bounds.width, bounds.height);
+		} else {
+			// repositionPlaced already culls; when skipped, still drop any newly
+			// generated rocks that landed fully off the current artboard.
+			cullOffCanvasPlaced(bounds);
 		}
-
-		// Cull only newly generated rocks that landed fully off-canvas.
-		const lockedSet = new Set(lockedPaths);
-		const onCanvas: paper.Path[] = [];
-		for (const rock of placed) {
-			if (lockedSet.has(rock) || rock.bounds.intersects(bounds)) {
-				onCanvas.push(rock);
-				continue;
-			}
-			removeBody(rock);
-			rock.remove();
-		}
-		placed = onCanvas;
-		groupParent = onCanvas.map((_, i) => i);
 
 		recomputeGroups();
 		if (app.backgroundImageId || attach.size) syncFills();
@@ -2441,6 +2502,7 @@
 		if (app.backgroundImageId) syncFills();
 
 		app.placedCount++;
+		cullOffCanvasPlaced();
 		commitHistory();
 	}
 
@@ -2522,6 +2584,7 @@
 		if (shapeDrag && didDragShape) {
 			endDrag(shapeDrag.paths);
 			finalizeShapeTransform();
+			cullOffCanvasPlaced();
 			updateTipPos();
 			commitHistory();
 		} else if (shapeDrag) {
@@ -2744,6 +2807,9 @@
 		// Geometry moved/scaled, so fills (separate clip clones + rasters) are
 		// stale: rebuild them against the new layout and shared baseline.
 		rebuildFills();
+		// Aspect / stage resize can leave rocks only visible on another ratio —
+		// drop fully off-canvas ones so they cannot phantom-collide.
+		cullOffCanvasPlaced(new paper.Rectangle(0, 0, w, h));
 		updateSelectionVisuals();
 		updateTipPos();
 	}
