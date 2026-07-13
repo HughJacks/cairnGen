@@ -3297,7 +3297,7 @@
 				return;
 			}
 			const w = window as unknown as { __CAIRN_DEBUG_PHYSICS?: boolean };
-			const enabled = !w.__CAIRN_DEBUG_PHYSICS;
+			const enabled = w.__CAIRN_DEBUG_PHYSICS === false;
 			w.__CAIRN_DEBUG_PHYSICS = enabled;
 			console.log('[cairn] debug logging', enabled ? 'ON' : 'OFF');
 			return;
