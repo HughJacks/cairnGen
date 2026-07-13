@@ -36,11 +36,10 @@ let engine: Matter.Engine | null = null;
 const links = new Map<paper.Path, BodyLink>();
 let warnedHull = false;
 
-/** Toggle with `window.__CAIRN_DEBUG_PHYSICS = false` to silence. */
-function debugPhysicsEnabled(): boolean {
+/** Opt in with `window.__CAIRN_DEBUG_PHYSICS = true` (off by default). */
+export function debugPhysicsEnabled(): boolean {
 	if (typeof window === 'undefined') return false;
-	const flag = (window as unknown as { __CAIRN_DEBUG_PHYSICS?: boolean }).__CAIRN_DEBUG_PHYSICS;
-	return flag !== false;
+	return (window as unknown as { __CAIRN_DEBUG_PHYSICS?: boolean }).__CAIRN_DEBUG_PHYSICS === true;
 }
 
 function pathDebugId(path: paper.Path, index?: number): string {
