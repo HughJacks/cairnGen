@@ -515,6 +515,33 @@
 	} | null = null;
 	let didDragShape = false;
 	let draggingShape = $state(false);
+	/** Custom cursor while a drag would cull the rock on release. */
+	const TRASH_CURSOR = `url("data:image/svg+xml;utf8,${encodeURIComponent(
+		`<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+			<circle cx="16" cy="16" r="14" fill="#fff" fill-opacity="0.94" stroke="#101a31" stroke-width="1.2"/>
+			<g fill="none" stroke="#101a31" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+				<path d="M11 12h10l-.85 11.2a1.6 1.6 0 0 1-1.6 1.45h-5.1a1.6 1.6 0 0 1-1.6-1.45L11 12z"/>
+				<path d="M9.5 12h13M13.5 12V10.4A1.6 1.6 0 0 1 15.1 8.8h1.8a1.6 1.6 0 0 1 1.6 1.6V12M14.75 15.5v5M17.25 15.5v5"/>
+			</g>
+		</svg>`
+	)}") 16 16, not-allowed`;
+
+	function dragWouldDelete(paths: paper.Path[]): boolean {
+		const bounds = viewBounds();
+		return paths.some((p) => !rockVisibleOnArtboard(p, bounds));
+	}
+
+	function setShapeDragCursor(willDelete: boolean) {
+		const cursor = willDelete ? TRASH_CURSOR : 'grabbing';
+		if (canvasEl) canvasEl.style.cursor = cursor;
+		document.body.style.cursor = cursor;
+	}
+
+	function clearShapeDragCursor() {
+		if (canvasEl) canvasEl.style.cursor = '';
+		document.body.style.cursor = '';
+	}
+
 	const MARQUEE_THRESHOLD = 4;
 	let marqueeDrag: {
 		start: paper.Point;
@@ -1797,6 +1824,7 @@
 	/** After moving or rotating a rock, rebuild fills and regroup contacts. */
 	function finalizeShapeTransform() {
 		syncFills();
+		cullOffCanvasPlaced();
 		updateSelectionVisuals();
 		recomputeGroups();
 	}
@@ -1827,14 +1855,29 @@
 		return true;
 	}
 
-	/** Drop rocks that sit fully outside the artboard. They still collide and
-	 *  read as phantom walls after an aspect change or off-canvas drag. */
+	/** True when enough of the rock sits on the artboard to be seen.
+	 *  A 1px edge kiss still `intersects`, but leaves an invisible collider. */
+	function rockVisibleOnArtboard(path: paper.Path, bounds: paper.Rectangle): boolean {
+		const b = path.bounds;
+		if (b.width < 1e-6 || b.height < 1e-6) return false;
+		if (!b.intersects(bounds)) return false;
+		// Center on-canvas → clearly present.
+		if (bounds.contains(b.center)) return true;
+		const overlap = b.intersect(bounds);
+		if (!overlap || overlap.width < 1 || overlap.height < 1) return false;
+		const frac = (overlap.width * overlap.height) / (b.width * b.height);
+		// Need a real chunk on-canvas — not a sliver the eye can't pick up.
+		return frac >= 0.2;
+	}
+
+	/** Drop rocks that aren't meaningfully on the artboard. They still collide
+	 *  and read as phantom walls after an aspect change or off-canvas drag. */
 	function cullOffCanvasPlaced(bounds: paper.Rectangle = viewBounds()): boolean {
 		if (placed.length === 0) return false;
 		const kept: paper.Path[] = [];
 		let removed = false;
 		for (const rock of placed) {
-			if (rock.bounds.intersects(bounds)) {
+			if (rockVisibleOnArtboard(rock, bounds)) {
 				kept.push(rock);
 				continue;
 			}
@@ -2550,7 +2593,7 @@
 			updateTipPos();
 			didDragShape = true;
 			draggingShape = true;
-			if (canvasEl) canvasEl.style.cursor = 'grabbing';
+			setShapeDragCursor(dragWouldDelete(paths));
 			return;
 		}
 		if (marqueeDrag) {
@@ -2599,7 +2642,7 @@
 		imageDrag = null;
 		shapeDrag = null;
 		draggingShape = false;
-		if (canvasEl) canvasEl.style.cursor = '';
+		clearShapeDragCursor();
 	}
 
 	function setupPaper() {
@@ -2641,6 +2684,8 @@
 		// Leave only clears the canvas cursor; window pointermove keeps
 		// updating `pointer` / drags / marquee past the artboard edge.
 		paper.view.onMouseLeave = () => {
+			// Keep the drag cursor (grab / trash) via body while off-canvas.
+			if (shapeDrag) return;
 			if (canvasEl) canvasEl.style.cursor = '';
 		};
 		paper.view.onMouseDown = (event: paper.MouseEvent) => {
@@ -2652,6 +2697,9 @@
 				if (hit) imageDrag = { kind: hit.kind, fill: hit.fill, last: event.point };
 				return;
 			}
+			// Drop invisible / sliver-off-canvas rocks before hit-testing so they
+			// cannot block placement or feel like phantom walls.
+			cullOffCanvasPlaced();
 			const shape = shapeAt(event.point);
 			if (shape) {
 				const shift =
