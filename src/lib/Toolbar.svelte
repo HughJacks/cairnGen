@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { app, rockColorIndex, ROCK_SIZES, type ToolPanel } from './state.svelte';
 	import { ROCK_SVGS } from './rocks';
+	import ShuffleIcon from './ShuffleIcon.svelte';
 
 	const ROCK_IMAGE_URLS = ROCK_SVGS.map(
 		(svg) => `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`
@@ -57,17 +58,14 @@
 		return subOpen && displayPanel === panel ? 0 : -1;
 	}
 
-	let diceSvg: SVGSVGElement | undefined = $state();
+	let shufflePulse: HTMLElement | undefined = $state();
 
 	function rollLayout() {
-		// Spin and fill on the same click — no wait for the animation to finish.
-		diceSvg?.getAnimations().forEach((a) => a.cancel());
-		diceSvg?.animate(
-			[
-				{ transform: 'rotate(0deg) scale(1)' },
-				{ transform: 'rotate(180deg) scale(1.25)' },
-				{ transform: 'rotate(360deg) scale(1)' }
-			],
+		// Pulse and generate on the same click — no wait for the animation to finish.
+		// Animate an HTML wrapper: WAAPI scale on <svg> is unreliable across browsers.
+		shufflePulse?.getAnimations().forEach((a) => a.cancel());
+		shufflePulse?.animate(
+			[{ transform: 'scale(1)' }, { transform: 'scale(1.25)' }, { transform: 'scale(1)' }],
 			{ duration: 320, easing: 'cubic-bezier(0.2, 0.7, 0.2, 1)' }
 		);
 		app.generate();
@@ -163,6 +161,22 @@
 						</svg>
 					{/if}
 				</button>
+				{#if app.mode === 'stack'}
+					<button
+						class="tool cycle-tool"
+						onclick={() => app.cycleStackCount()}
+						title={
+							app.maxStackCount <= 1
+								? '1 stack (max for this size/aspect)'
+								: `Stack count (1–${app.maxStackCount})`
+						}
+						aria-label="Stack count {app.stackCount} of {app.maxStackCount}"
+						tabindex={subTabIndex('lucky')}
+						disabled={app.maxStackCount <= 1}
+					>
+						{app.stackCount}
+					</button>
+				{/if}
 				<div class="cluster">
 					{#each ROCK_SVGS as _svg, i (i)}
 						<button
@@ -217,21 +231,9 @@
 				title="Roll layout"
 				aria-label="Roll layout"
 			>
-				<svg bind:this={diceSvg} viewBox="0 0 16 16" aria-hidden="true">
-					<rect
-						x="2.5"
-						y="2.5"
-						width="11"
-						height="11"
-						rx="2"
-						stroke="currentColor"
-						stroke-width="1.3"
-						fill="none"
-					/>
-					<circle cx="5.5" cy="5.5" r="1.1" fill="currentColor" />
-					<circle cx="8" cy="8" r="1.1" fill="currentColor" />
-					<circle cx="10.5" cy="10.5" r="1.1" fill="currentColor" />
-				</svg>
+				<span class="shuffle-pulse" bind:this={shufflePulse}>
+					<ShuffleIcon />
+				</span>
 			</button>
 			<button
 				class={['tool icon-tool lucky-settings', { active: app.toolPanel === 'lucky' }]}
@@ -623,6 +625,11 @@
 	.icon-tool svg {
 		width: 15px;
 		height: 15px;
+	}
+
+	.shuffle-pulse {
+		display: flex;
+		transform-origin: center;
 	}
 
 	.shape-tool img {

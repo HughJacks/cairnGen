@@ -509,18 +509,56 @@ function bodiesCollide(a: Matter.Body, b: Matter.Body): boolean {
 	return !!Collision.collides(a, b)?.collided;
 }
 
-/** True when any pair among `paths` penetrates (multi-select rigid rotate). */
-function selectionSelfOverlaps(paths: paper.Path[]): boolean {
-	for (let i = 0; i < paths.length; i++) {
-		for (let j = i + 1; j < paths.length; j++) {
-			if (pathsOverlap(paths[i]!, paths[j]!)) return true;
+type OverlapBody = { path: paper.Path; body: Matter.Body | null };
+
+/** Build ephemeral Matter bodies for a set of paths (once). */
+function overlapBodiesFor(paths: paper.Path[]): OverlapBody[] {
+	return paths.map((path) => ({ path, body: bodyForOverlap(path) }));
+}
+
+function pairOverlapsCached(a: OverlapBody, b: OverlapBody): boolean {
+	if (!a.path.bounds.intersects(b.path.bounds)) return false;
+	if (a.body && b.body && bodiesCollide(a.body, b.body)) return true;
+	return paperPathsOverlap(a.path, b.path);
+}
+
+/**
+ * Same oracle as groupOverlaps, but reuses prebuilt obstacle bodies and builds
+ * each mover body once — rotate probes touch the same static obstacles dozens
+ * of times per frame.
+ */
+function groupOverlapsCached(movers: paper.Path[], obstacleBodies: OverlapBody[]): boolean {
+	const moverBodies = overlapBodiesFor(movers);
+	for (const m of moverBodies) {
+		for (const o of obstacleBodies) {
+			if (pairOverlapsCached(m, o)) return true;
+		}
+	}
+	if (moverBodies.length > 1) {
+		for (let i = 0; i < moverBodies.length; i++) {
+			for (let j = i + 1; j < moverBodies.length; j++) {
+				if (pairOverlapsCached(moverBodies[i]!, moverBodies[j]!)) return true;
+			}
 		}
 	}
 	return false;
 }
 
-function groupOverlaps(paths: paper.Path[], obstacles: paper.Path[]): boolean {
-	return anyOverlap(paths, obstacles) || (paths.length > 1 && selectionSelfOverlaps(paths));
+/** True Paper fill penetration only — ignores Matter chord kissing. */
+function groupPaperOverlaps(movers: paper.Path[], obstacleBodies: OverlapBody[]): boolean {
+	for (const m of movers) {
+		for (const o of obstacleBodies) {
+			if (paperPathsOverlap(m, o.path)) return true;
+		}
+	}
+	if (movers.length > 1) {
+		for (let i = 0; i < movers.length; i++) {
+			for (let j = i + 1; j < movers.length; j++) {
+				if (paperPathsOverlap(movers[i]!, movers[j]!)) return true;
+			}
+		}
+	}
+	return false;
 }
 
 /** True when a sample of `subject`'s outline sits clearly inside `other`'s fill. */
@@ -759,42 +797,55 @@ function gatherRotatePivots(paths: paper.Path[], obstacles: paper.Path[]): paper
  * Largest |fraction| of `degrees` the group can rotate about `pivot` without
  * overlapping obstacles. Restores geometry afterward. Mirrors translation:
  * Matter binary-search first, then ease back only when Paper still penetrates.
+ *
+ * Ghost rest (Matter chords kiss while Paper fills do not): use Paper-only so
+ * nestled rocks are not stuck at 0° the way drag once was without maxFreeFrac's
+ * rest-overlap escape.
  */
 function maxFreeRotateFrac(
 	paths: paper.Path[],
-	obstacles: paper.Path[],
+	obstacleBodies: OverlapBody[],
 	degrees: number,
 	pivot: paper.Point,
-	befores: { path: paper.Path; pathData: string }[]
+	befores: { path: paper.Path; pathData: string }[],
+	iters: number
 ): number {
+	const matterRest = groupOverlapsCached(paths, obstacleBodies);
+	const paperRest = groupPaperOverlaps(paths, obstacleBodies);
+	const ghostRest = matterRest && !paperRest;
+	const overlaps = ghostRest
+		? () => groupPaperOverlaps(paths, obstacleBodies)
+		: () => groupOverlapsCached(paths, obstacleBodies);
+
 	applyRotateAbout(paths, degrees, pivot);
-	const freeFull = !groupOverlaps(paths, obstacles);
+	const freeFull = !overlaps();
 	restorePaths(befores);
 	if (freeFull) return 1;
 
 	let lo = 0;
 	let hi = 1;
-	for (let i = 0; i < ROTATE_ANGLE_ITERS; i++) {
+	for (let i = 0; i < iters; i++) {
 		const mid = (lo + hi) / 2;
 		applyRotateAbout(paths, degrees * mid, pivot);
-		if (groupOverlaps(paths, obstacles)) hi = mid;
+		if (overlaps()) hi = mid;
 		else lo = mid;
 		restorePaths(befores);
 	}
 
 	// Matter chords can sit slightly inside curved fills after rotation.
 	// Only then ease the angle back — never invent a standing gap.
+	const easeIters = Math.max(4, Math.min(8, iters - 2));
 	if (lo > 1e-5) {
 		applyRotateAbout(paths, degrees * lo, pivot);
-		const bites = groupOverlaps(paths, obstacles);
+		const bites = overlaps();
 		restorePaths(befores);
 		if (bites) {
 			let plo = 0;
 			let phi = lo;
-			for (let i = 0; i < 8; i++) {
+			for (let i = 0; i < easeIters; i++) {
 				const mid = (plo + phi) / 2;
 				applyRotateAbout(paths, degrees * mid, pivot);
-				const hit = groupOverlaps(paths, obstacles);
+				const hit = overlaps();
 				restorePaths(befores);
 				if (hit) phi = mid;
 				else plo = mid;
@@ -804,6 +855,16 @@ function maxFreeRotateFrac(
 	}
 	return lo;
 }
+
+export type RotateKinematicOpts = {
+	preferredPivot?: paper.Point;
+	/**
+	 * Live drag/wheel: prefer the preferred/center pivot and defer Matter
+	 * rebuilds to gesture end. Falls back to contact pivots when center spin
+	 * is fully blocked so nestled rocks can still rotate.
+	 */
+	live?: boolean;
+};
 
 /**
  * Rotate paths without ever leaving them overlapping obstacles.
@@ -815,26 +876,68 @@ export function rotateKinematic(
 	paths: paper.Path[],
 	degrees: number,
 	obstacles: paper.Path[],
-	preferredPivot?: paper.Point
+	preferredPivotOrOpts?: paper.Point | RotateKinematicOpts
 ): number {
 	if (paths.length === 0 || Math.abs(degrees) < MIN_ROTATE_DEG) return 0;
 
+	const opts: RotateKinematicOpts =
+		preferredPivotOrOpts && typeof preferredPivotOrOpts === 'object' && 'x' in preferredPivotOrOpts && !('live' in preferredPivotOrOpts)
+			? { preferredPivot: preferredPivotOrOpts as paper.Point }
+			: ((preferredPivotOrOpts as RotateKinematicOpts | undefined) ?? {});
+	const live = !!opts.live;
+	const preferredPivot = opts.preferredPivot;
+
 	const befores = paths.map((p) => ({ path: p, pathData: p.pathData }));
-	const pivots = gatherRotatePivots(paths, obstacles);
-	if (preferredPivot) {
-		pivots.unshift(preferredPivot.clone());
+	// Obstacles are static across every probe in this call — build once.
+	const obstacleBodies = overlapBodiesFor(obstacles);
+	const ghostRest =
+		groupOverlapsCached(paths, obstacleBodies) &&
+		!groupPaperOverlaps(paths, obstacleBodies);
+
+	const pivots: paper.Point[] = [];
+	const seenPivot = new Set<string>();
+	const addPivot = (pt: paper.Point) => {
+		const key = `${pt.x.toFixed(1)},${pt.y.toFixed(1)}`;
+		if (seenPivot.has(key)) return;
+		seenPivot.add(key);
+		pivots.push(pt);
+	};
+	if (preferredPivot) addPivot(preferredPivot.clone());
+	if (!live) {
+		for (const p of gatherRotatePivots(paths, obstacles)) addPivot(p);
+	} else if (!preferredPivot) {
+		addPivot(selectionCenter(paths));
 	}
 
 	let bestFrac = 0;
 	let bestPivot = pivots[0] ?? selectionCenter(paths);
+	const iters = live ? Math.max(5, ROTATE_ANGLE_ITERS - 4) : ROTATE_ANGLE_ITERS;
 
-	for (const pivot of pivots) {
-		const frac = maxFreeRotateFrac(paths, obstacles, degrees, pivot, befores);
-		if (frac > bestFrac + 1e-4) {
-			bestFrac = frac;
-			bestPivot = pivot;
-			if (bestFrac >= 0.999) break;
+	const tryPivots = (list: paper.Point[]) => {
+		for (const pivot of list) {
+			const frac = maxFreeRotateFrac(paths, obstacleBodies, degrees, pivot, befores, iters);
+			if (frac > bestFrac + 1e-4) {
+				bestFrac = frac;
+				bestPivot = pivot;
+				if (bestFrac >= 0.999) return;
+			}
 		}
+	};
+
+	tryPivots(pivots);
+
+	// Live gestures normally only spin about center; if that is fully blocked
+	// (neighbor nestled against the rock), fall back to contact pivots so the
+	// rock can still roll around the blocker.
+	if (live && Math.abs(degrees * bestFrac) < MIN_ROTATE_DEG) {
+		const extras: paper.Point[] = [];
+		for (const p of gatherRotatePivots(paths, obstacles)) {
+			const key = `${p.x.toFixed(1)},${p.y.toFixed(1)}`;
+			if (seenPivot.has(key)) continue;
+			seenPivot.add(key);
+			extras.push(p);
+		}
+		tryPivots(extras);
 	}
 
 	const applied = degrees * bestFrac;
@@ -844,15 +947,20 @@ export function rotateKinematic(
 	}
 
 	applyRotateAbout(paths, applied, bestPivot);
-	if (groupOverlaps(paths, obstacles)) {
-		// Safety: never commit an overlapping pose.
+	// Ghost rest: Matter chords already "collide" while fills only kiss — reject
+	// only real Paper penetration so nestled rocks can still commit a spin.
+	const blocked = ghostRest
+		? groupPaperOverlaps(paths, obstacleBodies)
+		: groupOverlapsCached(paths, obstacleBodies);
+	if (blocked) {
 		restorePaths(befores);
 		return 0;
 	}
 
 	for (const p of paths) {
 		onPathTranslated?.(p);
-		rebuildFromPath(p);
+		// Live rotate defers Matter rebuild to gesture end (same idea as move + beginDrag).
+		if (!live) rebuildFromPath(p);
 	}
 	return applied;
 }

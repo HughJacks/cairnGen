@@ -85,8 +85,8 @@ export const CANVAS_BG_COLORS: CanvasBgSwatch[] = [
 	{ name: 'Transparent', hex: null }
 ];
 
-/** Reorderable top-bar swatch: stable key, solid fill hex, dice-pool flag.
- *  `hex` stays `string | null` for typing; the bar never inserts null. */
+/** Fixed-order top-bar swatch: stable key, fill hex, rock-pool flag.
+ *  Order is palette definition order — background is `canvasBg`, not index. */
 export interface BgSwatch {
 	key: string;
 	hex: string | null;
@@ -150,11 +150,7 @@ export const COLOR_PALETTES: ColorPalette[] = [
 function defaultBgSwatchesFor(paletteId: ColorPaletteId): BgSwatch[] {
 	const palette = COLOR_PALETTES.find((p) => p.id === paletteId);
 	const colors = palette?.colors ?? COLOR_PALETTES[0]!.colors;
-	// Leftmost = canvas bg: prefer Paper when present, else first chromatic.
-	const paper = colors.find((c) => hexEq(c.hex, PAPER_HEX));
-	const rest = colors.filter((c) => !hexEq(c.hex, PAPER_HEX));
-	const ordered = paper ? [paper, ...rest] : colors;
-	return ordered.map((p) => ({
+	return colors.map((p) => ({
 		key: p.hex,
 		hex: p.hex,
 		enabled: true
@@ -166,52 +162,51 @@ function bgHexEq(a: string | null, b: string | null): boolean {
 	return hexEq(a, b);
 }
 
-/**
- * Paper may only sit at index 0 (canvas bg, enabled) or last (deactivated).
- * Any other placement is corrected by appending Paper disabled at the end.
- */
-export function normalizePaperPlacement(list: BgSwatch[]): BgSwatch[] {
-	const paperIdx = list.findIndex((s) => s.hex !== null && hexEq(s.hex, PAPER_HEX));
-	if (paperIdx < 0) return list;
-	if (paperIdx === 0) {
-		const paper = list[0]!;
-		if (paper.enabled) return list;
-		const next = list.slice();
-		next[0] = { ...paper, enabled: true };
-		return next;
-	}
-	const next = list.slice();
-	const [paper] = next.splice(paperIdx, 1);
-	if (!paper) return list;
-	next.push({ ...paper, enabled: false });
-	return next;
-}
-
-/** Enabled swatches first (order preserved), then disabled (order preserved). */
-export function partitionBgSwatches(list: BgSwatch[]): BgSwatch[] {
-	const enabled: BgSwatch[] = [];
-	const disabled: BgSwatch[] = [];
-	for (const s of list) {
-		if (s.enabled) enabled.push(s);
-		else disabled.push(s);
-	}
-	return normalizePaperPlacement([...enabled, ...disabled]);
-}
-
 export { ROCK_COUNT };
 
 export interface RockSize {
 	label: string;
-	/** Tallest-rock height as a fraction of sqrt(canvas area), so the same
-	 *  size reads identically across aspect ratios. */
+	/**
+	 * Shared rock width as a fraction of canvas height (one “shape unit”).
+	 * Sized so roughly this many units stack into the artboard height:
+	 * S ≈ 5–6, M ≈ 3–4, L ≈ 2.
+	 */
 	fraction: number;
 }
 
 export const ROCK_SIZES: RockSize[] = [
-	{ label: 'S', fraction: 0.48 },
-	{ label: 'M', fraction: 0.72 },
-	{ label: 'L', fraction: 1.12 }
+	{ label: 'S', fraction: 1 / 5.5 },
+	{ label: 'M', fraction: 1 / 3.5 },
+	{ label: 'L', fraction: 1 / 2 }
 ];
+
+/** How many independent cairns the stack shuffle can generate. */
+export const STACK_COUNT_MIN = 1;
+export const STACK_COUNT_MAX = 5;
+
+/**
+ * Max stacks that can actually place for this aspect + rock size.
+ * Rock width is a fraction of canvas height; packing uses height-normalized
+ * width (aspect ratio) so pixel stage size does not matter.
+ */
+export function maxStackCountFor(aspectId: AspectId, sizeIndex: number): number {
+	const aspect = ASPECTS.find((a) => a.id === aspectId) ?? ASPECTS[0]!;
+	const ratio = aspect.w / aspect.h;
+	const rock = ROCK_SIZES[sizeIndex]?.fraction ?? ROCK_SIZES[1]!.fraction;
+	// Must match shuffle lane packing (side pad / min slot / min gap).
+	const sidePad = rock * 0.15;
+	const minSlot = rock * 0.95;
+	const minGap = rock * 0.28;
+	const usable = ratio - 2 * sidePad;
+	if (usable < minSlot * 0.92) return STACK_COUNT_MIN;
+	let n = 1;
+	while (n < STACK_COUNT_MAX) {
+		const need = (n + 1) * minSlot + n * minGap;
+		if (need > usable + 1e-9) break;
+		n++;
+	}
+	return n;
+}
 
 export type Mode = 'cluster' | 'stack';
 /** Active canvas interaction tool. Cursor selects/moves; shape places rocks;
@@ -234,6 +229,8 @@ class AppState {
 	colorIndex = $state(0);
 	placedCount = $state(0);
 	sizeIndex = $state(1);
+	/** Number of separate stacks when mode is `stack` (lucky generate). */
+	stackCount = $state(3);
 	rotation = $state(0);
 	clearVersion = $state(0);
 	exportVersion = $state(0);
@@ -263,11 +260,11 @@ class AppState {
 	bgRecolor: { from: string; to: string } | null = $state(null);
 	/** Set while coercing colorIndex on bg change so Canvas won't recolor the selection. */
 	skipSelectionColorApply = false;
-	/** Active top-bar color palette (Warm or Cool). */
+	/** Active top-bar color palette (Warm / Cool / Balanced). */
 	activePaletteId: ColorPaletteId = $state('warm');
-	/** Top-bar bg swatches for the active palette (leftmost = canvas background). */
+	/** Top-bar swatches for the active palette (fixed definition order). */
 	bgSwatches: BgSwatch[] = $state(defaultBgSwatchesFor('warm'));
-	/** Bumped by the top-bar dice to shuffle palette order (rocks sync via colorSlot). */
+	/** Bumped by the top-bar shuffle to randomize unlocked rock fills. */
 	colorShuffleVersion = $state(0);
 	/** Bumped when switching Warm/Cool so Canvas recolors unlocked rocks into the new pool. */
 	paletteSwitchVersion = $state(0);
@@ -330,144 +327,58 @@ class AppState {
 		);
 	}
 
-	/** When a swatch becomes canvas bg (index 0), it must stay in the pool UI as on. */
-	private ensureLeftmostEnabled() {
-		const left = this.bgSwatches[0];
-		if (!left || left.enabled) return;
-		const next = this.bgSwatches.slice();
-		next[0] = { ...left, enabled: true };
-		this.bgSwatches = next;
+	/** Set canvas background from a palette swatch (order unchanged).
+	 *  Pinned colors are always enabled. */
+	setCanvasBgFromSwatch(index: number): boolean {
+		const swatch = this.bgSwatches[index];
+		if (!swatch || swatch.hex === null) return false;
+		const alreadyBg = bgHexEq(swatch.hex, this.canvasBg);
+		if (!swatch.enabled) {
+			const next = this.bgSwatches.slice();
+			next[index] = { ...swatch, enabled: true };
+			this.bgSwatches = next;
+			this.coerceColorIndex();
+		}
+		if (alreadyBg) return !swatch.enabled;
+		this.selectCanvasBg(swatch.hex);
+		return true;
 	}
 
 	/**
-	 * Splice-reorder top-bar swatches.
-	 * With `deferBg`, only mutates order (for live drag); call `finalizeBgSwatchOrder` on drag end.
-	 */
-	reorderBgSwatch(from: number, to: number, opts?: { deferBg?: boolean }) {
-		const n = this.bgSwatches.length;
-		if (from === to || from < 0 || to < 0 || from >= n || to >= n) return;
-		const next = this.bgSwatches.slice();
-		const [item] = next.splice(from, 1);
-		if (!item) return;
-		// Dragging onto the bg slot reactivates a disabled swatch.
-		const placed = to === 0 && !item.enabled ? { ...item, enabled: true } : item;
-		next.splice(to, 0, placed);
-		this.bgSwatches = next;
-		if (opts?.deferBg) return;
-		this.bgSwatches = normalizePaperPlacement(this.bgSwatches);
-		this.ensureLeftmostEnabled();
-		const newLeft = this.bgSwatches[0]?.hex ?? null;
-		if (!bgHexEq(this.canvasBg, newLeft)) this.selectCanvasBg(newLeft);
-	}
-
-	/** After drag: re-enable leftmost (so a disabled drag-to-bg sticks), then partition, apply bg. */
-	finalizeBgSwatchOrder() {
-		this.ensureLeftmostEnabled();
-		this.bgSwatches = partitionBgSwatches(this.bgSwatches);
-		const left = this.bgSwatches[0]?.hex ?? null;
-		if (!bgHexEq(left, this.canvasBg)) this.selectCanvasBg(left);
-		else this.coerceColorIndex();
-	}
-
-	/**
-	 * Toggle a swatch in/out of the color-shuffle pool.
-	 * Off → partition (disabled to the right); if it was canvas bg, new leftmost becomes bg.
-	 * On → partition so it joins the end of the enabled group. Never empties the rock-color pool.
-	 * Always keeps shape-tool `colorIndex` on an enabled non-bg color when the pool changes.
+	 * Toggle a swatch in/out of the rock-color pool. Order stays fixed.
+	 * Never empties the rock-color pool (at least one non-bg enabled chromatic).
+	 * The pinned canvas background cannot be disabled.
 	 */
 	toggleBgSwatch(index: number): boolean {
 		const swatch = this.bgSwatches[index];
-		if (!swatch) return false;
-		// Paper is background-only — never toggle rock-pool enable.
-		if (swatch.hex !== null && hexEq(swatch.hex, PAPER_HEX)) return false;
+		if (!swatch || swatch.hex === null) return false;
 
 		if (!swatch.enabled) {
 			const next = this.bgSwatches.slice();
 			next[index] = { ...swatch, enabled: true };
-			this.bgSwatches = partitionBgSwatches(next);
+			this.bgSwatches = next;
 			this.coerceColorIndex();
 			return true;
 		}
 
-		const wasLeft = index === 0;
+		// Pinned background stays enabled.
+		if (bgHexEq(swatch.hex, this.canvasBg)) return false;
+
 		const next = this.bgSwatches.slice();
 		next[index] = { ...swatch, enabled: false };
-		const partitioned = partitionBgSwatches(next);
-
-		let newCanvasBg = this.canvasBg;
-		if (wasLeft) {
-			const left = partitioned[0];
-			if (left && !left.enabled) partitioned[0] = { ...left, enabled: true };
-			newCanvasBg = partitioned[0]?.hex ?? this.canvasBg;
-		}
-
-		const poolAfter = partitioned.flatMap((s) =>
-			s.enabled && s.hex !== null && !isRockColorExcluded(s.hex, newCanvasBg) ? [s.hex] : []
+		const poolAfter = next.flatMap((s) =>
+			s.enabled && s.hex !== null && !isRockColorExcluded(s.hex, this.canvasBg) ? [s.hex] : []
 		);
 		if (poolAfter.length === 0) return false;
 
-		this.bgSwatches = partitioned;
-		if (wasLeft) {
-			this.ensureLeftmostEnabled();
-			this.selectCanvasBg(this.bgSwatches[0]?.hex ?? null);
-		} else {
-			this.coerceColorIndex();
-		}
+		this.bgSwatches = next;
+		this.coerceColorIndex();
 		return true;
 	}
 
-	/** Move a swatch to index 0 and select it as the canvas background. */
-	moveBgSwatchToFront(index: number) {
-		if (index <= 0 || index >= this.bgSwatches.length) return;
-		this.reorderBgSwatch(index, 0);
-	}
-
-	/**
-	 * Dice: shuffle enabled chromatic swatches only. Paper stays first+enabled
-	 * if it was bg, otherwise last+disabled. Disabled chromatics stay on the right.
-	 * Rocks keep a colorSlot index and Canvas syncs fills from the new order.
-	 */
+	/** Shuffle unlocked rock fills among the enabled pool (Canvas applies). */
 	shuffleRockColors() {
-		const paperWasFirst =
-			this.bgSwatches[0]?.hex !== null && hexEq(this.bgSwatches[0]!.hex, PAPER_HEX);
-		const paper = this.bgSwatches.find((s) => s.hex !== null && hexEq(s.hex, PAPER_HEX));
-		const chromatic = this.bgSwatches.filter(
-			(s) => !(s.hex !== null && hexEq(s.hex, PAPER_HEX))
-		);
-		const enabled = chromatic.filter((s) => s.enabled);
-		const disabled = chromatic.filter((s) => !s.enabled);
-		if (enabled.length < 2) return;
-
-		const prevKeys = enabled.map((s) => s.key);
-		let nextEnabled = enabled.slice();
-		for (let attempt = 0; attempt < 10; attempt++) {
-			for (let i = nextEnabled.length - 1; i > 0; i--) {
-				const j = Math.floor(Math.random() * (i + 1));
-				const a = nextEnabled[i]!;
-				nextEnabled[i] = nextEnabled[j]!;
-				nextEnabled[j] = a;
-			}
-			if (nextEnabled.some((s, i) => s.key !== prevKeys[i])) break;
-		}
-		if (nextEnabled.every((s, i) => s.key === prevKeys[i])) return;
-
-		if (paper && paperWasFirst) {
-			this.bgSwatches = [{ ...paper, enabled: true }, ...nextEnabled, ...disabled];
-		} else if (paper) {
-			this.bgSwatches = [...nextEnabled, ...disabled, { ...paper, enabled: false }];
-		} else {
-			this.bgSwatches = [...nextEnabled, ...disabled];
-		}
-		this.ensureLeftmostEnabled();
-
-		const newLeft = this.bgSwatches[0]?.hex ?? null;
-		if (!bgHexEq(this.canvasBg, newLeft)) {
-			// Slot sync owns rock recolor — skip selectCanvasBg's swap.
-			this.canvasBg = newLeft;
-			this.bgRecolor = null;
-			this.canvasBgVersion++;
-		}
-
+		if (this.enabledBgRockColors.length < 1) return;
 		this.skipSelectionColorApply = true;
 		this.coerceColorIndex();
 		queueMicrotask(() => {
@@ -477,15 +388,17 @@ class AppState {
 	}
 
 	/**
-	 * Switch Warm/Cool palette: reset swatches (Paper leftmost, all on),
-	 * force canvas bg to Paper, then bump paletteSwitchVersion so Canvas
-	 * recolors unlocked rocks into the new pool.
+	 * Switch palette: reset swatches (all on, fixed order). Keep canvas bg when
+	 * the hex exists in the new palette; otherwise fall back to Paper.
 	 */
 	selectPalette(id: ColorPaletteId) {
 		if (id === this.activePaletteId) return;
 		this.activePaletteId = id;
 		this.bgSwatches = defaultBgSwatchesFor(id);
-		if (!bgHexEq(this.canvasBg, PAPER_HEX)) {
+		const bgStillValid = this.bgSwatches.some(
+			(s) => s.hex !== null && bgHexEq(s.hex, this.canvasBg)
+		);
+		if (!bgStillValid) {
 			this.canvasBg = PAPER_HEX;
 			this.bgRecolor = null;
 			this.canvasBgVersion++;
@@ -566,10 +479,37 @@ class AppState {
 	cycleAspect() {
 		const i = ASPECTS.findIndex((a) => a.id === this.aspect);
 		this.aspect = ASPECTS[(i + 1) % ASPECTS.length].id;
+		this.clampStackCount();
 	}
 
 	cycleSize() {
 		this.sizeIndex = (this.sizeIndex + 1) % ROCK_SIZES.length;
+		this.clampStackCount();
+	}
+
+	/** Highest stack count that can place for the current aspect + size. */
+	get maxStackCount(): number {
+		return maxStackCountFor(this.aspect, this.sizeIndex);
+	}
+
+	clampStackCount() {
+		const max = this.maxStackCount;
+		if (this.stackCount > max) this.stackCount = max;
+		if (this.stackCount < STACK_COUNT_MIN) this.stackCount = STACK_COUNT_MIN;
+	}
+
+	cycleStackCount() {
+		const max = this.maxStackCount;
+		if (max <= STACK_COUNT_MIN) {
+			this.stackCount = STACK_COUNT_MIN;
+			return;
+		}
+		this.stackCount = this.stackCount >= max ? STACK_COUNT_MIN : this.stackCount + 1;
+	}
+
+	setStackCount(n: number) {
+		const max = this.maxStackCount;
+		this.stackCount = Math.min(max, Math.max(STACK_COUNT_MIN, Math.round(n)));
 	}
 
 	rotateBy(degrees: number) {
@@ -578,6 +518,7 @@ class AppState {
 
 	toggleMode() {
 		this.mode = this.mode === 'cluster' ? 'stack' : 'cluster';
+		if (this.mode === 'stack') this.clampStackCount();
 	}
 
 	/** Alias for the lucky-panel cycle control. */
@@ -587,6 +528,7 @@ class AppState {
 
 	setMode(mode: Mode) {
 		this.mode = mode;
+		if (mode === 'stack') this.clampStackCount();
 	}
 
 	/** Select/move existing rocks. Closes shape and generate settings. */
@@ -667,6 +609,7 @@ class AppState {
 
 	selectSize(i: number) {
 		this.sizeIndex = i;
+		this.clampStackCount();
 	}
 
 	clear() {

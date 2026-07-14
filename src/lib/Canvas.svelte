@@ -9,7 +9,6 @@
 		COLOR_PALETTES,
 		hexEq,
 		isPaperHex,
-		isRockColorExcluded,
 		PALETTE,
 		rockColorIndex,
 		ROCK_SIZES,
@@ -47,15 +46,17 @@
 		reconcileRegisteredOverlaps
 	} from './physics';
 	import { generateShuffle } from './shuffle';
+	import ShuffleIcon from './ShuffleIcon.svelte';
 
-	/** Height (in canvas px) of the tallest rock; all rocks share the same scale factor. */
+	/** Template reference width (canvas px). All rocks are uniformly scaled so
+	 *  their AABB width matches this; size fractions map that width to a
+	 *  fraction of artboard height (one shape unit). */
 	const ROCK_HEIGHT = 140;
 	const STAGE_PADDING = 28;
 	/** Space above the canvas for the centered bg swatch bar + gap. */
 	const BG_BAR_SPACE = 48;
 	/** Max image zoom as a multiple of the cover scale that fills a mask. */
 	const MAX_ZOOM = 4;
-	const BG_DRAG_THRESHOLD = 2;
 	const PAPER_HEX = '#FFFFFF';
 	const INK_HEX = '#101A31';
 
@@ -72,48 +73,56 @@
 	let seenColorShuffleVersion = app.colorShuffleVersion;
 	let seenPaletteSwitchVersion = app.paletteSwitchVersion;
 	let imageEditBaseline: CanvasSnapshot | null = null;
-	let bgDiceSvg: SVGSVGElement | undefined = $state();
-	let bgColorsEl: HTMLDivElement | null = $state(null);
-	let bgDragIndex: number | null = $state(null);
-	let bgDragMoved = false;
-	let bgDragStartX = 0;
-	let bgDragStartY = 0;
-	let bgDragPointerId: number | null = null;
-	/** Fixed slot-center X positions from pointerdown. Not spliced on reorder —
-	 *  absolute mids must stay sorted for hit-testing (splicing caused an infinite loop). */
-	let bgSlotMids: number[] = [];
-	let bgDragRaf = 0;
-	let bgDragPendingX: number | null = null;
+	let bgShufflePulse: HTMLElement | undefined = $state();
 
-	function bgSwatchTitle(hex: string | null): string {
-		if (hex === null) return 'Transparent';
-		if (isPaperHex(hex)) return 'Paper (background only)';
-		return PALETTE.find((p) => hexEq(p.hex, hex))?.name ?? hex;
+	function bgSwatchTitle(hex: string | null, enabled = true, pinned = false): string {
+		const name =
+			hex === null
+				? 'Transparent'
+				: isPaperHex(hex)
+					? 'Paper'
+					: (PALETTE.find((p) => hexEq(p.hex, hex))?.name ?? hex);
+		if (isPaperHex(hex)) return `${name} — pin for background`;
+		if (pinned) return `${name} — background`;
+		return enabled ? `${name} — click to disable` : `${name} — click to enable`;
 	}
 
-	function isPaperSwatch(swatch: { hex: string | null }): boolean {
-		return isPaperHex(swatch.hex);
+	function setBgFromSwatch(index: number) {
+		// Rock remaps + history are handled by the canvasBgVersion effect when needed.
+		app.setCanvasBgFromSwatch(index);
 	}
 
-	/** Paper is bg-only: click moves it to front; no rock-pool toggle. */
-	function onPaperSwatchActivate(index: number) {
-		if (index <= 0) return;
-		app.moveBgSwatchToFront(index);
-		syncRocksFromColorSlots();
-		commitHistory();
+	function pinBgSwatch(index: number, event: MouseEvent) {
+		event.preventDefault();
+		event.stopPropagation();
+		setBgFromSwatch(index);
+	}
+
+	function onSwatchActivate(index: number) {
+		const swatch = app.bgSwatches[index];
+		if (!swatch) return;
+		// Paper is bg-only for fills — pin sets background; click does nothing useful.
+		if (swatch.hex && isPaperHex(swatch.hex)) return;
+		// Pinned background stays enabled — don't allow disable via click.
+		if (
+			swatch.hex &&
+			typeof app.canvasBg === 'string' &&
+			hexEq(swatch.hex, app.canvasBg)
+		)
+			return;
+		toggleBgSwatchAndRemap(index);
 	}
 
 	function toggleBgSwatchAndRemap(index: number) {
 		const swatch = app.bgSwatches[index];
-		if (swatch && isPaperSwatch(swatch)) {
-			onPaperSwatchActivate(index);
-			return;
-		}
+		const hex = swatch?.hex ?? null;
 		const activating = swatch ? !swatch.enabled : false;
-		const disabledHex = swatch?.enabled ? swatch.hex : null;
+		const disabledHex = swatch?.enabled ? hex : null;
 		if (!app.toggleBgSwatch(index)) return;
+		// Paper/Ink never enter the rock pool — toggling them must not reshuffle fills.
+		if (hex && (isPaperHex(hex) || hexEq(hex, INK_HEX))) return;
 		if (
-			syncRockSlotsAfterPaletteMutation({
+			syncRocksAfterPaletteMutation({
 				disabledHex,
 				forceRemap: activating
 			})
@@ -122,43 +131,13 @@
 	}
 
 	function rollBgColors() {
-		bgDiceSvg?.getAnimations().forEach((a) => a.cancel());
-		bgDiceSvg?.animate(
-			[
-				{ transform: 'rotate(0deg) scale(1)' },
-				{ transform: 'rotate(180deg) scale(1.25)' },
-				{ transform: 'rotate(360deg) scale(1)' }
-			],
+		// Animate an HTML wrapper: WAAPI scale on <svg> is unreliable across browsers.
+		bgShufflePulse?.getAnimations().forEach((a) => a.cancel());
+		bgShufflePulse?.animate(
+			[{ transform: 'scale(1)' }, { transform: 'scale(1.25)' }, { transform: 'scale(1)' }],
 			{ duration: 320, easing: 'cubic-bezier(0.2, 0.7, 0.2, 1)' }
 		);
 		app.shuffleRockColors();
-	}
-
-	/** Palette slot index for a fill hex (falls back to first usable non-bg slot). */
-	function colorSlotForHex(hex: string): number {
-		const exact = app.bgSwatches.findIndex((s) => s.hex !== null && hexEq(s.hex, hex));
-		if (exact >= 0) return exact;
-		for (let i = 0; i < app.bgSwatches.length; i++) {
-			const s = app.bgSwatches[i];
-			if (s?.enabled && s.hex && !isRockColorExcluded(s.hex, app.canvasBg)) return i;
-		}
-		return Math.min(1, Math.max(0, app.bgSwatches.length - 1));
-	}
-
-	function resolveFillSlot(slot: number): { slot: number; hex: string } | null {
-		const trySlot = (i: number) => {
-			const s = app.bgSwatches[i];
-			if (!s?.enabled || s.hex === null) return null;
-			if (isRockColorExcluded(s.hex, app.canvasBg)) return null;
-			return { slot: i, hex: s.hex };
-		};
-		const direct = trySlot(slot);
-		if (direct) return direct;
-		for (let i = 0; i < app.bgSwatches.length; i++) {
-			const resolved = trySlot(i);
-			if (resolved) return resolved;
-		}
-		return null;
 	}
 
 	function writeRockMeta(
@@ -170,56 +149,19 @@
 			rockIndex: patch.rockIndex,
 			sizeIndex: patch.sizeIndex,
 			rotation: patch.rotation,
-			colorSlot: patch.colorSlot ?? prev?.colorSlot ?? colorSlotForHex(app.nextColor.hex),
+			colorHex: patch.colorHex ?? prev?.colorHex ?? app.nextColor.hex,
 			locked: patch.locked ?? prev?.locked
 		});
 	}
 
-	/** Apply each rock's colorSlot → current palette swatch (skips locked / masked). */
-	function syncRocksFromColorSlots(): boolean {
-		let changed = false;
-		for (const path of placed) {
-			if (isLocked(path)) continue;
-			if (attach.has(path)) continue;
-			if (app.backgroundImageId && !solidOnly.has(path)) continue;
-			const meta = rockMeta.get(path);
-			let slot = meta?.colorSlot;
-			if (slot === undefined || slot < 0) {
-				const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
-				slot = cur ? colorSlotForHex(cur) : colorSlotForHex(app.nextColor.hex);
-			}
-			const resolved = resolveFillSlot(slot);
-			if (!resolved) continue;
-			if (!meta || meta.colorSlot !== resolved.slot) {
-				writeRockMeta(path, {
-					rockIndex: meta?.rockIndex ?? 0,
-					sizeIndex: meta?.sizeIndex ?? app.sizeIndex,
-					rotation: meta?.rotation ?? path.rotation,
-					colorSlot: resolved.slot,
-					locked: meta?.locked
-				});
-			}
-			const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
-			if (!cur || !hexEq(cur, resolved.hex)) {
-				path.fillColor = new paper.Color(resolved.hex);
-				changed = true;
-			}
-		}
-		if (changed) {
-			if (selectedPaths.length) syncSelectionUi(selectedPaths.at(-1) ?? null);
-			updateGhost();
-		}
-		return changed;
-	}
-
 	/**
-	 * After enable/disable (+ partition): remap unlocked rocks onto the enabled
-	 * fill pool. When `disabledHex` is set and `forceRemap` is false, rocks whose
-	 * color is still valid keep it (slot index refreshed); only rocks on the
-	 * disabled color are reassigned. When `forceRemap` is true (activate), every
-	 * unlocked rock is redistributed across the pool so the new color is used.
+	 * After enable/disable: remap unlocked rocks onto the enabled fill pool.
+	 * When `disabledHex` is set and `forceRemap` is false, rocks whose color is
+	 * still valid keep it; only rocks on the disabled color are reassigned.
+	 * When `forceRemap` is true (activate), every unlocked rock is redistributed
+	 * across the pool so the new color is used.
 	 */
-	function syncRockSlotsAfterPaletteMutation(opts?: {
+	function syncRocksAfterPaletteMutation(opts?: {
 		disabledHex?: string | null;
 		forceRemap?: boolean;
 	}): boolean {
@@ -250,13 +192,12 @@
 				poolCursor++;
 			}
 
-			const slot = colorSlotForHex(hex);
-			if (!meta || meta.colorSlot !== slot) {
+			if (!meta || !hexEq(meta.colorHex, hex)) {
 				writeRockMeta(path, {
 					rockIndex: meta?.rockIndex ?? 0,
 					sizeIndex: meta?.sizeIndex ?? app.sizeIndex,
 					rotation: meta?.rotation ?? path.rotation,
-					colorSlot: slot,
+					colorHex: hex,
 					locked: meta?.locked
 				});
 			}
@@ -274,109 +215,38 @@
 
 	/** Remap rocks whose fill is Paper/Ink (or otherwise outside the chromatic pool). */
 	function coerceExcludedRockFills(): boolean {
-		return syncRockSlotsAfterPaletteMutation({ forceRemap: false });
+		return syncRocksAfterPaletteMutation({ forceRemap: false });
 	}
 
-	function cacheBgSlotMids() {
-		if (!bgColorsEl) {
-			bgSlotMids = [];
-			return;
+	/** Randomly assign unlocked rocks fills from the enabled rock-color pool. */
+	function shuffleUnlockedRockFills(): boolean {
+		const pool = app.enabledBgRockColors;
+		if (!pool.length) return false;
+		let changed = false;
+		for (const path of placed) {
+			if (isLocked(path)) continue;
+			if (attach.has(path)) continue;
+			if (app.backgroundImageId && !solidOnly.has(path)) continue;
+			const hex = pool[Math.floor(Math.random() * pool.length)]!;
+			const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
+			const meta = rockMeta.get(path);
+			if (meta) rockMeta.set(path, { ...meta, colorHex: hex });
+			else
+				writeRockMeta(path, {
+					rockIndex: 0,
+					sizeIndex: app.sizeIndex,
+					rotation: path.rotation,
+					colorHex: hex
+				});
+			if (cur && hexEq(cur, hex)) continue;
+			path.fillColor = new paper.Color(hex);
+			changed = true;
 		}
-		const slots = Array.from(bgColorsEl.querySelectorAll<HTMLElement>('.bg-slot'));
-		bgSlotMids = slots.map((el) => {
-			const rect = el.getBoundingClientRect();
-			return rect.left + rect.width / 2;
-		});
-	}
-
-	function bgTargetIndexFromClientX(clientX: number): number {
-		if (bgDragIndex === null || !bgSlotMids.length) return bgDragIndex ?? 0;
-		let target = 0;
-		for (let i = 0; i < bgSlotMids.length; i++) {
-			if (clientX < bgSlotMids[i]!) {
-				target = i;
-				break;
-			}
-			target = i;
+		if (changed) {
+			if (selectedPaths.length) syncSelectionUi(selectedPaths.at(-1) ?? null);
+			updateGhost();
 		}
-		return target;
-	}
-
-	function applyBgReorder(clientX: number) {
-		if (bgDragIndex === null) return;
-		let target = bgTargetIndexFromClientX(clientX);
-		const dragged = app.bgSwatches[bgDragIndex];
-		// Paper may only land at first (bg) or last (deactivated).
-		if (dragged && isPaperSwatch(dragged)) {
-			const last = app.bgSwatches.length - 1;
-			target = Math.abs(target - 0) <= Math.abs(target - last) ? 0 : last;
-		}
-		if (target === bgDragIndex) return;
-		const from = bgDragIndex;
-		bgDragIndex = target;
-		app.reorderBgSwatch(from, target, { deferBg: true });
-		syncRocksFromColorSlots();
-	}
-
-	function onBgSlotPointerDown(e: PointerEvent, index: number) {
-		if (e.button !== 0) return;
-		e.preventDefault();
-		bgDragIndex = index;
-		bgDragMoved = false;
-		bgDragStartX = e.clientX;
-		bgDragStartY = e.clientY;
-		bgDragPointerId = e.pointerId;
-		bgDragPendingX = null;
-		if (bgDragRaf) {
-			cancelAnimationFrame(bgDragRaf);
-			bgDragRaf = 0;
-		}
-		cacheBgSlotMids();
-		try {
-			(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-		} catch {
-			/* capture optional; window listeners are source of truth */
-		}
-	}
-
-	function onBgDragMove(e: PointerEvent) {
-		if (bgDragIndex === null) return;
-		if (bgDragPointerId !== null && e.pointerId !== bgDragPointerId) return;
-		const dx = e.clientX - bgDragStartX;
-		const dy = e.clientY - bgDragStartY;
-		if (!bgDragMoved && Math.hypot(dx, dy) < BG_DRAG_THRESHOLD) return;
-		bgDragMoved = true;
-		bgDragPendingX = e.clientX;
-		if (bgDragRaf) return;
-		bgDragRaf = requestAnimationFrame(() => {
-			bgDragRaf = 0;
-			const x = bgDragPendingX;
-			bgDragPendingX = null;
-			if (x === null || bgDragIndex === null) return;
-			applyBgReorder(x);
-		});
-	}
-
-	function onBgDragEnd(e: PointerEvent) {
-		if (bgDragIndex === null) return;
-		if (bgDragPointerId !== null && e.pointerId !== bgDragPointerId) return;
-		if (bgDragRaf) {
-			cancelAnimationFrame(bgDragRaf);
-			bgDragRaf = 0;
-			if (bgDragPendingX !== null && bgDragMoved) applyBgReorder(bgDragPendingX);
-			bgDragPendingX = null;
-		}
-		const index = bgDragIndex;
-		const wasDrag = bgDragMoved;
-		bgDragIndex = null;
-		bgDragMoved = false;
-		bgDragPointerId = null;
-		bgSlotMids = [];
-		if (wasDrag) {
-			app.finalizeBgSwatchOrder();
-			syncRocksFromColorSlots();
-			commitHistory();
-		} else toggleBgSwatchAndRemap(index);
+		return changed;
 	}
 
 	// Download dialog: pick format; optional transparent export when bg is white.
@@ -391,7 +261,6 @@
 	let leadingPaletteId = $state<ColorPaletteId>(app.activePaletteId);
 	let expandedPaletteId = $state<ColorPaletteId>(app.activePaletteId);
 	let paletteSwitching = false;
-	const paletteStripEls: Partial<Record<ColorPaletteId, HTMLDivElement>> = {};
 	/** Frozen swatch order for inactive palettes so condensed strips don't reshuffle. */
 	let frozenSwatches: Partial<Record<ColorPaletteId, BgSwatch[]>> = {};
 
@@ -422,22 +291,6 @@
 				s.hex !== null && !hexEq(s.hex, PAPER_HEX) && !hexEq(s.hex, INK_HEX)
 		);
 	}
-
-	function trackPaletteStrip(id: ColorPaletteId) {
-		return (node: HTMLDivElement) => {
-			paletteStripEls[id] = node;
-			if (expandedPaletteId === id) bgColorsEl = node;
-			return () => {
-				if (paletteStripEls[id] === node) delete paletteStripEls[id];
-				if (bgColorsEl === node) bgColorsEl = null;
-			};
-		};
-	}
-
-	$effect(() => {
-		const id = expandedPaletteId;
-		bgColorsEl = paletteStripEls[id] ?? null;
-	});
 
 	async function onSelectPalette(id: ColorPaletteId) {
 		if (paletteSwitching) return;
@@ -523,6 +376,13 @@
 	} | null = null;
 	let didDragShape = false;
 	let draggingShape = $state(false);
+	/** Dragging the selection rotation handle (filled dot above the bounds). */
+	let rotateDrag: {
+		pivot: paper.Point;
+		lastAngle: number;
+	} | null = null;
+	let didDragRotate = false;
+	let draggingRotate = $state(false);
 	/** Custom cursor while a drag would cull the rock on release. */
 	const TRASH_CURSOR = `url("data:image/svg+xml;utf8,${encodeURIComponent(
 		`<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
@@ -536,7 +396,11 @@
 
 	function dragWouldDelete(paths: paper.Path[]): boolean {
 		const bounds = viewBounds();
-		return paths.some((p) => !rockVisibleOnArtboard(p, bounds));
+		const off = paths.filter((p) => !rockVisibleOnArtboard(p, bounds));
+		if (!off.length) return false;
+		// Mixed multi-select: off-screen members are kept until full deselect.
+		if (paths.length > 1 && off.length < paths.length) return false;
+		return true;
 	}
 
 	function setShapeDragCursor(willDelete: boolean) {
@@ -562,7 +426,23 @@
 	let selectedPaths = $state.raw<paper.Path[]>([]);
 	const selectedPath = $derived(selectedPaths.at(-1) ?? null);
 	const multiSelected = $derived(selectedPaths.length > 1);
-	let selectionOutlines: paper.Path[] = [];
+	/** Oriented selection rectangle that rotates with the selection. */
+	let selectionBox: paper.Path | null = null;
+	/** Short stem from the box edge → rotate handle (always perpendicular). */
+	let rotateStem: paper.Path | null = null;
+	/** Filled rotation-handle dot outside the selection box. */
+	let rotateHandle: paper.Path | null = null;
+	const ROTATE_HANDLE_RADIUS = 6;
+	const ROTATE_HANDLE_HIT_PAD = 5;
+	/** Distance from the box edge to the handle center (along the stem). */
+	const ROTATE_HANDLE_GAP = 18;
+	/** Selection rotation when the box was last reset — box angle is (current − this)
+	 *  so reselect always starts axis-aligned to the canvas. */
+	let rotateHandleZeroRot = 0;
+	/** Local side of the OBB the handle attaches to: -90 top, 90 bottom, 0 right, 180 left. */
+	let rotateHandleLocalSide = -90;
+	/** Cached local OBB rect while rotating (rigid spin keeps size fixed). */
+	let rotateObbLocal: paper.Rectangle | null = null;
 	/** Matter collision body outlines (physics debug mode only). */
 	let collisionDebugGroup: paper.Group | null = null;
 	let ghostRaf = 0;
@@ -582,8 +462,8 @@
 		rockIndex: number;
 		sizeIndex: number;
 		rotation: number;
-		/** Index into `app.bgSwatches` — fill follows whatever color is in this slot. */
-		colorSlot: number;
+		/** Absolute fill hex for this rock (independent of palette order). */
+		colorHex: string;
 		locked?: boolean;
 	}
 	let rockMeta = new WeakMap<paper.Path, RockMeta>();
@@ -606,24 +486,36 @@
 	let tipPos = $state<{ left: number; top: number } | null>(null);
 	let tipAnchor = $state<{ x: number; y: number } | null>(null);
 	let tipEl: HTMLElement | undefined;
+	/** Prevent placeTip ↔ updateRotateHandle feedback loops. */
+	let placingTip = false;
 
 	const ROCK_IMAGE_URLS = ROCK_SVGS.map(
 		(svg) => `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`
 	);
 
 	function placeTip() {
-		if (!tipEl || !tipAnchor || !canvasEl) return;
+		if (placingTip || !tipEl || !tipAnchor || !canvasEl) return;
+		placingTip = true;
+		try {
+			placeTipInner();
+		} finally {
+			placingTip = false;
+		}
+	}
+
+	function placeTipInner() {
 		const pad = 8;
 		const gap = 10;
-		const { width: tw, height: th } = tipEl.getBoundingClientRect();
+		const { width: tw, height: th } = tipEl!.getBoundingClientRect();
 		if (tw < 1 || th < 1) return;
-		const canvas = canvasEl.getBoundingClientRect();
+		const canvas = canvasEl!.getBoundingClientRect();
 		if (canvas.width < 1 || canvas.height < 1) return;
 
-		const ax = tipAnchor.x;
-		const ay = tipAnchor.y;
-		// Single: bottom-left on the rock center. Multi: centered above the group.
-		const baseLeft = selectedPaths.length > 1 ? ax - tw / 2 : ax;
+		const ax = tipAnchor!.x;
+		const ay = tipAnchor!.y;
+		// Center the tip on the rock — left-anchoring (legacy single-select) always
+		// spills right and covers a right-side rotate handle.
+		const centeredLeft = ax - tw / 2;
 
 		const minLeft = canvas.left + pad;
 		const maxLeft = canvas.right - tw - pad;
@@ -631,29 +523,172 @@
 		const maxTop = canvas.bottom - th - pad;
 
 		const clampPos = (left: number, top: number) => ({
-			left: maxLeft >= minLeft ? Math.min(Math.max(left, minLeft), maxLeft) : canvas.left + (canvas.width - tw) / 2,
-			top: maxTop >= minTop ? Math.min(Math.max(top, minTop), maxTop) : canvas.top + (canvas.height - th) / 2
+			left:
+				maxLeft >= minLeft
+					? Math.min(Math.max(left, minLeft), maxLeft)
+					: canvas.left + (canvas.width - tw) / 2,
+			top:
+				maxTop >= minTop
+					? Math.min(Math.max(top, minTop), maxTop)
+					: canvas.top + (canvas.height - th) / 2
 		});
 
-		// Prefer above the rock; fall back below / beside — all clamped to the canvas.
-		const candidates = [
-			{ left: baseLeft, top: ay - th - gap },
-			{ left: baseLeft, top: ay + gap },
-			{ left: ax - tw - gap, top: ay - th / 2 },
-			{ left: ax + gap, top: ay - th / 2 }
-		];
+		const rotating = !!rotateDrag || draggingRotate || rotateHistoryGesture;
+		const sx =
+			ready && paper.view?.viewSize?.width
+				? canvas.width / Math.max(paper.view.viewSize.width, 1)
+				: 1;
+		const sy =
+			ready && paper.view?.viewSize?.height
+				? canvas.height / Math.max(paper.view.viewSize.height, 1)
+				: 1;
+		const handlePad = (ROTATE_HANDLE_RADIUS + ROTATE_HANDLE_HIT_PAD + 14) * Math.max(sx, sy);
 
-		let best = clampPos(candidates[0]!.left, candidates[0]!.top);
-		let bestDist = Infinity;
-		for (const c of candidates) {
-			const p = clampPos(c.left, c.top);
-			const dist = Math.hypot(p.left - c.left, p.top - c.top);
-			if (dist < bestDist - 1e-6) {
-				best = p;
-				bestDist = dist;
-				if (dist < 1e-6) break;
+		const obb =
+			ready &&
+			selectedPaths.length &&
+			!selectionHasLocked() &&
+			!app.imageEditId &&
+			paper.view?.viewSize
+				? selectionObb()
+				: null;
+
+		const toClient = (pt: paper.Point) => ({
+			x: canvas.left + pt.x * sx,
+			y: canvas.top + pt.y * sy
+		});
+
+		/** Tip rect vs handle circle, plus a pad around the stem segment. */
+		const tipHitsHandle = (
+			left: number,
+			top: number,
+			edge: { x: number; y: number },
+			handle: { x: number; y: number }
+		) => {
+			const nearestX = Math.min(Math.max(handle.x, left), left + tw);
+			const nearestY = Math.min(Math.max(handle.y, top), top + th);
+			if (Math.hypot(handle.x - nearestX, handle.y - nearestY) < handlePad) return true;
+			// Distance from tip AABB to stem segment (edge → handle).
+			const samples = 4;
+			for (let i = 0; i <= samples; i++) {
+				const t = i / samples;
+				const sx_ = edge.x + (handle.x - edge.x) * t;
+				const sy_ = edge.y + (handle.y - edge.y) * t;
+				const nx = Math.min(Math.max(sx_, left), left + tw);
+				const ny = Math.min(Math.max(sy_, top), top + th);
+				if (Math.hypot(sx_ - nx, sy_ - ny) < handlePad * 0.65) return true;
+			}
+			return false;
+		};
+
+		const nudgeFromHandle = (
+			left: number,
+			top: number,
+			handle: { x: number; y: number }
+		) => {
+			let l = left;
+			let t = top;
+			for (let i = 0; i < 24; i++) {
+				const nearestX = Math.min(Math.max(handle.x, l), l + tw);
+				const nearestY = Math.min(Math.max(handle.y, t), t + th);
+				const dist = Math.hypot(handle.x - nearestX, handle.y - nearestY);
+				if (dist >= handlePad) break;
+				let awayX = l + tw / 2 - handle.x;
+				let awayY = t + th / 2 - handle.y;
+				let awayLen = Math.hypot(awayX, awayY);
+				if (awayLen < 1e-3) {
+					awayX = 0;
+					awayY = 1;
+					awayLen = 1;
+				}
+				const push = handlePad - dist + 4;
+				l += (awayX / awayLen) * push;
+				t += (awayY / awayLen) * push;
+				({ left: l, top: t } = clampPos(l, t));
+			}
+			return { left: l, top: t };
+		};
+
+		const leftOf = ax - tw - gap;
+		const rightOf = ax + gap;
+		const above = ay - th - gap;
+		const below = ay + gap;
+
+		const tipCandidatesAwayFrom = (hx: number, hy: number) => {
+			const preferLeft = hx >= ax;
+			const preferAbove = hy >= ay;
+			const sideLeft = preferLeft ? leftOf : rightOf;
+			const sideTop = preferAbove ? above : below;
+			return [
+				{ left: sideLeft, top: ay - th / 2 },
+				{ left: centeredLeft, top: sideTop },
+				{ left: sideLeft, top: sideTop },
+				{ left: sideLeft, top: preferAbove ? below : above },
+				{ left: centeredLeft, top: preferAbove ? below : above },
+				{ left: preferLeft ? rightOf : leftOf, top: sideTop },
+				{ left: centeredLeft, top: above },
+				{ left: centeredLeft, top: below },
+				{ left: leftOf, top: ay - th / 2 },
+				{ left: rightOf, top: ay - th / 2 }
+			];
+		};
+
+		// Jointly pick tip placement + handle side so they never share space.
+		const sideOrder = rotating
+			? [rotateHandleLocalSide]
+			: [rotateHandleLocalSide, -90, 90, 0, 180].filter(
+					(s, i, arr) => arr.indexOf(s) === i
+				);
+
+		let best = clampPos(centeredLeft, above);
+		let bestScore = Infinity;
+		let bestSide = rotateHandleLocalSide;
+
+		if (!obb) {
+			for (const c of [
+				{ left: centeredLeft, top: above },
+				{ left: centeredLeft, top: below },
+				{ left: leftOf, top: ay - th / 2 },
+				{ left: rightOf, top: ay - th / 2 }
+			]) {
+				const p = clampPos(c.left, c.top);
+				const score = Math.hypot(p.left - c.left, p.top - c.top);
+				if (score < bestScore) {
+					best = p;
+					bestScore = score;
+				}
+			}
+			tipPos = best;
+			return;
+		}
+
+		for (const side of sideOrder) {
+			const geom = rotateHandleGeometry(obb, side);
+			if (!rotating && !rotateHandleFitsOnArtboard(geom.handle) && side !== rotateHandleLocalSide) {
+				continue;
+			}
+			const edge = toClient(geom.edge);
+			const handle = toClient(geom.handle);
+			for (const c of tipCandidatesAwayFrom(handle.x, handle.y)) {
+				const clamped = clampPos(c.left, c.top);
+				const nudged = nudgeFromHandle(clamped.left, clamped.top, handle);
+				const hit = tipHitsHandle(nudged.left, nudged.top, edge, handle) ? 1e6 : 0;
+				const clampDist = Math.hypot(nudged.left - c.left, nudged.top - c.top);
+				const sidePenalty = side === rotateHandleLocalSide ? 0 : 80;
+				const score = hit + clampDist + sidePenalty;
+				if (score < bestScore - 1e-6) {
+					best = nudged;
+					bestScore = score;
+					bestSide = side;
+				}
 			}
 		}
+
+		if (!rotating && bestSide !== rotateHandleLocalSide) {
+			rotateHandleLocalSide = bestSide;
+			updateRotateHandle();
+		}
+
 		tipPos = best;
 	}
 
@@ -687,7 +722,7 @@
 			rockIndex: number;
 			sizeIndex: number;
 			rotation: number;
-			colorSlot?: number;
+			colorHex?: string;
 			locked?: boolean;
 		}[];
 		attach: [number, string][];
@@ -704,6 +739,7 @@
 	let historyStack: CanvasSnapshot[] = [];
 	let historyIndex = -1;
 	let rotateHistoryGesture = false;
+	let rotateHistoryDirty = false;
 	let rotateHistoryIdleTimer: ReturnType<typeof setTimeout> | null = null;
 	const ROTATE_HISTORY_IDLE_MS = 400;
 
@@ -717,7 +753,7 @@
 					rockIndex: meta?.rockIndex ?? 0,
 					sizeIndex: meta?.sizeIndex ?? app.sizeIndex,
 					rotation: meta?.rotation ?? p.rotation,
-					colorSlot: meta?.colorSlot,
+					colorHex: meta?.colorHex,
 					locked: meta?.locked
 				};
 			}),
@@ -783,9 +819,7 @@
 				rockIndex: rock.rockIndex ?? 0,
 				sizeIndex: rock.sizeIndex ?? app.sizeIndex,
 				rotation: rock.rotation ?? 0,
-				colorSlot:
-					rock.colorSlot ??
-					colorSlotForHex(rock.fillColor ?? app.nextColor.hex),
+				colorHex: rock.colorHex ?? rock.fillColor ?? app.nextColor.hex,
 				locked: rock.locked
 			});
 		}
@@ -837,25 +871,37 @@
 
 	function endRotateHistoryGesture() {
 		const wasRotating = rotateHistoryGesture;
+		const needsSnap = rotateHistoryDirty && historyIndex >= 0;
 		rotateHistoryGesture = false;
+		rotateHistoryDirty = false;
 		if (rotateHistoryIdleTimer) {
 			clearTimeout(rotateHistoryIdleTimer);
 			rotateHistoryIdleTimer = null;
 		}
-		// Wheel rotation defers full fill rebuild until the gesture ends.
-		if (wasRotating) finalizeShapeTransform();
+		if (needsSnap) {
+			historyStack[historyIndex] = captureSnapshot();
+			syncHistoryFlags();
+		}
+		// Live rotate defers Matter rebuilds + fill rebuild until the gesture ends.
+		if (wasRotating) {
+			for (const p of selectedPaths) {
+				if (placed.includes(p)) rebuildFromPath(p);
+			}
+			finalizeShapeTransform();
+		}
 	}
 
 	function commitRotateHistory() {
 		if (!historyRecording || !ready) return;
-		const snap = captureSnapshot();
 		if (rotateHistoryGesture && historyIndex >= 0) {
-			historyStack[historyIndex] = snap;
+			// Coalesce: mark dirty and snapshot once on gesture end (not every frame).
+			rotateHistoryDirty = true;
 		} else {
 			historyStack = historyStack.slice(0, historyIndex + 1);
-			historyStack.push(snap);
+			historyStack.push(captureSnapshot());
 			historyIndex++;
 			rotateHistoryGesture = true;
+			rotateHistoryDirty = false;
 		}
 		syncHistoryFlags();
 		if (rotateHistoryIdleTimer) clearTimeout(rotateHistoryIdleTimer);
@@ -1311,16 +1357,15 @@
 		if (app.backgroundImageId && !solidOnly.has(path)) return false;
 		const hex = app.nextColor.hex;
 		const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
-		const slot = colorSlotForHex(hex);
 		const meta = rockMeta.get(path);
 		if (meta) {
-			rockMeta.set(path, { ...meta, colorSlot: slot });
+			rockMeta.set(path, { ...meta, colorHex: hex });
 		} else {
 			writeRockMeta(path, {
 				rockIndex: app.rockIndex,
 				sizeIndex: app.sizeIndex,
 				rotation: path.rotation,
-				colorSlot: slot
+				colorHex: hex
 			});
 		}
 		if (cur === hex) return false;
@@ -1367,9 +1412,17 @@
 			cx = (left + right) / 2;
 			cy = (top + bottom) / 2;
 		}
+		const sx =
+			ready && paper.view?.viewSize?.width
+				? rect.width / Math.max(paper.view.viewSize.width, 1)
+				: 1;
+		const sy =
+			ready && paper.view?.viewSize?.height
+				? rect.height / Math.max(paper.view.viewSize.height, 1)
+				: 1;
 		tipAnchor = {
-			x: rect.left + cx,
-			y: rect.top + cy
+			x: rect.left + cx * sx,
+			y: rect.top + cy * sy
 		};
 		requestAnimationFrame(placeTip);
 	}
@@ -1429,9 +1482,8 @@
 					rockIndex: 0,
 					sizeIndex: app.sizeIndex,
 					rotation: p.rotation,
-					colorSlot: colorSlotForHex(
-						(p.fillColor as paper.Color | null)?.toCSS(true) ?? app.nextColor.hex
-					),
+					colorHex:
+						(p.fillColor as paper.Color | null)?.toCSS(true) ?? app.nextColor.hex,
 					locked: next
 				});
 		}
@@ -1470,6 +1522,7 @@
 
 	function selectShape(path: paper.Path | null, syncColor = false) {
 		selectedPaths = path ? [path] : [];
+		resetRotateHandleForSelection();
 		if (path) {
 			app.selectCursorTool();
 			if (syncColor) syncColorFromShape(path);
@@ -1477,6 +1530,8 @@
 		syncSelectionUi(path);
 		updateSelectionVisuals();
 		updateGhost();
+		// Flush rocks that were only kept while a mixed multi-select stayed selected.
+		if (cullOffCanvasPlaced()) commitHistory();
 	}
 
 	function toggleSelectShape(path: paper.Path, syncColor = false) {
@@ -1484,6 +1539,7 @@
 		const next =
 			idx >= 0 ? selectedPaths.filter((p) => p !== path) : [...selectedPaths, path];
 		selectedPaths = next;
+		resetRotateHandleForSelection();
 		if (next.length) {
 			app.selectCursorTool();
 			const primary = next[next.length - 1]!;
@@ -1496,6 +1552,7 @@
 		}
 		updateSelectionVisuals();
 		updateGhost();
+		if (cullOffCanvasPlaced()) commitHistory();
 	}
 
 	function clearMarquee() {
@@ -1530,6 +1587,7 @@
 			? [...baseline, ...hits.filter((p) => !baseline.includes(p))]
 			: hits;
 		selectedPaths = next;
+		resetRotateHandleForSelection();
 		if (next.length) {
 			app.selectCursorTool();
 			const primary = next[next.length - 1]!;
@@ -1540,11 +1598,12 @@
 		}
 		updateSelectionVisuals();
 		updateGhost();
+		if (cullOffCanvasPlaced()) commitHistory();
 	}
 
 	/** Scale factor for a given size index at the current artboard. */
 	function scaleForSize(sizeIndex: number): number {
-		return (ROCK_SIZES[sizeIndex].fraction * Math.sqrt(artboard.w * artboard.h)) / ROCK_HEIGHT;
+		return (ROCK_SIZES[sizeIndex].fraction * artboard.h) / ROCK_HEIGHT;
 	}
 
 	/** Rebuild a placed rock's outline as a different shape/size in place.
@@ -1567,9 +1626,8 @@
 					rockIndex: 0,
 					sizeIndex: app.sizeIndex,
 					rotation,
-					colorSlot: colorSlotForHex(
+					colorHex:
 						(path.fillColor as paper.Color | null)?.toCSS(true) ?? app.nextColor.hex
-					)
 				};
 		const savedAnchor = tipAnchor ? { ...tipAnchor } : null;
 		const savedTip = tipPos ? { ...tipPos } : null;
@@ -1606,9 +1664,9 @@
 			rockIndex: nextRock,
 			sizeIndex: nextSize,
 			rotation,
-			colorSlot:
-				meta?.colorSlot ??
-				colorSlotForHex((path.fillColor as paper.Color | null)?.toCSS(true) ?? app.nextColor.hex),
+			colorHex:
+				meta?.colorHex ??
+				((path.fillColor as paper.Color | null)?.toCSS(true) ?? app.nextColor.hex),
 			locked: meta?.locked
 		});
 		selectedRockIndex = nextRock;
@@ -1721,8 +1779,198 @@
 		editGhost.sendToBack();
 	}
 
+	function clearRotateHandle() {
+		rotateStem?.remove();
+		rotateHandle?.remove();
+		rotateStem = null;
+		rotateHandle = null;
+	}
+
+	/** Primary selection rotation (drives OBB orientation). */
+	function selectionRotation(): number {
+		if (!selectedPaths.length) return 0;
+		const primary = selectedPaths.at(-1)!;
+		return rockMeta.get(primary)?.rotation ?? primary.rotation;
+	}
+
+	/**
+	 * Selection box: axis-aligned on select, then rotates by how far the rock has
+	 * turned since that select (sides stay perpendicular to the handle).
+	 * During handle-drag the local rect is invariant about the fixed pivot — reuse it.
+	 */
+	function selectionObb(): {
+		pivot: paper.Point;
+		rect: paper.Rectangle;
+		rotation: number;
+	} | null {
+		if (!selectedPaths.length) return null;
+		const boxRotation = selectionRotation() - rotateHandleZeroRot;
+
+		if (rotateObbLocal && rotateDrag) {
+			return {
+				pivot: rotateDrag.pivot.clone(),
+				rect: rotateObbLocal.clone(),
+				rotation: boxRotation
+			};
+		}
+
+		const pivot = rotateDrag?.pivot.clone() ?? selectionCenter();
+		if (!pivot) return null;
+		const clones: paper.Path[] = [];
+		try {
+			for (const path of selectedPaths) {
+				const clone = path.clone({ insert: false }) as paper.Path;
+				clone.rotate(-boxRotation, pivot);
+				clones.push(clone);
+			}
+			let bounds = clones[0]!.bounds;
+			for (let i = 1; i < clones.length; i++) bounds = bounds.unite(clones[i]!.bounds);
+			const rect = bounds.clone();
+			if (rotateDrag) rotateObbLocal = rect.clone();
+			return { pivot, rect, rotation: boxRotation };
+		} finally {
+			for (const clone of clones) clone.remove();
+		}
+	}
+
+	/** Midpoint of a local (unrotated) rect side, before world rotation. */
+	function localSideMidpoint(rect: paper.Rectangle, localSide: number): paper.Point {
+		if (localSide === 90) return new paper.Point(rect.center.x, rect.bottom);
+		if (localSide === 0) return new paper.Point(rect.right, rect.center.y);
+		if (localSide === 180 || localSide === -180) return new paper.Point(rect.left, rect.center.y);
+		return new paper.Point(rect.center.x, rect.top); // -90 = top
+	}
+
+	function rotateHandleGeometry(
+		obb: { pivot: paper.Point; rect: paper.Rectangle; rotation: number },
+		localSide: number
+	): { edge: paper.Point; handle: paper.Point } {
+		const edge = localSideMidpoint(obb.rect, localSide).rotate(obb.rotation, obb.pivot);
+		const outward = new paper.Point({
+			length: ROTATE_HANDLE_GAP,
+			angle: obb.rotation + localSide
+		});
+		return { edge, handle: edge.add(outward) };
+	}
+
+	/** True when the handle dot sits fully inside the artboard (with padding). */
+	function rotateHandleFitsOnArtboard(pos: paper.Point): boolean {
+		const b = viewBounds();
+		const pad = ROTATE_HANDLE_RADIUS + 2;
+		return (
+			pos.x >= b.left + pad &&
+			pos.x <= b.right - pad &&
+			pos.y >= b.top + pad &&
+			pos.y <= b.bottom - pad
+		);
+	}
+
+	function angleDiffDeg(a: number, b: number): number {
+		return Math.abs((((a - b) % 360) + 540) % 360 - 180);
+	}
+
+	/** Prefer the local side whose outward normal is closest to world-up and on-canvas. */
+	function pickRotateHandleLocalSide(obb: {
+		pivot: paper.Point;
+		rect: paper.Rectangle;
+		rotation: number;
+	}): number {
+		const candidates = [-90, 90, 0, 180];
+		const fitting = candidates.filter((side) =>
+			rotateHandleFitsOnArtboard(rotateHandleGeometry(obb, side).handle)
+		);
+		const pool = fitting.length ? fitting : candidates;
+		let best = pool[0]!;
+		let bestScore = Infinity;
+		for (const side of pool) {
+			const world = obb.rotation + side;
+			const score = angleDiffDeg(world, -90);
+			if (score < bestScore - 1e-6) {
+				best = side;
+				bestScore = score;
+			}
+		}
+		return best;
+	}
+
+	/** If the handle sits off-canvas, flip it to the best on-canvas side. */
+	function ensureRotateHandleOnArtboard(): boolean {
+		if (!selectedPaths.length || selectionHasLocked() || app.imageEditId) return false;
+		const obb = selectionObb();
+		if (!obb) return false;
+		const current = rotateHandleGeometry(obb, rotateHandleLocalSide).handle;
+		if (rotateHandleFitsOnArtboard(current)) return false;
+		rotateHandleLocalSide = pickRotateHandleLocalSide(obb);
+		return true;
+	}
+
+	/** Reset to an axis-aligned box; prefer handle on the top side. */
+	function resetRotateHandleForSelection() {
+		rotateObbLocal = null;
+		if (!selectedPaths.length) {
+			rotateHandleZeroRot = 0;
+			rotateHandleLocalSide = -90;
+			return;
+		}
+		rotateHandleZeroRot = selectionRotation();
+		const obb = selectionObb();
+		rotateHandleLocalSide = obb ? pickRotateHandleLocalSide(obb) : -90;
+	}
+
+	/** Selection AABB center (matches multi-rotate pivot / tip anchor). */
+	function selectionCenter(): paper.Point | null {
+		if (!selectedPaths.length) return null;
+		if (selectedPaths.length === 1) return selectedPaths[0]!.bounds.center.clone();
+		return unitedBoundsOf(selectedPaths).center.clone();
+	}
+
+	function rotateHandleAt(point: paper.Point): boolean {
+		if (!rotateHandle) return false;
+		return point.getDistance(rotateHandle.position) <= ROTATE_HANDLE_RADIUS + ROTATE_HANDLE_HIT_PAD;
+	}
+
+	/** Box, stem, and handle sit above rock fills. */
 	function raiseSelectionVisuals() {
-		for (const outline of selectionOutlines) outline.bringToFront();
+		selectionBox?.bringToFront();
+		rotateStem?.bringToFront();
+		rotateHandle?.bringToFront();
+	}
+
+	function updateRotateHandle(
+		obbIn?: { pivot: paper.Point; rect: paper.Rectangle; rotation: number } | null
+	) {
+		clearRotateHandle();
+		if (!selectedPaths.length || selectionHasLocked() || app.imageEditId) return;
+		const obb = obbIn === undefined ? selectionObb() : obbIn;
+		if (!obb) return;
+
+		// Idle: keep the handle on-canvas by flipping to another box side.
+		// While dragging/rotating: leave the side alone and allow off-screen.
+		const rotating = !!rotateDrag || draggingRotate || rotateHistoryGesture;
+		if (!rotating) ensureRotateHandleOnArtboard();
+
+		const { edge, handle: handlePos } = rotateHandleGeometry(obb, rotateHandleLocalSide);
+		const ink = new paper.Color('#101A31');
+
+		if (handlePos.getDistance(edge) > 1) {
+			rotateStem = new paper.Path.Line(edge, handlePos);
+			rotateStem.strokeColor = ink;
+			rotateStem.strokeWidth = 1.5;
+			rotateStem.strokeScaling = false;
+			rotateStem.opacity = 0.55;
+			paper.project.activeLayer.addChild(rotateStem);
+		}
+
+		rotateHandle = new paper.Path.Circle(handlePos, ROTATE_HANDLE_RADIUS);
+		rotateHandle.fillColor = ink;
+		rotateHandle.strokeColor = new paper.Color('#FFFFFF');
+		rotateHandle.strokeWidth = 1.5;
+		rotateHandle.strokeScaling = false;
+		paper.project.activeLayer.addChild(rotateHandle);
+
+		raiseSelectionVisuals();
+		// Handle side may have flipped — keep the tip from covering it.
+		if (!placingTip && tipAnchor && tipEl && !draggingRotate) requestAnimationFrame(placeTip);
 	}
 
 	function clearCollisionDebug() {
@@ -1779,26 +2027,38 @@
 		collisionDebugGroup.bringToFront();
 	}
 
+	function clearSelectionBox() {
+		selectionBox?.remove();
+		selectionBox = null;
+	}
+
 	function updateSelectionOutline() {
-		for (const outline of selectionOutlines) outline.remove();
-		selectionOutlines = [];
+		clearSelectionBox();
 		const next = selectedPaths.filter((p) => placed.includes(p));
 		if (next.length !== selectedPaths.length) {
 			selectedPaths = next;
+			resetRotateHandleForSelection();
 			syncSelectionUi(next.at(-1) ?? null);
 		}
-		if (!selectedPaths.length) return;
-		for (const path of selectedPaths) {
-			const outline = cloneRockGeometry(path);
-			const locked = isLocked(path);
-			outline.strokeColor = new paper.Color(locked ? '#2F6FED' : '#101A31');
-			outline.strokeWidth = locked ? 2 : 1.5;
-			outline.dashArray = locked ? [] : [5, 4];
-			outline.fillColor = null;
-			outline.opacity = locked ? 0.9 : 0.55;
-			paper.project.activeLayer.addChild(outline);
-			selectionOutlines.push(outline);
+		if (!selectedPaths.length) {
+			clearRotateHandle();
+			rotateHandleZeroRot = 0;
+			rotateHandleLocalSide = -90;
+			return;
 		}
+		const obb = selectionObb();
+		if (!obb) return;
+		const locked = selectionHasLocked();
+		selectionBox = new paper.Path.Rectangle(obb.rect);
+		selectionBox.rotate(obb.rotation, obb.pivot);
+		selectionBox.strokeColor = new paper.Color(locked ? '#2F6FED' : '#101A31');
+		selectionBox.strokeWidth = locked ? 2 : 1.5;
+		selectionBox.dashArray = locked ? [] : [5, 4];
+		selectionBox.fillColor = null;
+		selectionBox.opacity = locked ? 0.9 : 0.55;
+		selectionBox.strokeScaling = false;
+		paper.project.activeLayer.addChild(selectionBox);
+		updateRotateHandle(obb);
 		raiseSelectionVisuals();
 	}
 
@@ -1824,13 +2084,17 @@
 	function rotateShapeFree(
 		path: paper.Path,
 		degrees: number,
-		ignore: Set<paper.Path> = new Set()
+		ignore: Set<paper.Path> = new Set(),
+		live = false
 	): boolean {
 		const meta = rockMeta.get(path);
 		const beforeRotation = meta?.rotation ?? path.rotation;
 		const others = placed.filter((p) => p !== path && !ignore.has(p));
 
-		const applied = rotateKinematic([path], degrees, others);
+		const applied = rotateKinematic([path], degrees, others, {
+			preferredPivot: live ? path.bounds.center : undefined,
+			live
+		});
 		if (Math.abs(applied) < 1e-4) return false;
 		if (meta) {
 			rockMeta.set(path, {
@@ -1845,10 +2109,10 @@
 	 *  off-center pivot when blocked). Multi: around the selection's shared
 	 *  center as a rigid body, with the same free-angle / alternate-pivot rules.
 	 *  Never commits an overlapping pose. */
-	function rotateSelectedShapes(degrees: number): boolean {
+	function rotateSelectedShapes(degrees: number, live = false): boolean {
 		if (!selectedPaths.length || selectionHasLocked()) return false;
 		if (selectedPaths.length === 1) {
-			return rotateShapeFree(selectedPaths[0]!, degrees);
+			return rotateShapeFree(selectedPaths[0]!, degrees, new Set(), live);
 		}
 
 		let left = Infinity;
@@ -1862,7 +2126,7 @@
 			if (b.right > right) right = b.right;
 			if (b.bottom > bottom) bottom = b.bottom;
 		}
-		const pivot = new paper.Point((left + right) / 2, (top + bottom) / 2);
+		const pivot = live && rotateDrag ? rotateDrag.pivot : new paper.Point((left + right) / 2, (top + bottom) / 2);
 
 		const ignore = new Set(selectedPaths);
 		const others = placed.filter((p) => !ignore.has(p));
@@ -1872,7 +2136,10 @@
 			rotation: rockMeta.get(p)?.rotation ?? p.rotation
 		}));
 
-		const applied = rotateKinematic(selectedPaths, degrees, others, pivot);
+		const applied = rotateKinematic(selectedPaths, degrees, others, {
+			preferredPivot: pivot,
+			live
+		});
 		if (Math.abs(applied) < 1e-4) return false;
 
 		for (const b of befores) {
@@ -1936,13 +2203,23 @@
 	}
 
 	/** Drop rocks that aren't meaningfully on the artboard. They still collide
-	 *  and read as phantom walls after an aspect change or off-canvas drag. */
+	 *  and read as phantom walls after an aspect change or off-canvas drag.
+	 *  Exception: in a multi-selection where some rocks remain visible, keep the
+	 *  off-screen selected members until the selection is fully cleared. */
 	function cullOffCanvasPlaced(bounds: paper.Rectangle = viewBounds()): boolean {
 		if (placed.length === 0) return false;
+		const selectedSet = new Set(selectedPaths);
+		const selectedVisible =
+			selectedPaths.length > 1 &&
+			selectedPaths.some((p) => rockVisibleOnArtboard(p, bounds));
 		const kept: paper.Path[] = [];
 		let removed = false;
 		for (const rock of placed) {
 			if (rockVisibleOnArtboard(rock, bounds)) {
+				kept.push(rock);
+				continue;
+			}
+			if (selectedVisible && selectedSet.has(rock)) {
 				kept.push(rock);
 				continue;
 			}
@@ -1960,7 +2237,11 @@
 		if (nextSel.length !== selectedPaths.length) {
 			selectedPaths = nextSel;
 			if (!nextSel.length) {
-				selectShape(null);
+				// Inline clear — avoid selectShape(null) which would re-enter cull.
+				resetRotateHandleForSelection();
+				syncSelectionUi(null);
+				updateSelectionVisuals();
+				updateGhost();
 			} else {
 				syncSelectionUi(nextSel[nextSel.length - 1]!);
 				updateSelectionVisuals();
@@ -2003,11 +2284,10 @@
 		return { w: Math.max(Math.round(w), 1), h: Math.max(Math.round(h), 1) };
 	});
 
-	// Scale factor for the source rocks (normalized to ROCK_HEIGHT tall) so
-	// the tallest rock spans the chosen fraction of sqrt(canvas area) —
-	// tying size to the canvas itself, independent of aspect ratio.
+	// Scale factor for source rocks (normalized to ROCK_HEIGHT wide) so that
+	// shared width spans the chosen fraction of canvas height (one shape unit).
 	let sizeScale = $derived(
-		(app.rockSize.fraction * Math.sqrt(artboard.w * artboard.h)) / ROCK_HEIGHT
+		(app.rockSize.fraction * artboard.h) / ROCK_HEIGHT
 	);
 
 	function viewBounds(): paper.Rectangle {
@@ -2381,12 +2661,12 @@
 		}
 		ghostSuppressedUntil = 0;
 		ghost?.remove();
-		for (const outline of selectionOutlines) outline.remove();
+		clearSelectionBox();
+		clearRotateHandle();
 		destroyCollisionDebug();
 		clearMarquee();
 		clearEditGhost();
 		ghost = null;
-		selectionOutlines = [];
 	}
 
 	function restoreUiOverlays() {
@@ -2582,7 +2862,9 @@
 			shapes: app.enabledShapes,
 			sizeIndex: app.sizeIndex,
 			seed,
-			obstacles: lockedPaths
+			obstacles: lockedPaths,
+			stackCount: app.stackCount,
+			aspect: app.aspect
 		});
 		debugJson('shuffle:generated', {
 			seed,
@@ -2625,9 +2907,8 @@
 				rockIndex: data?.rockIndex ?? 0,
 				sizeIndex: data?.sizeIndex ?? app.sizeIndex,
 				rotation: data?.rotation ?? rock.rotation,
-				colorSlot: colorSlotForHex(
+				colorHex:
 					(rock.fillColor as paper.Color | null)?.toCSS(true) ?? app.nextColor.hex
-				)
 			});
 		}
 
@@ -2712,7 +2993,7 @@
 			rockIndex: app.rockIndex,
 			sizeIndex: app.sizeIndex,
 			rotation: app.rotation,
-			colorSlot: colorSlotForHex(app.nextColor.hex)
+			colorHex: app.nextColor.hex
 		});
 
 		// Union the new rock with every placed rock it touches.
@@ -2767,6 +3048,29 @@
 			if (canvasEl) canvasEl.style.cursor = 'grabbing';
 			return;
 		}
+		if (rotateDrag) {
+			const angle =
+				(Math.atan2(point.y - rotateDrag.pivot.y, point.x - rotateDrag.pivot.x) * 180) /
+				Math.PI;
+			let delta = angle - rotateDrag.lastAngle;
+			if (delta > 180) delta -= 360;
+			if (delta < -180) delta += 360;
+			// Cap per-frame spin so collision probes stay bounded on fast drags.
+			const MAX_FRAME_ROTATE = 18;
+			if (delta > MAX_FRAME_ROTATE) delta = MAX_FRAME_ROTATE;
+			else if (delta < -MAX_FRAME_ROTATE) delta = -MAX_FRAME_ROTATE;
+			rotateDrag.lastAngle = angle;
+			if (Math.abs(delta) > 1e-4 && rotateSelectedShapes(delta, true)) {
+				syncFillClipsForPaths(selectedPaths);
+				updateSelectionVisuals();
+				commitRotateHistory();
+				didDragRotate = true;
+				draggingRotate = true;
+			}
+			if (canvasEl) canvasEl.style.cursor = 'grabbing';
+			document.body.style.cursor = 'grabbing';
+			return;
+		}
 		if (shapeDrag) {
 			const { paths, grabOffset } = shapeDrag;
 			moveShapesTo(paths, point, grabOffset);
@@ -2795,6 +3099,8 @@
 				const shape = shapeAt(point);
 				const hit = editImageAt(point);
 				canvasEl.style.cursor = hit ? 'grab' : shape ? 'copy' : '';
+			} else if (rotateHandleAt(point)) {
+				canvasEl.style.cursor = 'grab';
 			} else {
 				canvasEl.style.cursor = '';
 			}
@@ -2807,6 +3113,10 @@
 	/** Shared up logic — idempotent so paper + window can both call it. */
 	function handleViewUp() {
 		if (imageDrag && didDragImage && !app.imageEditId) commitHistory();
+		if (rotateDrag && didDragRotate) {
+			endRotateHistoryGesture();
+			updateTipPos();
+		}
 		if (shapeDrag && didDragShape) {
 			endDrag(shapeDrag.paths);
 			finalizeShapeTransform();
@@ -2824,8 +3134,21 @@
 		draggingMarquee = false;
 		imageDrag = null;
 		shapeDrag = null;
+		rotateDrag = null;
 		draggingShape = false;
+		draggingRotate = false;
+		rotateObbLocal = null;
 		clearShapeDragCursor();
+		// After rotate/drag release, flip an off-screen handle back onto the artboard
+		// and re-place the tip (handle side may have changed).
+		if (selectedPaths.length && !app.imageEditId) {
+			requestAnimationFrame(() => {
+				ensureRotateHandleOnArtboard();
+				updateSelectionVisuals();
+				updateTipPos(true);
+				placeTip();
+			});
+		}
 	}
 
 	function setupPaper() {
@@ -2871,11 +3194,11 @@
 			return path;
 		});
 
-		// Apply one shared multiplier so the rocks keep their relative proportions:
-		// the tallest rock becomes ROCK_HEIGHT, the rest scale by the same factor.
-		const tallest = Math.max(...sourcePaths.map((p) => p.bounds.height));
-		const factor = ROCK_HEIGHT / tallest;
-		for (const p of sourcePaths) p.scale(factor);
+		// Uniform per-rock scale (no stretch): every rock shares the same width.
+		for (const p of sourcePaths) {
+			const w = p.bounds.width;
+			if (w > 0) p.scale(ROCK_HEIGHT / w);
+		}
 
 		paper.view.onMouseMove = (event: paper.MouseEvent) => {
 			handleViewMove(event.point);
@@ -2884,13 +3207,14 @@
 		// updating `pointer` / drags / marquee past the artboard edge.
 		paper.view.onMouseLeave = () => {
 			// Keep the drag cursor (grab / trash) via body while off-canvas.
-			if (shapeDrag) return;
+			if (shapeDrag || rotateDrag) return;
 			if (canvasEl) canvasEl.style.cursor = '';
 		};
 		paper.view.onMouseDown = (event: paper.MouseEvent) => {
 			didDragImage = false;
 			didDragShape = false;
 			didDragMarquee = false;
+			didDragRotate = false;
 			if (app.imageEditId) {
 				const hit = editImageAt(event.point);
 				if (hit) imageDrag = { kind: hit.kind, fill: hit.fill, last: event.point };
@@ -2899,6 +3223,20 @@
 			// Drop invisible / sliver-off-canvas rocks before hit-testing so they
 			// cannot block placement or feel like phantom walls.
 			cullOffCanvasPlaced();
+			if (rotateHandleAt(event.point) && !selectionHasLocked()) {
+				const pivot = selectionCenter();
+				if (pivot) {
+					rotateDrag = {
+						pivot,
+						lastAngle:
+							(Math.atan2(event.point.y - pivot.y, event.point.x - pivot.x) * 180) /
+							Math.PI
+					};
+					if (canvasEl) canvasEl.style.cursor = 'grabbing';
+					document.body.style.cursor = 'grabbing';
+					return;
+				}
+			}
 			const shape = shapeAt(event.point);
 			if (shape) {
 				const shift =
@@ -2935,10 +3273,11 @@
 			handleViewUp();
 		};
 		paper.view.onClick = (event: paper.MouseEvent) => {
-			if (didDragImage || didDragShape || didDragMarquee) {
+			if (didDragImage || didDragShape || didDragMarquee || didDragRotate) {
 				didDragImage = false;
 				didDragShape = false;
 				didDragMarquee = false;
+				didDragRotate = false;
 				return;
 			}
 			if (app.imageEditId) {
@@ -2946,6 +3285,8 @@
 				if (shape) toggleImageMask(shape);
 				return;
 			}
+			// Clicking the rotation handle must not clear the selection.
+			if (rotateHandleAt(event.point)) return;
 			const shape = shapeAt(event.point);
 			if (shape) {
 				// Selection already handled on mousedown — don't wipe multi-select.
@@ -2986,12 +3327,18 @@
 			attach = new Map();
 			imageDrag = null;
 			shapeDrag = null;
+			rotateDrag = null;
 			clearMarquee();
 			marqueeDrag = null;
 			draggingMarquee = false;
 			didDragMarquee = false;
+			draggingRotate = false;
 			selectedPaths = [];
-			selectionOutlines = [];
+			selectionBox = null;
+			rotateStem = null;
+			rotateHandle = null;
+			rotateHandleZeroRot = 0;
+			rotateHandleLocalSide = -90;
 			bgCenter = null;
 			bgId = null;
 			paper.project.clear();
@@ -3008,12 +3355,31 @@
 		return bounds;
 	}
 
-	/** Refit the placed arrangement to the current artboard: scale the whole
-	 *  composition so rocks stay proportional to the canvas (using sqrt of area,
-	 *  matching how rocks are sized at generation), then re-anchor —
-	 *  bottom-center in stack mode, centered in cluster mode.
-	 *  When any rocks are locked, scale pivots on the locked cluster's center
-	 *  and skip re-anchoring so locked rocks stay put. */
+	/** Rebuild a rock from its template at the target artboard height, keeping
+	 *  rotation and seating it on `center`. */
+	function rebuildRockAtSize(path: paper.Path, center: paper.Point, artboardH: number) {
+		const meta = rockMeta.get(path);
+		const rockIndex = meta?.rockIndex ?? 0;
+		const sizeIndex = meta?.sizeIndex ?? app.sizeIndex;
+		const rotation = meta?.rotation ?? 0;
+		const src = sourcePaths[rockIndex];
+		if (!src) return;
+		const next = src.clone({ insert: false }) as paper.Path;
+		next.scale((ROCK_SIZES[sizeIndex].fraction * artboardH) / ROCK_HEIGHT);
+		next.rotate(rotation);
+		next.position = center;
+		path.pathData = next.pathData;
+		next.remove();
+		invalidateSamples(path);
+		rebuildFromPath(path);
+	}
+
+	/** Uniformly scale the placed arrangement with the artboard height (the
+	 *  project’s shape-unit basis). Positions and rock sizes share one factor so
+	 *  contacts, gaps, and proportions stay the same. Then re-anchor —
+	 *  bottom-center in stack mode, centered in cluster mode. When any rocks are
+	 *  locked, the locked cluster is the pivot and re-anchoring is skipped so
+	 *  locked rocks stay put. */
 	function repositionPlaced(w: number, h: number) {
 		if (placed.length === 0) {
 			placedArtboard = { w, h };
@@ -3022,15 +3388,21 @@
 
 		const locked = placed.filter(isLocked);
 
-		const prevArea = placedArtboard.w * placedArtboard.h;
-		if (prevArea > 0 && w > 0 && h > 0) {
-			const factor = Math.sqrt((w * h) / prevArea);
-			if (Math.abs(factor - 1) > 1e-4) {
+		const prevW = placedArtboard.w;
+		const prevH = placedArtboard.h;
+		if (prevW > 0 && prevH > 0 && w > 0 && h > 0) {
+			// One scale for X and Y — matches rebuildRockAtSize (height-normalized).
+			// Independent sx/sy stretches gaps and breaks contacts on aspect change.
+			const s = h / prevH;
+			if (Math.abs(s - 1) > 1e-4) {
 				const pivot = (locked.length ? unitedBoundsOf(locked) : unitedBounds()).center;
 				for (const p of placed) {
-					p.scale(factor, pivot);
-					invalidateSamples(p);
-					rebuildFromPath(p);
+					const c = p.bounds.center;
+					const center = new paper.Point(
+						pivot.x + (c.x - pivot.x) * s,
+						pivot.y + (c.y - pivot.y) * s
+					);
+					rebuildRockAtSize(p, center, h);
 				}
 			}
 		}
@@ -3149,8 +3521,7 @@
 				if (!cur || !hexEq(cur, swap.from)) continue;
 				path.fillColor = new paper.Color(swap.to);
 				const meta = rockMeta.get(path);
-				const slot = colorSlotForHex(swap.to);
-				if (meta) rockMeta.set(path, { ...meta, colorSlot: slot });
+				if (meta) rockMeta.set(path, { ...meta, colorHex: swap.to });
 				changed = true;
 			}
 			if (selectedPaths.length) syncSelectionUi(selectedPaths.at(-1) ?? null);
@@ -3159,7 +3530,7 @@
 		});
 	});
 
-	// Top-bar dice: sync rock fills from palette slots. Palette switch: randomize into new pool.
+	// Top-bar dice: randomize unlocked rock fills. Palette switch: same into new pool.
 	$effect(() => {
 		if (!ready) return;
 		const shuffleVersion = app.colorShuffleVersion;
@@ -3170,37 +3541,7 @@
 		seenColorShuffleVersion = shuffleVersion;
 		seenPaletteSwitchVersion = paletteVersion;
 		untrack(() => {
-			let changed = false;
-
-			if (shuffled) {
-				changed = syncRocksFromColorSlots();
-			} else if (switched) {
-				const pool = app.enabledBgRockColors;
-				if (!pool.length) return;
-				for (const path of placed) {
-					if (isLocked(path)) continue;
-					if (attach.has(path)) continue;
-					if (app.backgroundImageId && !solidOnly.has(path)) continue;
-					const hex = pool[Math.floor(Math.random() * pool.length)]!;
-					const cur = (path.fillColor as paper.Color | null)?.toCSS(true);
-					const slot = colorSlotForHex(hex);
-					const meta = rockMeta.get(path);
-					if (meta) rockMeta.set(path, { ...meta, colorSlot: slot });
-					else
-						writeRockMeta(path, {
-							rockIndex: 0,
-							sizeIndex: app.sizeIndex,
-							rotation: path.rotation,
-							colorSlot: slot
-						});
-					if (cur && hexEq(cur, hex)) continue;
-					path.fillColor = new paper.Color(hex);
-					changed = true;
-				}
-				if (selectedPaths.length) syncSelectionUi(selectedPaths.at(-1) ?? null);
-				updateGhost();
-			}
-
+			const changed = shuffleUnlockedRockFills();
 			if (changed) commitHistory();
 		});
 	});
@@ -3308,7 +3649,7 @@
 		if (selectedPaths.length) {
 			if (selectionHasLocked()) return;
 			event.preventDefault();
-			if (rotateSelectedShapes(event.deltaY * 0.25)) {
+			if (rotateSelectedShapes(event.deltaY * 0.25, true)) {
 				syncFillClipsForPaths(selectedPaths);
 				updateSelectionVisuals();
 				updateTipPos();
@@ -3326,7 +3667,7 @@
 		if (!selectedPaths.length || app.imageEditId || selectionHasLocked()) return;
 		event.preventDefault();
 		event.stopPropagation();
-		if (rotateSelectedShapes(event.deltaY * 0.25)) {
+		if (rotateSelectedShapes(event.deltaY * 0.25, true)) {
 			syncFillClipsForPaths(selectedPaths);
 			updateSelectionVisuals();
 			updateTipPos();
@@ -3419,10 +3760,6 @@
 	/** Outside-canvas moves: skip when the event is on the canvas itself so
 	 *  paper.view.onMouseMove remains the sole in-bounds handler. */
 	function onWindowPointerMove(event: PointerEvent) {
-		if (bgDragIndex !== null) {
-			onBgDragMove(event);
-			return;
-		}
 		if (!ready || !canvasEl) return;
 		if (event.target === canvasEl) return;
 		const point = clientToView(event.clientX, event.clientY);
@@ -3432,11 +3769,7 @@
 
 	/** Always end interactions on window up so release outside the canvas
 	 *  commits/cancels. Idempotent with paper.view.onMouseUp. */
-	function onWindowPointerUp(event: PointerEvent) {
-		if (bgDragIndex !== null) {
-			onBgDragEnd(event);
-			return;
-		}
+	function onWindowPointerUp(_event: PointerEvent) {
 		if (!ready) return;
 		handleViewUp();
 	}
@@ -3485,27 +3818,15 @@
 		{#if !app.imageEditId}
 			<div class="bg-bar" role="toolbar" aria-label="Canvas background">
 				<button
-					class="bg-dice"
+					class="bg-shuffle"
 					type="button"
 					onclick={rollBgColors}
-					title="Shuffle palette order"
-					aria-label="Shuffle palette order"
+					title="Shuffle rock colors"
+					aria-label="Shuffle rock colors"
 				>
-					<svg bind:this={bgDiceSvg} viewBox="0 0 16 16" aria-hidden="true">
-						<rect
-							x="2.5"
-							y="2.5"
-							width="11"
-							height="11"
-							rx="2"
-							stroke="currentColor"
-							stroke-width="1.3"
-							fill="none"
-						/>
-						<circle cx="5.5" cy="5.5" r="1.1" fill="currentColor" />
-						<circle cx="8" cy="8" r="1.1" fill="currentColor" />
-						<circle cx="10.5" cy="10.5" r="1.1" fill="currentColor" />
-					</svg>
+					<span class="shuffle-pulse" bind:this={bgShufflePulse}>
+						<ShuffleIcon size={16} />
+					</span>
 				</button>
 				{#each orderedPalettes as palette (palette.id)}
 					{@const expanded = expandedPaletteId === palette.id}
@@ -3524,7 +3845,6 @@
 							tabindex={expanded ? undefined : 0}
 							title={expanded ? undefined : `${palette.name} palette`}
 							aria-label={expanded ? `${palette.name} palette` : `Select ${palette.name} palette`}
-							{@attach trackPaletteStrip(palette.id)}
 							onclick={() => {
 								if (!expanded) onSelectPalette(palette.id);
 							}}
@@ -3537,39 +3857,48 @@
 							}}
 						>
 							{#each paletteDisplaySwatches(palette, expanded) as swatch, i (swatch.key)}
+								{@const isCanvasBg =
+									!!swatch.hex &&
+									typeof app.canvasBg === 'string' &&
+									hexEq(swatch.hex, app.canvasBg)}
+								{@const appearsEnabled = isPaperHex(swatch.hex)
+									? isCanvasBg
+									: swatch.enabled || isCanvasBg}
+								{@const canDisable =
+									interactive &&
+									appearsEnabled &&
+									!isCanvasBg &&
+									!isPaperHex(swatch.hex)}
 								<!-- tabindex is only set when role=button (expanded interactive) -->
 								<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 								<div
 									class={[
 										'bg-slot',
 										{
-											active: interactive && i === 0,
-											dragging: interactive && bgDragIndex === i
+											active: interactive && isCanvasBg,
+											off: interactive && !appearsEnabled,
+											togglable: canDisable
 										}
 									]}
 									role={interactive ? 'button' : undefined}
 									tabindex={interactive ? 0 : undefined}
-									animate:flip={{ duration: interactive ? 320 : 0, easing: cubicOut }}
-									title={interactive ? bgSwatchTitle(swatch.hex) : undefined}
-									aria-label={interactive ? bgSwatchTitle(swatch.hex) : undefined}
-									aria-pressed={interactive
-										? isPaperHex(swatch.hex)
-											? i === 0
-											: swatch.enabled
+									title={interactive
+										? bgSwatchTitle(swatch.hex, appearsEnabled, isCanvasBg)
 										: undefined}
+									aria-label={interactive
+										? bgSwatchTitle(swatch.hex, appearsEnabled, isCanvasBg)
+										: undefined}
+									aria-pressed={interactive ? appearsEnabled : undefined}
 									style:z-index={!expanded ? palette.colors.length - i : undefined}
-									style:background={interactive && i === 0 && swatch.hex
-										? `color-mix(in srgb, ${swatch.hex} 80%, transparent)`
-										: undefined}
-									onpointerdown={(e) => {
+									onclick={() => {
 										if (!interactive) return;
-										onBgSlotPointerDown(e, i);
+										onSwatchActivate(i);
 									}}
 									onkeydown={(e) => {
 										if (!interactive) return;
 										if (e.key === 'Enter' || e.key === ' ') {
 											e.preventDefault();
-											toggleBgSwatchAndRemap(i);
+											onSwatchActivate(i);
 										}
 									}}
 								>
@@ -3577,7 +3906,7 @@
 										class={[
 											'bg-dot',
 											{
-												on: interactive ? swatch.enabled : false,
+												on: interactive ? appearsEnabled : false,
 												'is-paper': interactive && isPaperHex(swatch.hex),
 												pale: !expanded
 											}
@@ -3585,7 +3914,37 @@
 										style:background={expanded
 											? (swatch.hex ?? undefined)
 											: `color-mix(in srgb, ${swatch.hex ?? '#fff'} 42%, white)`}
-									></span>
+									>
+										{#if canDisable}
+											<span class="bg-slash" aria-hidden="true"></span>
+										{/if}
+									</span>
+									{#if interactive}
+										<button
+											class={['bg-pin', { on: isCanvasBg }]}
+											type="button"
+											title="Set as background"
+											aria-label="Set as background"
+											aria-pressed={isCanvasBg}
+											onclick={(e) => pinBgSwatch(i, e)}
+										>
+											<!-- Lucide pin -->
+											<svg
+												viewBox="0 0 24 24"
+												fill="none"
+												stroke="currentColor"
+												stroke-width="2.25"
+												stroke-linecap="round"
+												stroke-linejoin="round"
+												aria-hidden="true"
+											>
+												<path d="M12 17v5" />
+												<path
+													d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"
+												/>
+											</svg>
+										</button>
+									{/if}
 								</div>
 							{/each}
 						</div>
@@ -3604,7 +3963,7 @@
 	</div>
 </div>
 
-{#if tipAnchor && selectedPaths.length && !app.imageEditId && !draggingShape && !draggingMarquee}
+{#if tipAnchor && selectedPaths.length && !app.imageEditId && !draggingShape && !draggingMarquee && !draggingRotate}
 	<div
 		class={['sel-tip', { shake: tipShake }]}
 		style:left={tipPos ? `${tipPos.left}px` : '-9999px'}
@@ -3890,7 +4249,7 @@
 		overflow: visible;
 	}
 
-	.bg-dice {
+	.bg-shuffle {
 		display: flex;
 		align-items: center;
 		justify-content: center;
@@ -3908,14 +4267,13 @@
 		box-sizing: border-box;
 	}
 
-	.bg-dice:hover {
+	.bg-shuffle:hover {
 		background: color-mix(in srgb, var(--ink) 8%, var(--paper));
 	}
 
-	.bg-dice svg {
-		width: 16px;
-		height: 16px;
-		display: block;
+	.shuffle-pulse {
+		display: flex;
+		transform-origin: center;
 	}
 
 	.palette-item {
@@ -3954,6 +4312,7 @@
 		padding: 0;
 		align-items: stretch;
 		cursor: default;
+		overflow: visible;
 	}
 
 	.palette-strip .bg-slot {
@@ -3977,7 +4336,7 @@
 
 	.palette-strip.expanded .bg-slot {
 		margin-left: 0;
-		padding: 5px 4px;
+		padding: 6px 5px;
 		height: auto;
 		align-self: stretch;
 		pointer-events: auto;
@@ -3988,20 +4347,11 @@
 		align-items: center;
 		justify-content: center;
 		position: relative;
-		touch-action: none;
-		cursor: grab;
+		touch-action: manipulation;
+		cursor: pointer;
 		user-select: none;
 		background: transparent;
 		box-sizing: border-box;
-	}
-
-	.bg-slot.active {
-		border-radius: 999px;
-	}
-
-	.bg-slot.dragging {
-		cursor: grabbing;
-		z-index: 1;
 	}
 
 	.bg-dot {
@@ -4016,21 +4366,24 @@
 		flex: 0 0 auto;
 		pointer-events: none;
 		box-sizing: border-box;
+		position: relative;
+		overflow: hidden;
 		transition:
-			opacity 200ms ease,
-			border-color 200ms ease,
-			border-style 200ms ease,
+			opacity 160ms ease,
+			border-color 160ms ease,
+			border-style 160ms ease,
 			background-color 380ms var(--palette-morph, ease);
 	}
 
 	.bg-dot.pale {
 		opacity: 1;
 		border-style: solid;
-		border: .1px solid rgba(16, 26, 49, 0.28);
+		border: 0.1px solid rgba(16, 26, 49, 0.28);
+		overflow: visible;
 	}
 
-	.bg-slot:hover .bg-dot:not(.pale) {
-		opacity: 0.65;
+	.bg-slot:hover .bg-dot:not(.pale):not(.on) {
+		opacity: 0.55;
 	}
 
 	.bg-dot.on {
@@ -4040,11 +4393,86 @@
 
 	.bg-slot.active .bg-dot {
 		opacity: 1;
-		border: 1px solid rgba(16, 26, 49, 0.28);
 	}
 
-	.bg-slot:hover .bg-dot.on {
+	/* Preview disable: fade + slash (skip while aiming at the pin). */
+	.bg-slot.togglable:hover:not(:has(.bg-pin:hover)) .bg-dot.on {
+		opacity: 0.4;
+		border: 1.5px dashed rgba(16, 26, 49, 0.28);
+	}
+
+	.bg-slash {
+		position: absolute;
+		inset: 0;
+		opacity: 0;
+		transition: opacity 140ms ease;
+	}
+
+	.bg-slash::before {
+		content: '';
+		position: absolute;
+		left: 50%;
+		top: 50%;
+		width: 118%;
+		height: 1.5px;
+		background: rgba(16, 26, 49, 0.55);
+		border-radius: 1px;
+		transform: translate(-50%, -50%) rotate(-45deg);
+		box-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.35);
+	}
+
+	.bg-slot.togglable:hover:not(:has(.bg-pin:hover)) .bg-slash {
 		opacity: 1;
+	}
+
+	.bg-pin {
+		position: absolute;
+		top: 0;
+		right: 0;
+		width: 13px;
+		height: 13px;
+		padding: 0;
+		margin: 0;
+		border: none;
+		border-radius: 999px;
+		display: grid;
+		place-items: center;
+		background: rgba(255, 255, 255, 0.94);
+		color: rgba(160, 166, 176, 0.95);
+		box-shadow: 0 0 0 1px rgba(16, 26, 49, 0.1);
+		cursor: pointer;
+		opacity: 0;
+		pointer-events: none;
+		transition:
+			opacity 120ms ease,
+			color 120ms ease,
+			background-color 120ms ease,
+			box-shadow 120ms ease;
+		z-index: 2;
+	}
+
+	.bg-slot:hover .bg-pin,
+	.bg-pin:focus-visible,
+	.bg-pin.on {
+		opacity: 1;
+		pointer-events: auto;
+	}
+
+	.bg-pin.on {
+		color: rgba(16, 26, 49, 0.72);
+		background: #fff;
+		box-shadow: 0 0 0 1px rgba(16, 26, 49, 0.18);
+	}
+
+	.bg-pin:hover {
+		color: rgba(16, 26, 49, 0.78);
+		background: #fff;
+	}
+
+	.bg-pin svg {
+		width: 9px;
+		height: 9px;
+		display: block;
 	}
 
 	canvas {
