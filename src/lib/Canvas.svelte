@@ -4483,8 +4483,8 @@
 	}
 
 	.bg-pin.on {
-		color: #fff;
-		background: #000;
+		color: #000;
+		background: #fff;
 		box-shadow: 0 0 0 1px rgba(16, 26, 49, 0.18);
 	}
 
