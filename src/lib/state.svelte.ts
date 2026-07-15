@@ -227,6 +227,8 @@ class AppState {
 	aspect: AspectId = $state('4:5');
 	rockIndex = $state(0);
 	colorIndex = $state(0);
+	/** Bumped when selectColor re-picks the active index so Canvas re-applies fills. */
+	colorSelectVersion = $state(0);
 	placedCount = $state(0);
 	sizeIndex = $state(1);
 	/** Number of separate stacks when mode is `stack` (lucky generate). */
@@ -604,7 +606,10 @@ class AppState {
 
 	selectColor(i: number) {
 		if (!this.isRockColorAvailable(i)) return;
-		this.colorIndex = i;
+		// Same index is normally a no-op for $state; bump so tip/toolbar re-clicks
+		// still recolor mixed multi-selections that don't match the palette yet.
+		if (this.colorIndex === i) this.colorSelectVersion++;
+		else this.colorIndex = i;
 	}
 
 	selectSize(i: number) {

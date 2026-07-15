@@ -446,7 +446,6 @@
 	/** Matter collision body outlines (physics debug mode only). */
 	let collisionDebugGroup: paper.Group | null = null;
 	let ghostRaf = 0;
-	let shiftHeld = $state(false);
 
 	/** In-flight slam placement animations (cancelled on clear). */
 	let slamGeneration = 0;
@@ -477,6 +476,7 @@
 	/** Image src shown in the tip when the selection is masked; null = show colors. */
 	let selectedMaskSrc = $state<string | null>(null);
 	let selectedMaskId = $state<string | null>(null);
+	let selectionMaskMixed = $state(false);
 	/** Unclipped translucent copy of the active mask image (edit / masked selection). */
 	let editGhost: paper.Raster | null = null;
 	let tipShake = $state(false);
@@ -1440,12 +1440,31 @@
 		return shared ?? -1;
 	}
 
+	function maskIdFor(path: paper.Path): string | null {
+		return (
+			attach.get(path) ??
+			(app.backgroundImageId && !solidOnly.has(path) ? app.backgroundImageId : null)
+		);
+	}
+
+	function sharedSelectionMaskId(paths: paper.Path[]): string | null {
+		let shared: string | null = null;
+		for (const p of paths) {
+			const maskId = maskIdFor(p);
+			if (!maskId) return null;
+			if (shared === null) shared = maskId;
+			else if (shared !== maskId) return null;
+		}
+		return shared;
+	}
+
 	function syncSelectionUi(path: paper.Path | null) {
 		if (!path) {
 			tipPos = null;
 			tipAnchor = null;
 			selectedMaskSrc = null;
 			selectedMaskId = null;
+			selectionMaskMixed = false;
 			selectedLocked = false;
 			updateEditGhost();
 			return;
@@ -1461,12 +1480,10 @@
 		const sel = selectedPaths.length ? selectedPaths : [path];
 		selectedLocked = sel.length > 0 && sel.every((p) => !!rockMeta.get(p)?.locked);
 
-		const pinId = attach.get(path);
-		const bgId = app.backgroundImageId;
-		const maskId =
-			pinId ?? (bgId && !solidOnly.has(path) ? bgId : null);
+		const maskId = sharedSelectionMaskId(sel);
 		selectedMaskId = maskId;
 		selectedMaskSrc = maskId ? (app.imageById(maskId)?.src ?? null) : null;
+		selectionMaskMixed = !maskId && sel.some((p) => maskIdFor(p) !== null);
 		updateTipPos();
 		updateEditGhost();
 	}
@@ -1499,24 +1516,26 @@
 
 	/** Release this rock from its image mask so solid colors return. */
 	function releaseSelectedMask() {
-		if (selectedPaths.length !== 1 || !selectedPath || !placed.includes(selectedPath)) return;
-		if (isLocked(selectedPath)) return;
-		const path = selectedPath;
-		const pinId = attach.get(path);
-		if (pinId) {
-			attach.delete(path);
-		} else if (app.backgroundImageId && !solidOnly.has(path)) {
-			solidOnly.add(path);
-		} else {
-			return;
+		if (!selectedMaskId || !selectedPaths.length || selectionHasLocked()) return;
+		let changed = false;
+		for (const path of selectedPaths) {
+			const pinId = attach.get(path);
+			if (pinId) {
+				attach.delete(path);
+				changed = true;
+			} else if (app.backgroundImageId && !solidOnly.has(path)) {
+				solidOnly.add(path);
+				changed = true;
+			}
 		}
+		if (!changed) return;
 		syncFills();
 		commitHistory();
 	}
 
 	/** Open mask editing for the image currently on the selected rock. */
 	function editSelectedMask() {
-		if (selectedPaths.length !== 1 || !selectedMaskId || selectionHasLocked()) return;
+		if (!selectedMaskId || selectionHasLocked()) return;
 		app.startImageEdit(selectedMaskId);
 	}
 
@@ -1696,6 +1715,12 @@
 	function setSelectedColor(i: number) {
 		if (!selectedPaths.length) return;
 		app.selectColor(i);
+	}
+
+	/** Shift for additive select/marquee — only the native mouse event, never a
+	 *  sticky key flag (those get stuck after blur / missed keyup). */
+	function mouseShift(event: paper.MouseEvent): boolean {
+		return !!(event as paper.MouseEvent & { event?: MouseEvent }).event?.shiftKey;
 	}
 
 	function setSelectedRock(i: number) {
@@ -3239,8 +3264,7 @@
 			}
 			const shape = shapeAt(event.point);
 			if (shape) {
-				const shift =
-					!!(event as paper.MouseEvent & { event?: MouseEvent }).event?.shiftKey || shiftHeld;
+				const shift = mouseShift(event);
 				if (shift) {
 					toggleSelectShape(shape, true);
 				} else if (!selectedPaths.includes(shape)) {
@@ -3260,8 +3284,7 @@
 				};
 				beginDrag(paths, placed);
 			} else {
-				const additive =
-					!!(event as paper.MouseEvent & { event?: MouseEvent }).event?.shiftKey || shiftHeld;
+				const additive = mouseShift(event);
 				marqueeDrag = {
 					start: event.point.clone(),
 					additive,
@@ -3488,11 +3511,13 @@
 	// recolor the whole set to the current palette color.
 	$effect(() => {
 		const idx = app.colorIndex;
+		const selectVersion = app.colorSelectVersion;
 		if (!ready || app.imageEditId) return;
 		untrack(() => {
 			if (app.skipSelectionColorApply) return;
 			if (!selectedPaths.length) return;
 			void idx;
+			void selectVersion;
 			selectedColorIndex = idx;
 			let changed = false;
 			for (const path of selectedPaths) {
@@ -3676,7 +3701,6 @@
 	}
 
 	function onKeydown(event: KeyboardEvent) {
-		if (event.key === 'Shift') shiftHeld = true;
 		// The native <dialog> traps focus and handles Escape itself; just add
 		// Enter as a shortcut to confirm the download.
 		if (showExportDialog) {
@@ -3753,10 +3777,6 @@
 		}
 	}
 
-	function onKeyup(event: KeyboardEvent) {
-		if (event.key === 'Shift') shiftHeld = false;
-	}
-
 	/** Outside-canvas moves: skip when the event is on the canvas itself so
 	 *  paper.view.onMouseMove remains the sole in-bounds handler. */
 	function onWindowPointerMove(event: PointerEvent) {
@@ -3777,7 +3797,6 @@
 
 <svelte:window
 	onkeydown={onKeydown}
-	onkeyup={onKeyup}
 	onpointermove={onWindowPointerMove}
 	onpointerup={onWindowPointerUp}
 	onpointercancel={onWindowPointerUp}
@@ -4046,7 +4065,7 @@
 					{ROCK_SIZES[selectedSizeIndex].label}
 				</button>
 			{/if}
-			{#if !multiSelected && selectedMaskSrc}
+			{#if selectedMaskSrc}
 				<div class="sel-mask-wrap">
 					<button
 						class="sel-mask-thumb"
@@ -4073,7 +4092,7 @@
 						</svg>
 					</button>
 				</div>
-			{:else}
+			{:else if !selectionMaskMixed}
 				<div class="sel-colors">
 					{#each app.availableRockColors as color (color.hex)}
 						{@const i = rockColorIndex(color.hex)}
@@ -4438,7 +4457,7 @@
 		display: grid;
 		place-items: center;
 		background: rgba(255, 255, 255, 0.94);
-		color: rgba(160, 166, 176, 0.95);
+		color: #c8c8c8;
 		box-shadow: 0 0 0 1px rgba(16, 26, 49, 0.1);
 		cursor: pointer;
 		opacity: 0;
@@ -4458,15 +4477,15 @@
 		pointer-events: auto;
 	}
 
-	.bg-pin.on {
-		color: rgba(16, 26, 49, 0.72);
+	.bg-pin:hover {
+		color: #888;
 		background: #fff;
-		box-shadow: 0 0 0 1px rgba(16, 26, 49, 0.18);
 	}
 
-	.bg-pin:hover {
-		color: rgba(16, 26, 49, 0.78);
-		background: #fff;
+	.bg-pin.on {
+		color: #fff;
+		background: #000;
+		box-shadow: 0 0 0 1px rgba(16, 26, 49, 0.18);
 	}
 
 	.bg-pin svg {
