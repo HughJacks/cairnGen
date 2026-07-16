@@ -52,9 +52,9 @@
 	 *  their AABB width matches this; size fractions map that width to a
 	 *  fraction of artboard height (one shape unit). */
 	const ROCK_HEIGHT = 140;
-	const STAGE_PADDING = 28;
-	/** Space above the canvas for the centered bg swatch bar + gap. */
-	const BG_BAR_SPACE = 48;
+	const STAGE_PADDING = 8;
+	/** Extra top reserve; bg bar is fixed to the viewport, so keep this at 0. */
+	const BG_BAR_SPACE = 0;
 	/** Max image zoom as a multiple of the cover scale that fills a mask. */
 	const MAX_ZOOM = 4;
 	const PAPER_HEX = '#FFFFFF';
@@ -3833,144 +3833,144 @@
 			</div>
 		</div>
 	{/if}
-	<div class="artboard" style:width="{artboard.w}px" style:height="{artboard.h}px">
-		{#if !app.imageEditId}
-			<div class="bg-bar" role="toolbar" aria-label="Canvas background">
-				<button
-					class="bg-shuffle"
-					type="button"
-					onclick={rollBgColors}
-					title="Shuffle rock colors"
-					aria-label="Shuffle rock colors"
+	{#if !app.imageEditId}
+		<div class="bg-bar" role="toolbar" aria-label="Canvas background">
+			<button
+				class="bg-shuffle"
+				type="button"
+				onclick={rollBgColors}
+				title="Shuffle rock colors"
+				aria-label="Shuffle rock colors"
+			>
+				<span class="shuffle-pulse" bind:this={bgShufflePulse}>
+					<ShuffleIcon size={16} />
+				</span>
+			</button>
+			{#each orderedPalettes as palette (palette.id)}
+				{@const expanded = expandedPaletteId === palette.id}
+				{@const interactive = expanded && app.activePaletteId === palette.id}
+				<div
+					class="palette-item"
+					animate:flip={{ duration: PALETTE_FLIP_MS, easing: cubicOut }}
 				>
-					<span class="shuffle-pulse" bind:this={bgShufflePulse}>
-						<ShuffleIcon size={16} />
-					</span>
-				</button>
-				{#each orderedPalettes as palette (palette.id)}
-					{@const expanded = expandedPaletteId === palette.id}
-					{@const interactive = expanded && app.activePaletteId === palette.id}
+					<!-- tabindex is only set when role=button (condensed) -->
+					<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 					<div
-						class="palette-item"
-						animate:flip={{ duration: PALETTE_FLIP_MS, easing: cubicOut }}
+						class={['palette-strip', { expanded, condensed: !expanded }]}
+						style:--palette-morph={PALETTE_EASE}
+						style:--palette-morph-ms="{PALETTE_MORPH_MS}ms"
+						role={expanded ? 'group' : 'button'}
+						tabindex={expanded ? undefined : 0}
+						title={expanded ? undefined : `${palette.name} palette`}
+						aria-label={expanded ? `${palette.name} palette` : `Select ${palette.name} palette`}
+						onclick={() => {
+							if (!expanded) onSelectPalette(palette.id);
+						}}
+						onkeydown={(e) => {
+							if (expanded) return;
+							if (e.key === 'Enter' || e.key === ' ') {
+								e.preventDefault();
+								onSelectPalette(palette.id);
+							}
+						}}
 					>
-						<!-- tabindex is only set when role=button (condensed) -->
-						<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-						<div
-							class={['palette-strip', { expanded, condensed: !expanded }]}
-							style:--palette-morph={PALETTE_EASE}
-							style:--palette-morph-ms="{PALETTE_MORPH_MS}ms"
-							role={expanded ? 'group' : 'button'}
-							tabindex={expanded ? undefined : 0}
-							title={expanded ? undefined : `${palette.name} palette`}
-							aria-label={expanded ? `${palette.name} palette` : `Select ${palette.name} palette`}
-							onclick={() => {
-								if (!expanded) onSelectPalette(palette.id);
-							}}
-							onkeydown={(e) => {
-								if (expanded) return;
-								if (e.key === 'Enter' || e.key === ' ') {
-									e.preventDefault();
-									onSelectPalette(palette.id);
-								}
-							}}
-						>
-							{#each paletteDisplaySwatches(palette, expanded) as swatch, i (swatch.key)}
-								{@const isCanvasBg =
-									!!swatch.hex &&
-									typeof app.canvasBg === 'string' &&
-									hexEq(swatch.hex, app.canvasBg)}
-								{@const appearsEnabled = isPaperHex(swatch.hex)
-									? isCanvasBg
-									: swatch.enabled || isCanvasBg}
-								{@const canDisable =
-									interactive &&
-									appearsEnabled &&
-									!isCanvasBg &&
-									!isPaperHex(swatch.hex)}
-								<!-- tabindex is only set when role=button (expanded interactive) -->
-								<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-								<div
+						{#each paletteDisplaySwatches(palette, expanded) as swatch, i (swatch.key)}
+							{@const isCanvasBg =
+								!!swatch.hex &&
+								typeof app.canvasBg === 'string' &&
+								hexEq(swatch.hex, app.canvasBg)}
+							{@const appearsEnabled = isPaperHex(swatch.hex)
+								? isCanvasBg
+								: swatch.enabled || isCanvasBg}
+							{@const canDisable =
+								interactive &&
+								appearsEnabled &&
+								!isCanvasBg &&
+								!isPaperHex(swatch.hex)}
+							<!-- tabindex is only set when role=button (expanded interactive) -->
+							<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+							<div
+								class={[
+									'bg-slot',
+									{
+										active: interactive && isCanvasBg,
+										off: interactive && !appearsEnabled,
+										togglable: canDisable
+									}
+								]}
+								role={interactive ? 'button' : undefined}
+								tabindex={interactive ? 0 : undefined}
+								title={interactive
+									? bgSwatchTitle(swatch.hex, appearsEnabled, isCanvasBg)
+									: undefined}
+								aria-label={interactive
+									? bgSwatchTitle(swatch.hex, appearsEnabled, isCanvasBg)
+									: undefined}
+								aria-pressed={interactive ? appearsEnabled : undefined}
+								style:z-index={!expanded ? palette.colors.length - i : undefined}
+								onclick={() => {
+									if (!interactive) return;
+									onSwatchActivate(i);
+								}}
+								onkeydown={(e) => {
+									if (!interactive) return;
+									if (e.key === 'Enter' || e.key === ' ') {
+										e.preventDefault();
+										onSwatchActivate(i);
+									}
+								}}
+							>
+								<span
 									class={[
-										'bg-slot',
+										'bg-dot',
 										{
-											active: interactive && isCanvasBg,
-											off: interactive && !appearsEnabled,
-											togglable: canDisable
+											on: interactive ? appearsEnabled : false,
+											'is-paper': interactive && isPaperHex(swatch.hex),
+											pale: !expanded
 										}
 									]}
-									role={interactive ? 'button' : undefined}
-									tabindex={interactive ? 0 : undefined}
-									title={interactive
-										? bgSwatchTitle(swatch.hex, appearsEnabled, isCanvasBg)
-										: undefined}
-									aria-label={interactive
-										? bgSwatchTitle(swatch.hex, appearsEnabled, isCanvasBg)
-										: undefined}
-									aria-pressed={interactive ? appearsEnabled : undefined}
-									style:z-index={!expanded ? palette.colors.length - i : undefined}
-									onclick={() => {
-										if (!interactive) return;
-										onSwatchActivate(i);
-									}}
-									onkeydown={(e) => {
-										if (!interactive) return;
-										if (e.key === 'Enter' || e.key === ' ') {
-											e.preventDefault();
-											onSwatchActivate(i);
-										}
-									}}
+									style:background={expanded
+										? (swatch.hex ?? undefined)
+										: `color-mix(in srgb, ${swatch.hex ?? '#fff'} 42%, white)`}
 								>
-									<span
-										class={[
-											'bg-dot',
-											{
-												on: interactive ? appearsEnabled : false,
-												'is-paper': interactive && isPaperHex(swatch.hex),
-												pale: !expanded
-											}
-										]}
-										style:background={expanded
-											? (swatch.hex ?? undefined)
-											: `color-mix(in srgb, ${swatch.hex ?? '#fff'} 42%, white)`}
-									>
-										{#if canDisable}
-											<span class="bg-slash" aria-hidden="true"></span>
-										{/if}
-									</span>
-									{#if interactive}
-										<button
-											class={['bg-pin', { on: isCanvasBg }]}
-											type="button"
-											title="Set as background"
-											aria-label="Set as background"
-											aria-pressed={isCanvasBg}
-											onclick={(e) => pinBgSwatch(i, e)}
-										>
-											<!-- Lucide pin -->
-											<svg
-												viewBox="0 0 24 24"
-												fill="none"
-												stroke="currentColor"
-												stroke-width="2.25"
-												stroke-linecap="round"
-												stroke-linejoin="round"
-												aria-hidden="true"
-											>
-												<path d="M12 17v5" />
-												<path
-													d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"
-												/>
-											</svg>
-										</button>
+									{#if canDisable}
+										<span class="bg-slash" aria-hidden="true"></span>
 									{/if}
-								</div>
-							{/each}
-						</div>
+								</span>
+								{#if interactive}
+									<button
+										class={['bg-pin', { on: isCanvasBg }]}
+										type="button"
+										title="Set as background"
+										aria-label="Set as background"
+										aria-pressed={isCanvasBg}
+										onclick={(e) => pinBgSwatch(i, e)}
+									>
+										<!-- Lucide pin -->
+										<svg
+											viewBox="0 0 24 24"
+											fill="none"
+											stroke="currentColor"
+											stroke-width="2.25"
+											stroke-linecap="round"
+											stroke-linejoin="round"
+											aria-hidden="true"
+										>
+											<path d="M12 17v5" />
+											<path
+												d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"
+											/>
+										</svg>
+									</button>
+								{/if}
+							</div>
+						{/each}
 					</div>
-				{/each}
-			</div>
-		{/if}
+				</div>
+			{/each}
+		</div>
+	{/if}
+	<div class="artboard" style:width="{artboard.w}px" style:height="{artboard.h}px">
 		<canvas
 			bind:this={canvasEl}
 			class:transparent-bg={app.canvasBg === null}
@@ -4248,24 +4248,30 @@
 	}
 
 	.bg-bar {
-		position: absolute;
+		position: fixed;
+		top: var(--dock-top, 20px);
 		left: 50%;
-		bottom: calc(100% + 12px);
 		transform: translateX(-50%);
 		display: flex;
 		align-items: center;
 		justify-content: center;
 		gap: 6px;
 		padding: 0;
-		height: 36px;
+		height: var(--chrome-bar, 36px);
 		border-radius: 999px;
 		color: #fff;
 		background-color: #fff;
 		border: none;
 		box-shadow: 0px 4px 12px 0px rgba(0, 0, 0, 0.15);
-		z-index: 4;
+		z-index: 20;
 		pointer-events: auto;
 		overflow: visible;
+	}
+
+	@media (max-width: 760px) {
+		.bg-bar {
+			top: 12px;
+		}
 	}
 
 	.bg-shuffle {

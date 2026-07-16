@@ -416,7 +416,7 @@
 	.dock {
 		position: absolute;
 		left: 50%;
-		bottom: 20px;
+		bottom: var(--dock-bottom, 16px);
 		transform: translateX(-50%);
 		z-index: 20;
 		pointer-events: none;
@@ -453,7 +453,7 @@
 
 	.sub {
 		position: absolute;
-		bottom: calc(100% + 8px);
+		bottom: calc(100% + var(--dock-gap, 8px));
 		left: 50%;
 		transform: translateX(-50%);
 		max-width: calc(100vw - 24px);
